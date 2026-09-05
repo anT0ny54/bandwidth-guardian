@@ -5,27 +5,23 @@
   "short_name": "BW Guardian",
   "description": "__MSG_extensionDescription__",
   "version": "0.0.1",
-
   "action": {
     "default_popup": "popup.html",
     "default_icon": {
-      "16":  "icons/icon-16.png",
-      "32":  "icons/icon-32.png",
-      "48":  "icons/icon-48.png",
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png",
+      "48": "icons/icon-48.png",
       "128": "icons/icon-128.png"
     },
     "default_title": "Bandwidth Guardian"
   },
-
   "options_page": "options.html",
-
   "icons": {
-    "16":  "icons/icon-16.png",
-    "32":  "icons/icon-32.png",
-    "48":  "icons/icon-48.png",
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
     "128": "icons/icon-128.png"
   },
-
   "permissions": [
     "storage",
     "tabs",
@@ -33,9 +29,9 @@
     "webRequest"
   ],
   "host_permissions": ["<all_urls>"],
-
-  "background": { "service_worker": "service-worker.js" },
-
+  "background": {
+    "service_worker": "service-worker.js"
+  },
   "content_scripts": [
     {
       "matches": ["<all_urls>"],
@@ -50,7 +46,6 @@
       "all_frames": true
     }
   ],
-
   "browser_specific_settings": {
     "gecko": {
       "id": "bandwidth-guardian@github.com",
