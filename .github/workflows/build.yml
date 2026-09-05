@@ -5,6 +5,7 @@ on:
     types: [published]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 jobs:
   build:
@@ -18,11 +19,11 @@ jobs:
 
       - name: Get version from manifest
         id: version
-        run: echo "version=$(python3 -c "import json; print(json.load(open('manifest.json'))['version'])")" >> $GITHUB_OUTPUT
+        run: echo "version=$(python3 -c 'import json; print(json.load(open("manifest.json"))["version"])')" >> "$GITHUB_OUTPUT"
 
       - name: Build extension zip
         run: |
-          zip -r bandwidth-guardian-${{ steps.version.outputs.version }}.zip \
+          zip -r "bandwidth-guardian-${{ steps.version.outputs.version }}.zip" \
             manifest.json \
             defaults.js \
             service-worker.js \
@@ -36,6 +37,7 @@ jobs:
             icons
 
       - name: Attach zip to release
+        if: github.event_name == 'release'
         uses: softprops/action-gh-release@v2
         with:
-          files: bandwidth-guardian-*.zip
+          files: bandwidth-guardian-${{ steps.version.outputs.version }}.zip
