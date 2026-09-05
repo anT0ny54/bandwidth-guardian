@@ -1,27 +1,29 @@
-name: Build
+name: Build and Release
 
 on:
-  release:
-    types: [published]
-  pull_request:
+  push:
     branches: [main]
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Get version from manifest
         id: version
-        run: echo "version=$(python3 -c 'import json; print(json.load(open("manifest.json"))["version"])')" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "version=$(python3 -c 'import json; print(json.load(open(\"manifest.json\"))[\"version\"])')" >> "$GITHUB_OUTPUT"
 
-      - name: Build extension zip
+      - name: Create zip
         run: |
           zip -r "bandwidth-guardian-${{ steps.version.outputs.version }}.zip" \
             manifest.json \
@@ -36,8 +38,15 @@ jobs:
             _locales \
             icons
 
-      - name: Attach zip to release
-        if: github.event_name == 'release'
+      - name: Create tag
+        run: |
+          git tag "v${{ steps.version.outputs.version }}"
+          git push origin "v${{ steps.version.outputs.version }}"
+
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: v${{ steps.version.outputs.version }}
+          name: v${{ steps.version.outputs.version }}
           files: bandwidth-guardian-${{ steps.version.outputs.version }}.zip
+          generate_release_notes: true
