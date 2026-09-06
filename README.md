@@ -107,3 +107,30 @@ Based on [bandwidth-hero](https://github.com/ayastreb/bandwidth-hero) by Anatoli
 ## License
 
 MIT — see [LICENSE](LICENSE)
+
+
+## 🌐 Free DNS Services
+
+High-performance DNS utilizing HaGeZi Blocklists (Multi Pro + TIF).
+
+| Blocklist | DNS-over-HTTPS (DoH) |
+| :--- | :--- |
+| Multi Pro + TIF | `https://freedns-six.vercel.app/api/doh/dns-query` (Recommended) |
+| Multi Pro + TIF | `https://dnssix.netlify.app/api/doh/dns-query` |
+
+---
+
+# ⚡ Bandwidth Hero Server
+
+A lightweight image optimization proxy designed to slash bandwidth usage and accelerate web browsing.
+
+Bandwidth Hero Server fetches remote images, compresses them on the fly, and delivers optimized versions to the client. This significantly reduces data consumption while improving page load performance.
+
+🖥️ **Live Demo:** [Bandwidth Hero](https://bhserv.netlify.app/)
+
+
+## Supporting the Project
+
+If you find this project useful, donations are appreciated:
+- **Bitcoin**: `1HntwKxyqGCfnSGvGLMUTRAqLnTvLarAQP`
+  
