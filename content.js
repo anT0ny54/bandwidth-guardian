@@ -1,5 +1,7 @@
-// Bandwidth Guardian — content script
-(function () {
+// Bandwidth Guardian — optimized content script
+(() => {
+  "use strict";
+
   const DEFAULTS = {
     enabled: true,
     proxyBase: "",
@@ -11,15 +13,15 @@
   };
 
   const LAZY_ATTRS = [
-    "data-src",
-    "data-iurl",
-    "data-lazy-src",
-    "data-original",
-    "data-url",
-    "data-hi-res",
-    "data-lazy",
-    "data-echo",
+    "data-src", "data-iurl", "data-lazy-src", "data-original",
+    "data-url", "data-hi-res", "data-lazy", "data-echo",
   ];
+  const LAZY_SET = new Set(LAZY_ATTRS);
+  const OBSERVED_ATTRS = ["src", "srcset", "style", ...LAZY_ATTRS, "data-srcset"];
+  const IMAGE_SELECTOR = [
+    "img", "picture source", "[style]",
+    ...LAZY_ATTRS.map((a) => `[${a}]`), "[data-srcset]",
+  ].join(",");
 
   const TRACKING_PATTERNS = [
     /pagead/i,
@@ -38,242 +40,268 @@
   ];
 
   const done = new WeakSet();
-  let opts = null;
-  const lazySelector = LAZY_ATTRS.concat(["data-srcset"])
-    .map((a) => `[${a}]`)
-    .join(",");
+  const urlCache = new Map();
+  const CACHE_LIMIT = 512;
+  let opts = { ...DEFAULTS };
+  let excluded = new Set();
+  let proxyHost = "";
+  let rewriteQueued = false;
+  let observerStarted = false;
 
-  const safeURL = (u) => {
-    try {
-      return new URL(u);
-    } catch {
-      return null;
-    }
+  const imgSrc = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, "src");
+  const sourceSrcset = Object.getOwnPropertyDescriptor(HTMLSourceElement.prototype, "srcset");
+
+  const isHttp = (value) => /^https?:\/\//i.test(String(value || ""));
+  const parseURL = (value) => {
+    try { return new URL(value); } catch { return null; }
   };
 
-  const isHttp = (u) => /^https?:\/\//i.test(u);
-
-  function domainSet(text) {
-    return new Set(
-      String(text || "")
-        .split(/[, \s]+/)
-        .map((s) => s.trim().toLowerCase())
-        .filter(Boolean)
-        .map((s) => s.replace(/^https?:\/\//, "").split("/")[0])
-    );
+  function setOptions(next) {
+    opts = { ...DEFAULTS, ...(next || {}) };
+    excluded = parseDomains(opts.excludeDomains);
+    proxyHost = parseURL(opts.proxyBase)?.hostname?.toLowerCase() || "";
+    urlCache.clear();
   }
 
-  function shouldSkip(url) {
-    if (!opts?.enabled || !opts?.proxyBase) return true;
-    if (!isHttp(url)) return true;
+  function parseDomains(text) {
+    const set = new Set();
+    for (const token of String(text || "").split(/[\s,]+/)) {
+      const value = token.trim().toLowerCase();
+      if (!value) continue;
+      const host = value.replace(/^https?:\/\//, "").split("/")[0].replace(/\.$/, "");
+      if (host) set.add(host);
+    }
+    return set;
+  }
 
-    const u = safeURL(url);
-    if (!u) return true;
-
-    const proxyHost = safeURL(opts.proxyBase)?.hostname?.toLowerCase();
-    if (proxyHost && u.hostname.toLowerCase() === proxyHost) return true;
-
-    const ex = domainSet(opts.excludeDomains);
-    if (ex.has(u.hostname.toLowerCase())) return true;
-    if (ex.has(location.hostname.toLowerCase())) return true;
-
-    const path = u.pathname.toLowerCase();
-    if (path.endsWith(".ico") || path.endsWith(".svg")) return true;
-    if (url.toLowerCase().includes("favicon")) return true;
-    if (TRACKING_PATTERNS.some((p) => p.test(url))) return true;
-
+  function hostExcluded(host) {
+    host = host.toLowerCase();
+    if (excluded.has(host)) return true;
+    // Treat a configured parent domain as covering its subdomains.
+    for (const domain of excluded) {
+      if (host.endsWith("." + domain)) return true;
+    }
     return false;
   }
 
-  function buildProxyUrl(orig) {
-    const base = (opts.proxyBase || "").trim();
-    const sep = base.includes("?") ? "&" : "?";
-    const jpeg = opts.isWebpSupported ? "0" : "1";
-    const bw = opts.grayscale ? "1" : "0";
+  function shouldSkip(value) {
+    if (!opts.enabled || !opts.proxyBase || !isHttp(value)) return true;
+    const url = parseURL(value);
+    if (!url) return true;
 
-    const parts = [
-      "url=" + encodeURIComponent(orig),
-      "jpeg=" + jpeg,
-      "bw=" + bw,
-      "quality=" + (opts.quality ?? 40),
-    ];
-    if (opts.maxWidth) parts.push("max_width=" + opts.maxWidth);
+    const host = url.hostname.toLowerCase();
+    if (proxyHost && host === proxyHost) return true;
+    if (hostExcluded(host) || hostExcluded(location.hostname)) return true;
 
-    return base + sep + parts.join("&");
+    const lower = String(value).toLowerCase();
+    const path = url.pathname.toLowerCase();
+    return path.endsWith(".ico") ||
+      path.endsWith(".svg") ||
+      lower.includes("favicon") ||
+      TRACKING_PATTERNS.some((pattern) => pattern.test(value));
   }
 
-  function setNativeSrc(el, value) {
-    const desc = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, "src");
-    desc?.set?.call(el, value);
+  function buildProxyUrl(original) {
+    const base = String(opts.proxyBase || "").trim();
+    if (!base || !isHttp(original)) return original;
+
+    const cached = urlCache.get(original);
+    if (cached) return cached;
+
+    const separator = base.includes("?") ? "&" : "?";
+    const params = new URLSearchParams({
+      url: original,
+      jpeg: opts.isWebpSupported ? "0" : "1",
+      bw: opts.grayscale ? "1" : "0",
+      quality: String(opts.quality ?? 40),
+    });
+    if (opts.maxWidth) params.set("max_width", String(opts.maxWidth));
+
+    const result = base + separator + params.toString();
+    if (urlCache.size >= CACHE_LIMIT) {
+      const first = urlCache.keys().next().value;
+      if (first !== undefined) urlCache.delete(first);
+    }
+    urlCache.set(original, result);
+    return result;
+  }
+
+  function nativeSrc(el, value) {
+    imgSrc?.set?.call(el, value);
   }
 
   function rewriteSrcset(el, attrName) {
-    const ss = el.getAttribute(attrName);
-    if (!ss) return false;
+    const value = el.getAttribute(attrName);
+    if (!value) return false;
 
-    let touched = false;
-    const rewritten = ss
-      .split(",")
-      .map((part) => {
-        const m = part.trim().match(/^(\S+)(\s.*)?$/);
-        if (!m) return part;
-        const [, url, desc = ""] = m;
-        if (!isHttp(url) || shouldSkip(url)) return part;
-        touched = true;
-        return buildProxyUrl(url) + desc;
-      })
-      .join(", ");
+    let changed = false;
+    const output = value.split(",").map((part) => {
+      const match = part.trim().match(/^(\S+)(\s.*)?$/);
+      if (!match) return part;
+      const [, url, descriptor = ""] = match;
+      if (shouldSkip(url)) return part;
+      changed = true;
+      return buildProxyUrl(url) + descriptor;
+    }).join(", ");
 
-    if (touched) el.setAttribute(attrName, rewritten);
-    return touched;
+    if (changed) el.setAttribute(attrName, output);
+    return changed;
   }
 
-  function rewriteImg(el) {
-    if (!el || done.has(el)) return;
-    if (!opts?.enabled || !opts?.proxyBase) return;
-    if (el.tagName !== "IMG" && el.tagName !== "SOURCE") return;
+  function rewriteImage(el) {
+    if (!el || done.has(el) || !opts.enabled || !opts.proxyBase) return;
+    const tag = el.tagName;
+    if (tag !== "IMG" && tag !== "SOURCE") return;
 
-    let rewrote = false;
-
+    let changed = false;
     const src = el.getAttribute("src");
-    if (src && isHttp(src) && !shouldSkip(src)) {
-      setNativeSrc(el, buildProxyUrl(src));
-      rewrote = true;
+    if (src && !shouldSkip(src)) {
+      nativeSrc(el, buildProxyUrl(src));
+      changed = true;
     }
-
-    if (rewriteSrcset(el, "srcset")) rewrote = true;
-
-    if (rewrote) done.add(el);
+    if (rewriteSrcset(el, "srcset")) changed = true;
+    if (changed) done.add(el);
   }
 
   function rewriteLazy(el) {
-    if (!el || done.has(el)) return;
-    if (!opts?.enabled || !opts?.proxyBase) return;
+    if (!el || done.has(el) || !opts.enabled || !opts.proxyBase) return;
 
-    let rewrote = false;
-
+    let changed = false;
     for (const attr of LAZY_ATTRS) {
-      const val = el.getAttribute(attr);
-      if (!val || !isHttp(val) || shouldSkip(val)) continue;
-      el.setAttribute(attr, buildProxyUrl(val));
-      rewrote = true;
+      const value = el.getAttribute(attr);
+      if (!value || shouldSkip(value)) continue;
+      el.setAttribute(attr, buildProxyUrl(value));
+      changed = true;
     }
-
-    if (rewriteSrcset(el, "data-srcset")) rewrote = true;
-
-    if (rewrote) done.add(el);
+    if (rewriteSrcset(el, "data-srcset")) changed = true;
+    if (changed) done.add(el);
   }
 
-  function rewriteBg(el) {
-    if (!el || done.has(el)) return;
-    if (!opts?.enabled || !opts?.proxyBase) return;
-
+  function rewriteBackground(el) {
+    if (!el || done.has(el) || !opts.enabled || !opts.proxyBase) return;
     const bg = el.style?.backgroundImage;
-    if (!bg || !bg.startsWith("url(")) return;
+    if (!bg || !/^\s*url\(/i.test(bg)) return;
 
-    const raw = bg.slice(4, -1).replace(/['"]/g, "").trim();
-    if (!raw || !isHttp(raw) || shouldSkip(raw)) return;
-
-    el.style.backgroundImage = `url("${buildProxyUrl(raw)}")`;
-    done.add(el);
-  }
-
-  function rewriteAll(root = document) {
-    root.querySelectorAll("img, picture source").forEach(rewriteImg);
-    root.querySelectorAll(lazySelector).forEach(rewriteLazy);
-    root
-      .querySelectorAll(
-        "div, section, article, header, footer, aside, main, figure, li, a, span, td, th, [style*='background']"
-      )
-      .forEach(rewriteBg);
-  }
-
-  const mo = new MutationObserver((mutations) => {
-    for (const m of mutations) {
-      if (m.type === "childList") {
-        m.addedNodes.forEach((n) => {
-          if (n.nodeType !== 1) return;
-          rewriteImg(n);
-          rewriteLazy(n);
-          rewriteBg(n);
-          n.querySelectorAll?.("img, picture source").forEach(rewriteImg);
-          n.querySelectorAll?.(lazySelector).forEach(rewriteLazy);
-          n.querySelectorAll?.("[style*='background']").forEach(rewriteBg);
-        });
-      } else if (m.type === "attributes") {
-        const t = m.target;
-        if (!t) continue;
-
-        if (m.attributeName === "src" || m.attributeName === "srcset") {
-          if (t.tagName === "IMG" || t.tagName === "SOURCE") {
-            done.delete(t);
-            rewriteImg(t);
-          }
-        } else if (m.attributeName === "style") {
-          done.delete(t);
-          rewriteBg(t);
-        } else if (LAZY_ATTRS.includes(m.attributeName) || m.attributeName === "data-srcset") {
-          done.delete(t);
-          rewriteLazy(t);
-        }
-      }
+    // Handle url("...") / url('...') and unquoted URLs without touching
+    // gradients or multiple background layers.
+    const rewritten = bg.replace(/url\(\s*(['"]?)(https?:\/\/[^'")\s]+)\1\s*\)/gi, (full, quote, url) => {
+      if (shouldSkip(url)) return full;
+      return `url("${buildProxyUrl(url)}")`;
+    });
+    if (rewritten !== bg) {
+      el.style.backgroundImage = rewritten;
+      done.add(el);
     }
-  });
+  }
 
-  function injectPreconnect(proxyBase) {
+  function processElement(el) {
+    if (el.nodeType !== 1) return;
+    rewriteImage(el);
+    rewriteLazy(el);
+    rewriteBackground(el);
+    el.querySelectorAll?.(IMAGE_SELECTOR).forEach((node) => {
+      rewriteImage(node);
+      rewriteLazy(node);
+      rewriteBackground(node);
+    });
+  }
+
+  function rewriteAll() {
+    if (!document.documentElement || !opts.enabled || !opts.proxyBase) return;
+    document.querySelectorAll(IMAGE_SELECTOR).forEach((el) => {
+      rewriteImage(el);
+      rewriteLazy(el);
+      rewriteBackground(el);
+    });
+  }
+
+  function queueRewrite() {
+    if (rewriteQueued) return;
+    rewriteQueued = true;
+    queueMicrotask(() => {
+      rewriteQueued = false;
+      rewriteAll();
+    });
+  }
+
+  function injectPreconnect(base) {
     try {
-      const origin = new URL(proxyBase).origin;
-      if (document.querySelector(`link[href="${origin}"]`)) return;
+      const origin = parseURL(base)?.origin;
+      if (!origin || !document.head) return;
+      if (document.head.querySelector(`link[rel="preconnect"][href="${CSS.escape(origin)}"]`)) return;
 
-      const root = document.head || document.documentElement;
-      if (!root) return;
-
-      const pc = document.createElement("link");
-      pc.rel = "preconnect";
-      pc.href = origin;
-      pc.crossOrigin = "anonymous";
-      root.prepend(pc);
+      const preconnect = document.createElement("link");
+      preconnect.rel = "preconnect";
+      preconnect.href = origin;
+      preconnect.crossOrigin = "anonymous";
+      document.head.prepend(preconnect);
 
       const dns = document.createElement("link");
       dns.rel = "dns-prefetch";
       dns.href = origin;
-      root.prepend(dns);
+      document.head.prepend(dns);
     } catch {}
   }
 
-  function applySettings(nextOpts) {
-    opts = nextOpts || DEFAULTS;
-    if (opts.enabled && opts.proxyBase) {
-      injectPreconnect(opts.proxyBase);
-      rewriteAll();
+  const observer = new MutationObserver((mutations) => {
+    for (const mutation of mutations) {
+      if (mutation.type === "childList") {
+        for (const node of mutation.addedNodes) processElement(node);
+        continue;
+      }
+
+      const target = mutation.target;
+      if (!target?.tagName) continue;
+      const attr = mutation.attributeName;
+
+      // Our own rewrite triggers mutations. Re-processing a completed node
+      // is cheap and WeakSet prevents duplicate work.
+      if (attr === "src" || attr === "srcset") {
+        done.delete(target);
+        rewriteImage(target);
+      } else if (attr === "style") {
+        done.delete(target);
+        rewriteBackground(target);
+      } else if (LAZY_SET.has(attr) || attr === "data-srcset") {
+        done.delete(target);
+        rewriteLazy(target);
+      }
     }
-  }
+  });
 
   function startObserver() {
-    if (!document.documentElement) return;
-    mo.observe(document.documentElement, {
-      childList: true,
+    if (observerStarted || !document.documentElement) return;
+    observerStarted = true;
+    observer.observe(document.documentElement, {
       subtree: true,
+      childList: true,
       attributes: true,
-      attributeFilter: ["src", "srcset", "style", ...LAZY_ATTRS, "data-srcset"],
+      attributeFilter: OBSERVED_ATTRS,
     });
   }
 
-  chrome.storage.local.get({ bhOpts: null }, (d) => {
-    if (d.bhOpts) {
-      applySettings(d.bhOpts);
+  function applySettings(next) {
+    setOptions(next);
+    if (opts.enabled && opts.proxyBase) {
+      injectPreconnect(opts.proxyBase);
+      queueRewrite();
+    }
+  }
+
+  chrome.storage.local.get({ bhOpts: null }, (data) => {
+    if (data.bhOpts) {
+      applySettings(data.bhOpts);
     } else {
       chrome.storage.sync.get(DEFAULTS, (synced) => {
-        chrome.storage.local.set({ bhOpts: synced });
         applySettings(synced);
+        chrome.storage.local.set({ bhOpts: synced });
       });
     }
   });
 
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area === "local" && changes.bhOpts) {
-      opts = changes.bhOpts.newValue || DEFAULTS;
-      if (opts.enabled && opts.proxyBase) rewriteAll();
+      applySettings(changes.bhOpts.newValue);
     } else if (area === "sync") {
       chrome.storage.sync.get(DEFAULTS, (synced) => {
         applySettings(synced);
@@ -282,9 +310,6 @@
     }
   });
 
-  if (document.documentElement) {
-    startObserver();
-  } else {
-    document.addEventListener("DOMContentLoaded", startObserver, { once: true });
-  }
+  if (document.documentElement) startObserver();
+  else document.addEventListener("DOMContentLoaded", startObserver, { once: true });
 })();
