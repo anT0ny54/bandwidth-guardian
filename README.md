@@ -126,12 +126,7 @@ A lightweight image optimization proxy designed to slash bandwidth usage and acc
 
 Bandwidth Hero Server fetches remote images, compresses them on the fly, and delivers optimized versions to the client. This significantly reduces data consumption while improving page load performance.
 
-🖥️ **Live Demo:** [Bandwidth Hero](https://bhserv.netlify.app/)
-
-
-# ⚡ User Script Bandwidth Hero
-
-User Script Bandwidth Hero Proxy for [Violentmonkey](https://violentmonkey.github.io/) and [Tampermonkey](https://www.tampermonkey.net/). Download [UserScriptBandwidthHero.zip](https://github.com/anT0ny54/Legacy-bromite-adblocklist/raw/main/UserScriptBandwidthHero.zip).
+🖥️ **Live Demo:** [Bandwidth Hero](https://bhserv.netlify.app/).
 
 
 ## Supporting the Project
