@@ -129,6 +129,11 @@ Bandwidth Hero Server fetches remote images, compresses them on the fly, and del
 🖥️ **Live Demo:** [Bandwidth Hero](https://bhserv.netlify.app/)
 
 
+# ⚡ User Script Bandwidth Hero
+
+User Script Bandwidth Hero Proxy for [Violentmonkey](https://violentmonkey.github.io/) and [Tampermonkey](https://www.tampermonkey.net/). Download [UserScriptBandwidthHero.zip](https://github.com/anT0ny54/Legacy-bromite-adblocklist/raw/main/UserScriptBandwidthHero.zip).
+
+
 ## Supporting the Project
 
 If you find this project useful, donations are appreciated:
