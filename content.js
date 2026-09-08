@@ -39,7 +39,11 @@
     /ad\.doubleclick\.net/i,
   ];
 
-  const done = new WeakSet();
+  // Track each rewrite type independently. An <img> can legitimately have
+  // both src/srcset and lazy data-* attributes; one must not suppress the other.
+  const doneImages = new WeakSet();
+  const doneLazy = new WeakSet();
+  const doneBackground = new WeakSet();
   const urlCache = new Map();
   const CACHE_LIMIT = 512;
   let opts = { ...DEFAULTS };
@@ -149,7 +153,7 @@
   }
 
   function rewriteImage(el) {
-    if (!el || done.has(el) || !opts.enabled || !opts.proxyBase) return;
+    if (!el || doneImages.has(el) || !opts.enabled || !opts.proxyBase) return;
     const tag = el.tagName;
     if (tag !== "IMG" && tag !== "SOURCE") return;
 
@@ -160,11 +164,11 @@
       changed = true;
     }
     if (rewriteSrcset(el, "srcset")) changed = true;
-    if (changed) done.add(el);
+    if (changed) doneImages.add(el);
   }
 
   function rewriteLazy(el) {
-    if (!el || done.has(el) || !opts.enabled || !opts.proxyBase) return;
+    if (!el || doneLazy.has(el) || !opts.enabled || !opts.proxyBase) return;
 
     let changed = false;
     for (const attr of LAZY_ATTRS) {
@@ -174,11 +178,11 @@
       changed = true;
     }
     if (rewriteSrcset(el, "data-srcset")) changed = true;
-    if (changed) done.add(el);
+    if (changed) doneLazy.add(el);
   }
 
   function rewriteBackground(el) {
-    if (!el || done.has(el) || !opts.enabled || !opts.proxyBase) return;
+    if (!el || doneBackground.has(el) || !opts.enabled || !opts.proxyBase) return;
     const bg = el.style?.backgroundImage;
     if (!bg || !/^\s*url\(/i.test(bg)) return;
 
@@ -190,7 +194,7 @@
     });
     if (rewritten !== bg) {
       el.style.backgroundImage = rewritten;
-      done.add(el);
+      doneBackground.add(el);
     }
   }
 
@@ -257,13 +261,13 @@
       // Our own rewrite triggers mutations. Re-processing a completed node
       // is cheap and WeakSet prevents duplicate work.
       if (attr === "src" || attr === "srcset") {
-        done.delete(target);
+        doneImages.delete(target);
         rewriteImage(target);
       } else if (attr === "style") {
-        done.delete(target);
+        doneBackground.delete(target);
         rewriteBackground(target);
       } else if (LAZY_SET.has(attr) || attr === "data-srcset") {
-        done.delete(target);
+        doneLazy.delete(target);
         rewriteLazy(target);
       }
     }
