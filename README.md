@@ -131,7 +131,8 @@ Bandwidth Hero Server fetches remote images, compresses them on the fly, and del
 
 # ⚡ User Script Bandwidth Hero
 
-User Script Bandwidth Hero Proxy for [Violentmonkey](https://violentmonkey.github.io/) and [Tampermonkey](https://www.tampermonkey.net/). Download [UserScriptBandwidthHero.zip](https://github.com/anT0ny54/Legacy-bromite-adblocklist/raw/main/BandwidthHero.zip).
+This alternative Bandwidth Guardian extension.
+Run User Script Bandwidth Hero Proxy for [Violentmonkey](https://violentmonkey.github.io/) and [Tampermonkey](https://www.tampermonkey.net/). Download [UserScript Bandwidth Hero](https://github.com/anT0ny54/Legacy-bromite-adblocklist/raw/main/BandwidthHero.zip).
 
 
 ## Supporting the Project
