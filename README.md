@@ -115,6 +115,7 @@ High-performance DNS utilizing HaGeZi Blocklists (Multi Pro + TIF).
 
 | Blocklist | DNS-over-HTTPS (DoH) |
 | :--- | :--- |
+| Multi Pro + TIF | `https://freedns.koyeb.app/dns-query` (Recommended) |
 | Multi Pro + TIF | `https://freedns-six.vercel.app/api/doh/dns-query` (Recommended) |
 | Multi Pro + TIF | `https://dnssix.netlify.app/api/doh/dns-query` |
 
