@@ -89,7 +89,7 @@ async function loadSiteUI(settings) {
 
   if (!currentIsWeb) {
     siteNameEl.textContent = `${url.protocol.replace(":", "")} page`;
-    sitePillEl.style.display = "none";
+    sitePillEl.classList.add("is-hidden");
     excludeBtn.textContent = "Not a web page";
     excludeBtn.disabled = true;
     return;
@@ -102,7 +102,7 @@ async function loadSiteUI(settings) {
   const isExcluded = excluded.has(currentHost);
   sitePillEl.textContent = isExcluded ? "Excluded" : "";
   sitePillEl.className = isExcluded ? "site-pill excluded" : "site-pill";
-  sitePillEl.style.display = isExcluded ? "" : "none";
+  sitePillEl.classList.toggle("is-hidden", !isExcluded);
   excludeBtn.textContent = isExcluded ? "✕ Remove exclusion" : "Exclude this site";
 }
 

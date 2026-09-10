@@ -16,7 +16,7 @@
   let ready = false;
   let excluded = new Set();
   let proxyHost = "";
-  const pending = new Set();
+  const pending = new Map();
 
   const imgProto = HTMLImageElement.prototype;
   const srcDesc = Object.getOwnPropertyDescriptor(imgProto, "src");
@@ -26,11 +26,17 @@
   const nativeSetAttribute = Element.prototype.setAttribute;
 
   function parseURL(value) {
-    try { return new URL(value); } catch { return null; }
+    try { return new URL(value, document.baseURI); } catch { return null; }
   }
 
   function isHttp(value) {
-    return /^https?:\/\//i.test(String(value || ""));
+    const url = parseURL(value);
+    return !!url && (url.protocol === "http:" || url.protocol === "https:");
+  }
+
+  function absoluteHttp(value) {
+    const url = parseURL(value);
+    return url && (url.protocol === "http:" || url.protocol === "https:") ? url.href : String(value || "");
   }
 
   function parseDomains(text) {
@@ -74,8 +80,9 @@
     const base = opts.proxyBase.trim();
     if (!base) return value;
 
+    const original = absoluteHttp(value);
     const params = new URLSearchParams({
-      url: value,
+      url: original,
       jpeg: opts.isWebpSupported ? "0" : "1",
       bw: opts.grayscale ? "1" : "0",
       quality: String(opts.quality ?? 40),
@@ -96,8 +103,9 @@
 
   function decideSrc(value) {
     if (!isHttp(value)) return value;
+    const original = absoluteHttp(value);
     if (!ready || !opts.enabled || !opts.proxyBase) return null;
-    return shouldBypass(value) ? value : proxy(value);
+    return shouldBypass(original) ? original : proxy(original);
   }
 
   function nativeSrc(el, value) {
@@ -113,25 +121,23 @@
   }
 
   function queuePending(el, src, srcset) {
-    if (src !== undefined) el.dataset.bhPendingSrc = src;
-    if (srcset !== undefined) el.dataset.bhPendingSrcset = srcset;
-    pending.add(el);
+    const previous = pending.get(el) || {};
+    if (src !== undefined) previous.src = src;
+    if (srcset !== undefined) previous.srcset = srcset;
+    pending.set(el, previous);
   }
 
   function flushPending() {
-    for (const el of pending) {
+    for (const [el, values] of pending) {
       pending.delete(el);
       try {
-        const src = el.dataset.bhPendingSrc;
-        if (src !== undefined) {
-          el.removeAttribute("data-bh-pending-src");
-          nativeSrc(el, decideSrc(src) ?? src);
+        if (values.src !== undefined) {
+          nativeSrc(el, decideSrc(values.src) ?? values.src);
         }
 
-        const srcset = el.dataset.bhPendingSrcset;
-        if (srcset !== undefined) {
-          el.removeAttribute("data-bh-pending-srcset");
-          nativeSrcset(el, rewriteSrcset(srcset));
+        if (values.srcset !== undefined) {
+          const setter = el instanceof HTMLSourceElement ? nativeSourceSrcset : nativeSrcset;
+          setter(el, rewriteSrcset(values.srcset));
         }
       } catch {}
     }
