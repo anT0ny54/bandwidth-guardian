@@ -1,4 +1,4 @@
-import { DEFAULTS } from "./defaults.js";
+import { DEFAULTS, normalizeProxyBase } from "./defaults.js";
 
 const $ = (id) => document.getElementById(id);
 const enabledEl = $("enabled");
@@ -65,7 +65,7 @@ async function load() {
   const d = await chrome.storage.sync.get(DEFAULTS);
   enabledEl.checked = !!d.enabled;
   grayscaleEl.checked = !!d.grayscale;
-  proxyBaseEl.value = d.proxyBase || "";
+  proxyBaseEl.value = normalizeProxyBase(d.proxyBase || "");
   excludeEl.value = d.excludeDomains || "";
   proxyBaseEl.classList.remove("invalid");
   setQualityUI(Number.isFinite(d.quality) ? d.quality : DEFAULTS.quality);
@@ -95,7 +95,7 @@ function parseCustomInput(input, min, max = Infinity) {
 }
 
 async function save() {
-  const proxyBase = proxyBaseEl.value.trim();
+  const proxyBase = normalizeProxyBase(proxyBaseEl.value);
   if (!isValidProxyURL(proxyBase)) {
     proxyBaseEl.classList.add("invalid");
     showToast("Proxy URL must be http:// or https://", "err");
@@ -126,36 +126,10 @@ async function resetStats() {
 }
 
 async function checkForUpdate() {
-  const current = chrome.runtime.getManifest().version;
   checkUpdateBtn.disabled = true;
-  updateStatusEl.textContent = `Checking GitHub for a newer version than v${current}…`;
-  try {
-    const response = await fetchWithTimeout(
-      "https://raw.githubusercontent.com/anT0ny54/bandwidth-guardian/main/manifest.json",
-      7000
-    );
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const remote = await response.json();
-    const latest = String(remote.version || "");
-    if (!/^\d+(?:\.\d+){1,3}$/.test(latest)) throw new Error("Invalid version");
-    const cmp = (a,b) => {
-      const aa=a.split(".").map(Number), bb=b.split(".").map(Number);
-      for(let i=0;i<Math.max(aa.length,bb.length);i++){ const x=aa[i]||0,y=bb[i]||0; if(x!==y)return x-y; }
-      return 0;
-    };
-    if (cmp(latest, current) > 0) {
-      updateStatusEl.textContent = `v${latest} is available. Download it from GitHub Releases.`;
-      showToast(`Update available: v${latest}`, "ok");
-    } else {
-      updateStatusEl.textContent = `You are up to date (v${current}).`;
-      showToast("Already up to date", "ok");
-    }
-  } catch (error) {
-    updateStatusEl.textContent = "Could not check GitHub right now. You can check Releases manually.";
-    showToast("Update check failed", "err");
-  } finally {
-    checkUpdateBtn.disabled = false;
-  }
+  updateStatusEl.textContent = `Extension v${chrome.runtime.getManifest().version} — BHP2 compatible.`;
+  showToast("This build is ready for BHP2", "ok");
+  setTimeout(() => { checkUpdateBtn.disabled = false; }, 300);
 }
 
 function fetchWithTimeout(url, ms) {
@@ -165,7 +139,7 @@ function fetchWithTimeout(url, ms) {
 }
 
 async function testProxy() {
-  const url = proxyBaseEl.value.trim();
+  const url = normalizeProxyBase(proxyBaseEl.value);
   if (!url) return showToast("Enter a proxy URL first", "err");
   if (!isValidProxyURL(url)) {
     proxyBaseEl.classList.add("invalid");

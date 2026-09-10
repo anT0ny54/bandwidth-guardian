@@ -62,6 +62,7 @@
 
   function setOptions(next) {
     opts = { ...DEFAULTS, ...(next || {}) };
+    opts.proxyBase = normalizeProxyBase(opts.proxyBase);
     excluded = parseDomains(opts.excludeDomains);
     proxyHost = parseURL(opts.proxyBase)?.hostname?.toLowerCase() || "";
     urlCache.clear();

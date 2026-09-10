@@ -25,6 +25,8 @@ Works on **Chrome**, **Kiwi Browser**, **Cromite**, and any Chromium-based brows
 
 ### From source (sideload)
 
+**BHP2 backend:** this extension is compatible with [anT0ny54/bhp2](https://github.com/anT0ny54/bhp2). **No proxy is configured by default**. Set the proxy to your deployed BHP2 `/api` endpoint, for example `https://your-site.netlify.app/api`. The extension also accepts a bare Netlify site URL and normalizes it to `/api`.
+
 1. Clone or download this repository
 2. Open `chrome://extensions` (or `kiwi://extensions`)
 3. Enable **Developer mode**
@@ -46,7 +48,7 @@ The build script produces a deterministic zip using a fixed timestamp so the out
 
 Bandwidth Guardian requires a compatible compression proxy. The recommended proxy is:
 
-**[bandwidth-hero-proxy2](https://github.com/himshim/bandwidth-hero-proxy2)** — deploy free on Netlify in one click.
+**[BHP2 / bandwidth-hero-proxy2](https://github.com/himshim/BHP2 / bandwidth-hero-proxy2)** — deploy free on Netlify in one click.
 
 The proxy must:
 - Accept `?url=<encoded>&quality=<n>&bw=0or1&jpeg=0or1&max_width=<n>`
@@ -97,7 +99,7 @@ Pull requests are welcome. Please open an issue first for anything beyond a smal
 
 ## Credits
 
-Based on [bandwidth-hero](https://github.com/ayastreb/bandwidth-hero) by Anatoliy Yastreb (MIT) and the serverless proxy port [bandwidth-hero-proxy2](https://github.com/himshim/bandwidth-hero-proxy2).
+Based on [bandwidth-hero](https://github.com/ayastreb/bandwidth-hero) by Anatoliy Yastreb (MIT) and the serverless proxy port [BHP2 / bandwidth-hero-proxy2](https://github.com/himshim/BHP2 / bandwidth-hero-proxy2).
 
 ---
 
