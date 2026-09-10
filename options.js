@@ -1,4 +1,4 @@
-import { DEFAULTS } from "./defaults.js";
+import { DEFAULTS, normalizeProxyBase } from "./defaults.js";
 
 const $ = (id) => document.getElementById(id);
 const enabledEl = $("enabled");
@@ -65,7 +65,7 @@ async function load() {
   const d = await chrome.storage.sync.get(DEFAULTS);
   enabledEl.checked = !!d.enabled;
   grayscaleEl.checked = !!d.grayscale;
-  proxyBaseEl.value = d.proxyBase || "";
+  proxyBaseEl.value = d.proxyBase ? normalizeProxyBase(d.proxyBase) : "";
   excludeEl.value = d.excludeDomains || "";
   proxyBaseEl.classList.remove("invalid");
   setQualityUI(Number.isFinite(d.quality) ? d.quality : DEFAULTS.quality);
@@ -95,7 +95,7 @@ function parseCustomInput(input, min, max = Infinity) {
 }
 
 async function save() {
-  const proxyBase = proxyBaseEl.value.trim();
+  const proxyBase = normalizeProxyBase(proxyBaseEl.value);
   if (!isValidProxyURL(proxyBase)) {
     proxyBaseEl.classList.add("invalid");
     showToast("Proxy URL must be http:// or https://", "err");
@@ -165,7 +165,7 @@ function fetchWithTimeout(url, ms) {
 }
 
 async function testProxy() {
-  const url = proxyBaseEl.value.trim();
+  const url = normalizeProxyBase(proxyBaseEl.value);
   if (!url) return showToast("Enter a proxy URL first", "err");
   if (!isValidProxyURL(url)) {
     proxyBaseEl.classList.add("invalid");

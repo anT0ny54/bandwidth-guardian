@@ -26,6 +26,14 @@ function parseDomains(text) {
   return set;
 }
 
+function isExcludedHost(host, domains) {
+  if (domains.has(host)) return true;
+  for (const domain of domains) {
+    if (host.endsWith("." + domain)) return true;
+  }
+  return false;
+}
+
 function nearestPreset(value) {
   return PRESETS.reduce(
     (best, candidate) =>
@@ -99,7 +107,7 @@ async function loadSiteUI(settings) {
   excludeBtn.disabled = false;
 
   const excluded = parseDomains(settings.excludeDomains);
-  const isExcluded = excluded.has(currentHost);
+  const isExcluded = isExcludedHost(currentHost, excluded);
   sitePillEl.textContent = isExcluded ? "Excluded" : "";
   sitePillEl.className = isExcluded ? "site-pill excluded" : "site-pill";
   sitePillEl.style.display = isExcluded ? "" : "none";

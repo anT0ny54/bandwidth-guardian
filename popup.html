@@ -2,50 +2,50 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="viewport" content="width=320,initial-scale=1,maximum-scale=1,viewport-fit=cover">
+  <meta name="color-scheme" content="dark light">
   <title>Bandwidth Guardian</title>
   <link rel="stylesheet" href="popup.css">
 </head>
 <body>
-<div class="wrap">
-
-  <!-- Header -->
-  <div class="card">
-    <div class="header">
-      <img class="shield" src="shield.svg" alt="">
-      <div>
-        <div class="header-title">Bandwidth Guardian</div>
-        <div class="header-sub" id="headerSub">Loading…</div>
+<main class="wrap">
+  <section class="card">
+    <header class="header">
+      <img class="shield" src="shield.svg" alt="" aria-hidden="true">
+      <div class="header-copy">
+        <h1 class="header-title">Bandwidth Guardian</h1>
+        <p class="header-sub" id="headerSub">Loading…</p>
       </div>
-    </div>
+    </header>
 
     <label class="toggle-row" for="enabled">
-      <div>
-        <div class="tr-label">Enable compression</div>
-        <div class="tr-hint">Route images through proxy</div>
-      </div>
+      <span class="toggle-copy">
+        <span class="tr-label">Enable compression</span>
+        <span class="tr-hint">Route images through proxy</span>
+      </span>
       <input type="checkbox" id="enabled" class="switch">
     </label>
 
-    <div class="nudge" id="nudge">
-      Reload the page to apply changes
+    <div class="nudge" id="nudge" role="status">
+      <span>Reload page to apply changes</span>
       <button class="nudge-btn" id="reloadBtn" type="button">Reload</button>
     </div>
-  </div>
+  </section>
 
-  <div class="card" id="ctrlCard">
+  <section class="card" id="ctrlCard">
     <label class="toggle-row" for="grayscale">
-      <div>
-        <div class="tr-label">Grayscale</div>
-        <div class="tr-hint">B&amp;W images use less data</div>
-      </div>
+      <span class="toggle-copy">
+        <span class="tr-label">Grayscale</span>
+        <span class="tr-hint">B&amp;W images use less data</span>
+      </span>
       <input type="checkbox" id="grayscale" class="switch">
     </label>
-    <div class="section-head">Quality</div>
+
+    <h2 class="section-head">Quality</h2>
     <div class="presets" id="qualityPresets">
       <button class="preset" data-q="20" type="button">
         <span class="p-label">Small</span>
-        <span class="p-hint">Saves most</span>
+        <span class="p-hint">Most savings</span>
       </button>
       <button class="preset" data-q="40" type="button">
         <span class="p-label">Normal</span>
@@ -56,28 +56,23 @@
         <span class="p-hint">Best quality</span>
       </button>
     </div>
-  </div>
+  </section>
 
-  <!-- Current site -->
-  <div class="card">
+  <section class="card site-card">
     <div class="site-row">
-      <span>🌐</span>
+      <span aria-hidden="true">🌐</span>
       <span class="site-host" id="siteName">—</span>
       <span class="site-pill" id="sitePill" hidden></span>
     </div>
     <div class="btn-row">
       <button id="excludeBtn" class="btn" type="button">Exclude this site</button>
     </div>
-  </div>
+  </section>
 
-  <!-- Settings button -->
   <div class="settings-action">
-    <button id="settingsBtn" class="btn primary" type="button">
-      ⚙ Settings
-    </button>
+    <button id="settingsBtn" class="btn primary" type="button">⚙ Settings</button>
   </div>
-
-</div>
+</main>
 <script type="module" src="popup.js"></script>
 </body>
 </html>
