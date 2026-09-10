@@ -3,7 +3,7 @@ name: Build Bandwidth Guardian
 on:
   push:
     branches: [main]
-    tags: ['v*']
+    tags: ['v0.0.5']
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -19,6 +19,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Extract version
+        id: version
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            VERSION="${{ github.ref }}" 
+            VERSION="${VERSION#refs/tags/v}"
+            echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          else
+            # Default version for non-tag pushes
+            VERSION="0.0.0-dev"
+            echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build extension
         run: bash ./build.sh --out ./dist
 
@@ -26,7 +39,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          ZIP="dist/bandwidth-guardian-0.0.5.zip"
+          ZIP="dist/bandwidth-guardian-${{ steps.version.outputs.version }}.zip"
           test -s "$ZIP"
           unzip -tq "$ZIP"
           unzip -Z1 "$ZIP" | grep -Fx 'manifest.json'
@@ -43,8 +56,8 @@ jobs:
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: bandwidth-guardian-0.0.5
-          path: dist/bandwidth-guardian-0.0.5.zip
+          name: bandwidth-guardian-${{ steps.version.outputs.version }}
+          path: dist/bandwidth-guardian-${{ steps.version.outputs.version }}.zip
           if-no-files-found: error
           retention-days: 30
 
@@ -59,11 +72,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Extract version
+        id: version
+        run: |
+          VERSION="${{ github.ref }}"
+          VERSION="${VERSION#refs/tags/v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
       - name: Build release ZIP
         run: bash ./build.sh --out ./dist
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/bandwidth-guardian-0.0.5.zip
+          files: dist/bandwidth-guardian-${{ steps.version.outputs.version }}.zip
           generate_release_notes: true
