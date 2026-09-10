@@ -48,7 +48,7 @@ The build script produces a deterministic zip using a fixed timestamp so the out
 
 Bandwidth Guardian requires a compatible compression proxy. The recommended proxy is:
 
-**[BHP2 / bandwidth-hero-proxy2](https://github.com/himshim/BHP2 / bandwidth-hero-proxy2)** — deploy free on Netlify in one click.
+**[BHP2 / bandwidth-hero-proxy2](https://github.com/anT0ny54/bhp2)** — deploy free on Netlify in one click.
 
 The proxy must:
 - Accept `?url=<encoded>&quality=<n>&bw=0or1&jpeg=0or1&max_width=<n>`
