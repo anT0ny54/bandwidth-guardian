@@ -18,14 +18,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build v0.0.5
+      - name: Read manifest version
+        id: version
+        shell: bash
+        run: echo "version=$(python3 -c 'import json; print(json.load(open("manifest.json"))["version"])')" >> "$GITHUB_OUTPUT"
+
+      - name: Build extension
         run: bash ./build.sh --out ./dist
 
       - name: Upload Actions artifact
         uses: actions/upload-artifact@v4
         with:
-          name: bandwidth-guardian-0.0.5
-          path: dist/bandwidth-guardian-0.0.5.zip
+          name: bandwidth-guardian-${{ steps.version.outputs.version }}
+          path: dist/bandwidth-guardian-${{ steps.version.outputs.version }}.zip
           if-no-files-found: error
           retention-days: 30
 
@@ -41,20 +46,21 @@ jobs:
       - name: Build release ZIP
         run: bash ./build.sh --out ./dist
 
-      - name: Publish v0.0.5 release
+      - name: Publish manifest version release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          ZIP="dist/bandwidth-guardian-0.0.5.zip"
+          VERSION="$(python3 -c 'import json; print(json.load(open("manifest.json"))["version"])')"
+          ZIP="dist/bandwidth-guardian-${VERSION}.zip"
 
-          if gh release view v0.0.5 >/dev/null 2>&1; then
-            echo "Release v0.0.5 exists; replacing release asset."
-            gh release upload v0.0.5 "$ZIP" --clobber
+          if gh release view "v${VERSION}" >/dev/null 2>&1; then
+            echo "Release v${VERSION} exists; replacing release asset."
+            gh release upload "v${VERSION}" "$ZIP" --clobber
           else
-            echo "Creating release v0.0.5."
-            gh release create v0.0.5 "$ZIP" \
+            echo "Creating v${VERSION} release."
+            gh release create "v${VERSION}" "$ZIP" \
               --target "$GITHUB_SHA" \
-              --title "Bandwidth Guardian v0.0.5" \
+              --title "Bandwidth Guardian v${VERSION}" \
               --generate-notes
           fi
