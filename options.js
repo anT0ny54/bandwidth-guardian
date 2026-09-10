@@ -62,6 +62,8 @@ function readWidth() {
 }
 
 async function load() {
+  const version = chrome.runtime.getManifest().version;
+  updateStatusEl.textContent = `Current version: v${version}`;
   const d = await chrome.storage.sync.get(DEFAULTS);
   enabledEl.checked = !!d.enabled;
   grayscaleEl.checked = !!d.grayscale;
