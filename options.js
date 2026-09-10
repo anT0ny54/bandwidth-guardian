@@ -12,6 +12,8 @@ const resetStatsBtn = $("resetStats");
 const statImagesEl = $("statImages");
 const statBytesEl = $("statBytes");
 const toastEl = $("toast");
+const checkUpdateBtn = $("checkUpdate");
+const updateStatusEl = $("updateStatus");
 const customQualityEl = $("customQuality");
 const customWidthEl = $("customWidth");
 const qualityPresets = [...document.querySelectorAll("#qualityPresets .preset")];
@@ -123,6 +125,39 @@ async function resetStats() {
   showToast("Stats cleared");
 }
 
+async function checkForUpdate() {
+  const current = chrome.runtime.getManifest().version;
+  checkUpdateBtn.disabled = true;
+  updateStatusEl.textContent = `Checking GitHub for a newer version than v${current}…`;
+  try {
+    const response = await fetchWithTimeout(
+      "https://raw.githubusercontent.com/anT0ny54/bandwidth-guardian/main/manifest.json",
+      7000
+    );
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const remote = await response.json();
+    const latest = String(remote.version || "");
+    if (!/^\d+(?:\.\d+){1,3}$/.test(latest)) throw new Error("Invalid version");
+    const cmp = (a,b) => {
+      const aa=a.split(".").map(Number), bb=b.split(".").map(Number);
+      for(let i=0;i<Math.max(aa.length,bb.length);i++){ const x=aa[i]||0,y=bb[i]||0; if(x!==y)return x-y; }
+      return 0;
+    };
+    if (cmp(latest, current) > 0) {
+      updateStatusEl.textContent = `v${latest} is available. Download it from GitHub Releases.`;
+      showToast(`Update available: v${latest}`, "ok");
+    } else {
+      updateStatusEl.textContent = `You are up to date (v${current}).`;
+      showToast("Already up to date", "ok");
+    }
+  } catch (error) {
+    updateStatusEl.textContent = "Could not check GitHub right now. You can check Releases manually.";
+    showToast("Update check failed", "err");
+  } finally {
+    checkUpdateBtn.disabled = false;
+  }
+}
+
 function fetchWithTimeout(url, ms) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), ms);
@@ -187,6 +222,7 @@ saveBtn.addEventListener("click", save);
 resetAllBtn.addEventListener("click", resetAll);
 resetStatsBtn.addEventListener("click", resetStats);
 testProxyBtn.addEventListener("click", testProxy);
+checkUpdateBtn.addEventListener("click", () => void checkForUpdate());
 proxyBaseEl.addEventListener("input", () => proxyBaseEl.classList.remove("invalid"));
 
 [proxyBaseEl, excludeEl, customQualityEl, customWidthEl].forEach((el) => {
