@@ -20,6 +20,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 mkdir -p "$OUTDIR"
+OUTDIR="$(cd "$OUTDIR" && pwd)"
+cd "$ROOT_DIR"
 
 VERSION="$(
   python3 - <<'PY'
@@ -44,6 +46,8 @@ INCLUDE=(
   popup.js
   options.html
   options.js
+  options.css
+  popup.css
   _locales
   icons
 )
