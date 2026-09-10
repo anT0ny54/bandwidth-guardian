@@ -9,6 +9,7 @@ const DEFAULTS = {
   maxWidth: 1920,
   excludeDomains: "google.com gstatic.com",
   isWebpSupported: false,
+  failoverOriginal: true,
 };
 
 const RULE_ID_CSP = 2;

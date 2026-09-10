@@ -9,6 +9,7 @@ export const DEFAULTS = {
   maxWidth:       1920,
   excludeDomains: "google.com gstatic.com",
   isWebpSupported: false,
+  failoverOriginal: true,
 };
 
 // BHP2 is deployed as a Netlify function at /api.

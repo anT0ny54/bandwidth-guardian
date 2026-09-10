@@ -3,6 +3,7 @@ import { DEFAULTS, normalizeProxyBase } from "./defaults.js";
 const $ = (id) => document.getElementById(id);
 const enabledEl = $("enabled");
 const grayscaleEl = $("grayscale");
+const failoverOriginalEl = $("failoverOriginal");
 const proxyBaseEl = $("proxyBase");
 const testProxyBtn = $("testProxy");
 const excludeEl = $("excludeDomains");
@@ -65,6 +66,7 @@ async function load() {
   const d = await chrome.storage.sync.get(DEFAULTS);
   enabledEl.checked = !!d.enabled;
   grayscaleEl.checked = !!d.grayscale;
+  failoverOriginalEl.checked = d.failoverOriginal !== false;
   proxyBaseEl.value = d.proxyBase ? normalizeProxyBase(d.proxyBase) : "";
   excludeEl.value = d.excludeDomains || "";
   proxyBaseEl.classList.remove("invalid");
@@ -109,6 +111,7 @@ async function save() {
     quality: readQuality(),
     maxWidth: readWidth(),
     excludeDomains: excludeEl.value.trim(),
+    failoverOriginal: failoverOriginalEl.checked,
   });
   showToast("Saved", "ok");
 }
@@ -216,6 +219,10 @@ enabledEl.addEventListener("change", async () => {
 grayscaleEl.addEventListener("change", async () => {
   await chrome.storage.sync.set({ grayscale: grayscaleEl.checked });
   showToast("Reload the page to apply", "warn");
+});
+failoverOriginalEl.addEventListener("change", async () => {
+  await chrome.storage.sync.set({ failoverOriginal: failoverOriginalEl.checked });
+  showToast(failoverOriginalEl.checked ? "Original failover enabled" : "Original failover disabled", "ok");
 });
 
 saveBtn.addEventListener("click", save);

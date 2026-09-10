@@ -21,7 +21,7 @@
     <label class="toggle-row" for="enabled">
       <span class="toggle-copy">
         <span class="tr-label">Enable compression</span>
-        <span class="tr-hint">Route images through proxy</span>
+        <span class="tr-hint">Save image data through proxy</span>
       </span>
       <input type="checkbox" id="enabled" class="switch">
     </label>
@@ -36,7 +36,7 @@
     <label class="toggle-row" for="grayscale">
       <span class="toggle-copy">
         <span class="tr-label">Grayscale</span>
-        <span class="tr-hint">B&amp;W images use less data</span>
+        <span class="tr-hint">Optional extra savings</span>
       </span>
       <input type="checkbox" id="grayscale" class="switch">
     </label>
@@ -45,15 +45,15 @@
     <div class="presets" id="qualityPresets">
       <button class="preset" data-q="20" type="button">
         <span class="p-label">Small</span>
-        <span class="p-hint">Most savings</span>
+        <span class="p-hint">Maximum savings</span>
       </button>
       <button class="preset" data-q="40" type="button">
         <span class="p-label">Normal</span>
-        <span class="p-hint">Recommended</span>
+        <span class="p-hint">Balanced</span>
       </button>
       <button class="preset" data-q="80" type="button">
         <span class="p-label">Sharp</span>
-        <span class="p-hint">Best quality</span>
+        <span class="p-hint">Highest quality</span>
       </button>
     </div>
   </section>
@@ -65,12 +65,12 @@
       <span class="site-pill" id="sitePill" hidden></span>
     </div>
     <div class="btn-row">
-      <button id="excludeBtn" class="btn" type="button">Exclude this site</button>
+      <button id="excludeBtn" class="btn" type="button">Skip this site</button>
     </div>
   </section>
 
   <div class="settings-action">
-    <button id="settingsBtn" class="btn primary" type="button">⚙ Settings</button>
+    <button id="settingsBtn" class="btn primary" type="button">⚙  Settings</button>
   </div>
 </main>
 <script type="module" src="popup.js"></script>
