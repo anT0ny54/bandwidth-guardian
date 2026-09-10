@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 46 46" fill="none">
+  <defs>
+    <linearGradient id="guardian-gradient" x1="0" y1="0" x2="46" y2="46" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#1a3e99"/>
+      <stop offset="50%" stop-color="#0891b2"/>
+      <stop offset="100%" stop-color="#22c55e"/>
+    </linearGradient>
+  </defs>
+  <path d="M23 3 L42 10 L42 23 C42 33 33 41 23 44 C13 41 4 33 4 23 L4 10 Z" fill="url(#guardian-gradient)"/>
+  <polyline points="9,34 17,20 22,27 29,15 37,34" fill="none" stroke="white" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round" opacity="0.9"/>
+  <line x1="12" y1="31" x2="24" y2="24" stroke="white" stroke-width="1.8" opacity="0.85"/>
+  <line x1="24" y1="24" x2="34" y2="28" stroke="white" stroke-width="1.8" opacity="0.85"/>
+  <circle cx="12" cy="31" r="2.5" fill="white" opacity="0.9"/>
+  <circle cx="24" cy="24" r="2.5" fill="white" opacity="0.9"/>
+  <circle cx="34" cy="28" r="2.5" fill="white" opacity="0.9"/>
+</svg>
