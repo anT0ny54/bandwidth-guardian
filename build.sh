@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 # Bandwidth Guardian — safe production build
 # Packages the existing source files without modifying extension logic.
-# Usage: bash build.sh [--out DIR]
+# Usage: bash build.sh [--out DIR] [--version VERSION]
 
 set -euo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 OUTDIR="$ROOT_DIR"
+OVERRIDE_VERSION=""
 SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-1709856000}"
 
 usage() {
-  echo "Usage: bash build.sh [--out DIR]"
+  echo "Usage: bash build.sh [--out DIR] [--version VERSION]"
 }
 
 fail() {
@@ -23,6 +24,11 @@ while [[ $# -gt 0 ]]; do
     --out)
       [[ $# -ge 2 && -n "${2:-}" ]] || fail "--out requires a directory"
       OUTDIR="$2"
+      shift 2
+      ;;
+    --version)
+      [[ $# -ge 2 && -n "${2:-}" ]] || fail "--version requires a version string"
+      OVERRIDE_VERSION="$2"
       shift 2
       ;;
     -h|--help)
@@ -66,6 +72,11 @@ if version != "0.0.5":
 print(version)
 PY
 )"
+
+# Allow override for dev/release builds
+if [[ -n "$OVERRIDE_VERSION" ]]; then
+  VERSION="$OVERRIDE_VERSION"
+fi
 
 # Exact runtime package. Keep this list explicit so source/CI files cannot
 # accidentally enter the extension ZIP.
