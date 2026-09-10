@@ -28,22 +28,6 @@
   function parseURL(value) {
     try { return new URL(value); } catch { return null; }
   }
-  function normalizeProxyBase(value) {
-    const raw = String(value || "").trim();
-    if (!raw) return "";
-    try {
-      const url = new URL(raw);
-      if (url.protocol !== "http:" && url.protocol !== "https:") return raw;
-      const path = url.pathname.replace(/\/+$/, "");
-      if (!path) url.pathname = "/api";
-      else if (path === "/api") url.pathname = "/api";
-      else url.pathname = path;
-      url.search = "";
-      url.hash = "";
-      return url.toString().replace(/\/$/, "");
-    } catch { return raw; }
-  }
-
 
   function isHttp(value) {
     return /^https?:\/\//i.test(String(value || ""));
@@ -62,7 +46,6 @@
 
   function configure(next) {
     opts = { ...DEFAULTS, ...(next || {}) };
-    opts.proxyBase = normalizeProxyBase(opts.proxyBase);
     excluded = parseDomains(opts.excludeDomains);
     proxyHost = parseURL(opts.proxyBase)?.hostname?.toLowerCase() || "";
   }
