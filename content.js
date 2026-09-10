@@ -55,12 +55,9 @@
   const imgSrc = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, "src");
   const sourceSrcset = Object.getOwnPropertyDescriptor(HTMLSourceElement.prototype, "srcset");
 
+  const isHttp = (value) => /^https?:\/\//i.test(String(value || ""));
   const parseURL = (value) => {
-    try { return new URL(value, document.baseURI); } catch { return null; }
-  };
-  const isHttp = (value) => {
-    const url = parseURL(value);
-    return !!url && (url.protocol === "http:" || url.protocol === "https:");
+    try { return new URL(value); } catch { return null; }
   };
 
   function setOptions(next) {
@@ -116,12 +113,8 @@
     if (cached) return cached;
 
     const separator = base.includes("?") ? "&" : "?";
-    const source = parseURL(original);
-    const absolute = source && (source.protocol === "http:" || source.protocol === "https:")
-      ? source.href
-      : original;
     const params = new URLSearchParams({
-      url: absolute,
+      url: original,
       jpeg: opts.isWebpSupported ? "0" : "1",
       bw: opts.grayscale ? "1" : "0",
       quality: String(opts.quality ?? 40),
@@ -166,7 +159,7 @@
 
     let changed = false;
     const src = el.getAttribute("src");
-    if (tag === "IMG" && src && !shouldSkip(src)) {
+    if (src && !shouldSkip(src)) {
       nativeSrc(el, buildProxyUrl(src));
       changed = true;
     }

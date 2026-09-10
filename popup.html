@@ -4,8 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <title>Bandwidth Guardian</title>
-      <link rel="stylesheet" href="popup.css">
-
+  <link rel="stylesheet" href="popup.css">
 </head>
 <body>
 <div class="wrap">
@@ -59,7 +58,7 @@
 
   <!-- Compression settings — dims when extension is off -->
   <div class="card" id="ctrlCard">
-    <label class="toggle-row first" for="grayscale">
+    <label class="toggle-row" style="border-top:none" for="grayscale">
       <div>
         <div class="tr-label">Grayscale</div>
         <div class="tr-hint">B&amp;W images use less data</div>
@@ -88,7 +87,7 @@
     <div class="site-row">
       <span>🌐</span>
       <span class="site-host" id="siteName">—</span>
-      <span class="site-pill is-hidden" id="sitePill"></span>
+      <span class="site-pill" id="sitePill" style="display:none"></span>
     </div>
     <div class="btn-row">
       <button id="excludeBtn" class="btn" type="button">Exclude this site</button>
@@ -96,8 +95,8 @@
   </div>
 
   <!-- Settings button -->
-  <div class="settings-wrap">
-    <button id="settingsBtn" class="btn primary settings-btn" type="button">
+  <div style="display:flex;gap:8px">
+    <button id="settingsBtn" class="btn primary" type="button" style="flex:1;min-height:42px">
       ⚙ Settings
     </button>
   </div>

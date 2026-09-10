@@ -2,6 +2,7 @@
 
 > Save mobile data by compressing images through a self-hosted proxy before they load.
 
+
 Bandwidth Guardian is a Manifest V3 Chrome extension that routes every image through a compression proxy before the browser downloads it. It supports WebP output, grayscale mode, per-site exclusions, and configurable quality and max-width.
 
 Works on **Chrome**, **Kiwi Browser**, **Cromite**, and any Chromium-based browser that supports MV3.
@@ -45,7 +46,7 @@ The build script produces a deterministic zip using a fixed timestamp so the out
 
 Bandwidth Guardian requires a compatible compression proxy. The recommended proxy is:
 
-**[anT0ny54/bhp2](https://github.com/anT0ny54/bhp2)** — deploy free on Netlify in one click.
+**[bandwidth-hero-proxy2](https://github.com/himshim/bandwidth-hero-proxy2)** — deploy free on Netlify in one click.
 
 The proxy must:
 - Accept `?url=<encoded>&quality=<n>&bw=0or1&jpeg=0or1&max_width=<n>`
@@ -96,7 +97,7 @@ Pull requests are welcome. Please open an issue first for anything beyond a smal
 
 ## Credits
 
-Based on [bandwidth-hero](https://github.com/ayastreb/bandwidth-hero) by Anatoliy Yastreb (MIT) and the serverless proxy port [anT0ny54/bhp2](https://github.com/anT0ny54/bhp2).
+Based on [bandwidth-hero](https://github.com/ayastreb/bandwidth-hero) by Anatoliy Yastreb (MIT) and the serverless proxy port [bandwidth-hero-proxy2](https://github.com/himshim/bandwidth-hero-proxy2).
 
 ---
 

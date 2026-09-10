@@ -4,8 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <title>Bandwidth Guardian — Settings</title>
-      <link rel="stylesheet" href="options.css">
-
+  <link rel="stylesheet" href="options.css">
 </head>
 <body>
 <div class="wrap">
@@ -73,7 +72,7 @@
           <span class="p-hint">Best quality</span>
         </button>
       </div>
-      <div class="hint mt8">Reload the page after changing quality.</div>
+      <div class="hint" style="margin-top:8px">Reload the page after changing quality.</div>
     </div>
   </div>
 
@@ -95,7 +94,7 @@
           <span class="p-hint">Original size</span>
         </button>
       </div>
-      <div class="hint mt8">Images wider than this are scaled down before compressing.</div>
+      <div class="hint" style="margin-top:8px">Images wider than this are scaled down before compressing.</div>
     </div>
   </div>
 
@@ -113,7 +112,7 @@
       </div>
       <div class="hint">
         Need a proxy? →
-        <a href="https://github.com/anT0ny54/bhp2" target="_blank" rel="noopener">anT0ny54/bhp2</a><br>
+        <a href="https://github.com/himshim/bandwidth-hero-proxy2" target="_blank" rel="noopener">bandwidth-hero-proxy2</a><br>
         Expects <code>?url=…&quality=…&bw=1&jpeg=1</code>
       </div>
     </div>
@@ -144,10 +143,10 @@
           <div class="stat-val" id="statBytes">—</div>
         </div>
       </div>
-      <div class="hint mt8">
+      <div class="hint" style="margin-top:8px">
         Reads <code>x-bytes-saved</code> and <code>x-original-size</code> headers from your proxy.
       </div>
-      <div class="btn-row mt10">
+      <div class="btn-row" style="margin-top:10px">
         <button id="resetStats" class="btn ghost" type="button">Reset stats</button>
       </div>
     </div>
@@ -159,21 +158,21 @@
       <summary>Advanced</summary>
       <div class="adv-body">
         <div>
-          <div class="field-label field-label-sm">Custom quality (1–100)</div>
+          <div class="field-label" style="font-size:12px;margin-bottom:6px">Custom quality (1–100)</div>
           <div class="adv-row">
             <input id="customQuality" type="number" min="1" max="100" step="1"
                    placeholder="e.g. 55" inputmode="numeric">
-            <label for="customQuality" class="adv-hint">
+            <label for="customQuality" style="color:var(--sub);font-size:11px">
               Overrides the preset above
             </label>
           </div>
         </div>
         <div>
-          <div class="field-label field-label-sm">Custom max width (px, 0 = no limit)</div>
+          <div class="field-label" style="font-size:12px;margin-bottom:6px">Custom max width (px, 0 = no limit)</div>
           <div class="adv-row">
             <input id="customWidth" type="number" min="0" step="10"
                    placeholder="e.g. 1440" inputmode="numeric">
-            <label for="customWidth" class="adv-hint">
+            <label for="customWidth" style="color:var(--sub);font-size:11px">
               Overrides the preset above
             </label>
           </div>
@@ -184,7 +183,7 @@
 
   <!-- Source -->
   <div class="card">
-    <div class="row source-row">
+    <div class="row" style="font-size:13px">
       Source →
       <a href="https://github.com/anT0ny54/bandwidth-guardian" target="_blank" rel="noopener">
         github.com/anT0ny54/bandwidth-guardian
@@ -193,21 +192,20 @@
     </div>
   </div>
 
+</div>
 
-  <div class="card">
+<div class="card">
     <div class="row" id="updateSection">
       <div class="field-label">Updates</div>
       <div class="hint" id="updateStatus">Current version: v0.0.5</div>
-      <div class="btn-row mt10">
+      <div class="btn-row" style="margin-top:10px">
         <button id="checkUpdate" class="btn ghost" type="button">Check for update</button>
         <a class="btn ghost" href="https://github.com/anT0ny54/bandwidth-guardian/releases" target="_blank" rel="noopener">GitHub releases</a>
       </div>
     </div>
   </div>
 
-</div>
-
-<div class="action-bar">
+  <div class="action-bar">
   <button id="resetAll" class="btn ghost"    type="button">Reset defaults</button>
   <button id="save"     class="btn primary"  type="button">Save</button>
 </div>
