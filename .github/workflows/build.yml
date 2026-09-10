@@ -1,89 +1,60 @@
-name: Build Bandwidth Guardian
+name: Build and Release
 
 on:
   push:
-    branches: [main]
-    tags: ['v0.0.5']
-  pull_request:
-    branches: [main]
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
+    name: Build extension
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Extract version
-        id: version
-        run: |
-          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
-            VERSION="${{ github.ref }}" 
-            VERSION="${VERSION#refs/tags/v}"
-            echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          else
-            # Default version for non-tag pushes
-            VERSION="0.0.0-dev"
-            echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Build extension
+      - name: Build v0.0.5
         run: bash ./build.sh --out ./dist
 
-      - name: Verify release ZIP
-        shell: bash
-        run: |
-          set -euo pipefail
-          ZIP="dist/bandwidth-guardian-${{ steps.version.outputs.version }}.zip"
-          test -s "$ZIP"
-          unzip -tq "$ZIP"
-          unzip -Z1 "$ZIP" | grep -Fx 'manifest.json'
-          unzip -Z1 "$ZIP" | grep -Fx 'popup.css'
-          unzip -Z1 "$ZIP" | grep -Fx 'options.css'
-          unzip -Z1 "$ZIP" | grep -Fx 'shield.svg'
-          if unzip -Z1 "$ZIP" | grep -q '^bandwidth-guardian-main/'; then
-            echo 'ERROR: archive contains a top-level wrapper directory.'
-            exit 1
-          fi
-          echo "Release ZIP: $ZIP"
-          sha256sum "$ZIP"
-
-      - name: Upload build artifact
+      - name: Upload Actions artifact
         uses: actions/upload-artifact@v4
         with:
-          name: bandwidth-guardian-${{ steps.version.outputs.version }}
-          path: dist/bandwidth-guardian-${{ steps.version.outputs.version }}.zip
+          name: bandwidth-guardian-0.0.5
+          path: dist/bandwidth-guardian-0.0.5.zip
           if-no-files-found: error
           retention-days: 30
 
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    name: Publish GitHub Release
     needs: build
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Extract version
-        id: version
-        run: |
-          VERSION="${{ github.ref }}"
-          VERSION="${VERSION#refs/tags/v}"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-
       - name: Build release ZIP
         run: bash ./build.sh --out ./dist
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/bandwidth-guardian-${{ steps.version.outputs.version }}.zip
-          generate_release_notes: true
+      - name: Publish v0.0.5 release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ZIP="dist/bandwidth-guardian-0.0.5.zip"
+
+          if gh release view v0.0.5 >/dev/null 2>&1; then
+            echo "Release v0.0.5 exists; replacing release asset."
+            gh release upload v0.0.5 "$ZIP" --clobber
+          else
+            echo "Creating release v0.0.5."
+            gh release create v0.0.5 "$ZIP" \
+              --target "$GITHUB_SHA" \
+              --title "Bandwidth Guardian v0.0.5" \
+              --generate-notes
+          fi
