@@ -29,10 +29,14 @@ with open(sys.argv[1], encoding='utf-8') as f:
 PY
 )"
 
-[[ "$VERSION" == "0.0.5" ]] || {
-  echo "ERROR: expected version 0.0.5, found $VERSION" >&2
-  exit 1
-}
+# The manifest is the single source of truth for the extension version.
+# Do not hard-code a release version here: every manifest version must build.
+python3 - "$VERSION" <<'PYVERCHECK'
+import re, sys
+version = sys.argv[1]
+if not re.fullmatch(r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)", version):
+    raise SystemExit(f"ERROR: invalid extension version: {version!r}")
+PYVERCHECK
 
 ZIPFILE="$OUTDIR/bandwidth-guardian-$VERSION.zip"
 SOURCE_DATE_EPOCH=1709856000
@@ -71,7 +75,8 @@ manifest_path = sys.argv[1]
 with open(manifest_path, encoding='utf-8') as f:
     manifest = json.load(f)
 assert manifest.get('manifest_version') == 3, 'Manifest V3 required'
-assert manifest.get('version') == '0.0.5', 'Version must be 0.0.5'
+version = manifest.get('version')
+assert isinstance(version, str) and version, 'Manifest version missing'
 for item in sys.argv[2:]:
     if not os.path.exists(os.path.join(os.path.dirname(manifest_path), item)):
         raise SystemExit(f'Missing staged item: {item}')
