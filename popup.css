@@ -198,3 +198,38 @@
 .is-hidden { display: none; }
 .settings-wrap { display: flex; gap: 8px; }
 .settings-btn { flex: 1; min-height: 42px; }
+
+/* ── Mobile-first touch refinements ───────────────────────────────────── */
+html { width: 100%; min-width: 0; }
+body { width: 100%; min-width: 0; overflow-x: hidden; }
+button, input, textarea, select { font: inherit; }
+button, label, .switch { touch-action: manipulation; }
+@media (max-width: 380px) {
+  .wrap { max-width: none; width: 100%; padding: 8px 8px calc(8px + env(safe-area-inset-bottom, 0px)); gap: 7px; }
+  .card { border-radius: 12px; }
+  .header { padding: 12px; gap: 10px; }
+  .header-title { font-size: 15px; }
+  .header-sub { font-size: 11px; }
+  .shield { width: 34px; height: 34px; }
+  .toggle-row { min-height: 56px; padding: 12px; gap: 12px; }
+  .tr-label { font-size: 14px; }
+  .tr-hint { font-size: 11px; }
+  .switch { width: 48px; height: 28px; }
+  .switch::after { width: 22px; height: 22px; }
+  .switch:checked::after { transform: translateX(20px); }
+  .section-head { padding: 11px 12px 0; }
+  .presets { gap: 5px; padding: 8px 10px 10px; }
+  .preset { min-height: 52px; padding: 7px 3px; }
+  .preset .p-label { font-size: 12px; }
+  .preset .p-hint { font-size: 9px; }
+  .site-row { min-height: 48px; padding: 10px 12px; }
+  .btn-row { padding: 8px; gap: 7px; }
+  .btn { min-height: 44px; }
+  .settings-wrap { padding-bottom: env(safe-area-inset-bottom, 0px); }
+}
+@media (min-width: 381px) and (max-width: 600px) {
+  .wrap { width: 100%; max-width: 420px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .switch, .switch::after, .preset, .btn { transition: none; }
+}

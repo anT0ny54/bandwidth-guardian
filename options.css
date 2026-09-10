@@ -246,3 +246,54 @@
 .field-label-sm { font-size: 12px; margin-bottom: 6px; }
 .adv-hint { color: var(--sub); font-size: 11px; }
 .source-row { font-size: 13px; }
+
+/* ── Mobile-first touch refinements ───────────────────────────────────── */
+html, body { width: 100%; min-width: 0; overflow-x: hidden; }
+button, input, textarea, select { font: inherit; }
+button, label, .switch { touch-action: manipulation; }
+@media (max-width: 600px) {
+  body { font-size: 15px; }
+  .wrap { width: 100%; max-width: 520px; padding: 12px 10px calc(var(--bar) + 12px + env(safe-area-inset-bottom, 0px)); gap: 8px; }
+  .page-header { gap: 11px; margin-bottom: 4px; padding: 2px 2px; }
+  .shield { width: 42px; height: 42px; }
+  .page-header h1 { font-size: 19px; }
+  .page-header .sub { font-size: 11px; }
+  .sec-label { font-size: 10px; padding-left: 2px; }
+  .card { border-radius: 12px; }
+  .row { padding: 13px 12px; }
+  .toggle-row { min-height: 58px; padding: 13px 12px; gap: 12px; }
+  .tr-label { font-size: 14px; }
+  .tr-hint { font-size: 11px; }
+  .switch { width: 48px; height: 28px; }
+  .switch::after { width: 22px; height: 22px; }
+  .switch:checked::after { transform: translateX(20px); }
+  .presets { gap: 6px; }
+  .preset { min-height: 58px; padding: 9px 4px; }
+  .preset .p-label { font-size: 13px; }
+  .preset .p-hint { font-size: 10px; }
+  input[type="text"], input[type="number"], textarea { min-height: 46px; font-size: 16px; }
+  textarea { min-height: 88px; }
+  .proxy-row { gap: 6px; flex-direction: column; }
+  .proxy-row .btn { width: 100%; }
+  .stats { grid-template-columns: 1fr 1fr; }
+  .stat { min-height: 76px; padding: 11px; }
+  .stat-val { font-size: 20px; }
+  .adv-body { padding: 0 12px 13px; gap: 12px; }
+  .adv-row { align-items: stretch; flex-direction: column; }
+  .adv-row input { max-width: none; width: 100%; }
+  .adv-row label { white-space: normal; }
+  .btn-row { gap: 7px; }
+  .btn { min-height: 46px; padding: 0 14px; }
+  .action-bar { height: calc(var(--bar) + env(safe-area-inset-bottom, 0px)); padding: 8px 10px env(safe-area-inset-bottom, 8px); gap: 7px; }
+  .action-bar .btn { flex: 1; min-width: 0; }
+  .toast { bottom: calc(var(--bar) + env(safe-area-inset-bottom, 0px) + 10px); white-space: normal; }
+}
+@media (max-width: 360px) {
+  .wrap { padding-left: 8px; padding-right: 8px; }
+  .stats { grid-template-columns: 1fr; }
+  .btn-row .btn { flex: 1 1 100%; }
+  .action-bar .btn { font-size: 12px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .switch, .switch::after, .preset, .btn, .toast { transition: none; }
+}
