@@ -99,7 +99,7 @@ Pull requests are welcome. Please open an issue first for anything beyond a smal
 
 ## Credits
 
-Based on [bandwidth-hero](https://github.com/ayastreb/bandwidth-hero) by Anatoliy Yastreb (MIT) and the serverless proxy port [BHP2 / bandwidth-hero-proxy2](https://github.com/himshim/BHP2 / bandwidth-hero-proxy2).
+Based on [bandwidth-hero](https://github.com/ayastreb/bandwidth-hero) by Anatoliy Yastreb (MIT) and the serverless proxy port [bandwidth-hero-proxy2](https://github.com/himshim/bandwidth-hero-proxy2).
 
 ---
 
