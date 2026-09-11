@@ -15,7 +15,6 @@ const statBytesEl = $("statBytes");
 const toastEl = $("toast");
 const checkUpdateBtn = $("checkUpdate");
 const updateStatusEl = $("updateStatus");
-const extensionVersionEl = $("extensionVersion");
 const sourceVersionEl = $("sourceVersion");
 const updateCurrentEl = $("updateCurrent");
 const customQualityEl = $("customQuality");
@@ -68,7 +67,6 @@ function readWidth() {
 function renderVersion() {
   const version = String(chrome.runtime.getManifest().version || "0.0.0");
   const label = `v${version}`;
-  extensionVersionEl.textContent = label;
   sourceVersionEl.textContent = label;
   updateCurrentEl.textContent = label;
   updateStatusEl.textContent = `Installed version: ${label}`;
