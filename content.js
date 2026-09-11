@@ -5,7 +5,7 @@
 
   const DEFAULTS = {
     enabled: true, proxyBase: "", quality: 40, grayscale: true,
-    maxWidth: 1920, excludeDomains: "google.com gstatic.com", isWebpSupported: false,
+    maxWidth: 1280, excludeDomains: "google.com gstatic.com", isWebpSupported: false,
     failoverOriginal: true,
     mobileMaxWidth: 1280,
   };

@@ -74,17 +74,34 @@ function renderVersion() {
   updateStatusEl.textContent = `Installed version: ${label}`;
 }
 
+function normalizeSettings(raw = {}) {
+  const d = { ...DEFAULTS, ...raw };
+  d.enabled = d.enabled !== false;
+  d.grayscale = d.grayscale !== false;
+  d.failoverOriginal = d.failoverOriginal !== false;
+  d.quality = Number.isInteger(Number(d.quality)) && Number(d.quality) >= 1 && Number(d.quality) <= 100
+    ? Number(d.quality) : DEFAULTS.quality;
+  d.maxWidth = Number.isInteger(Number(d.maxWidth)) && Number(d.maxWidth) >= 0
+    ? Number(d.maxWidth) : DEFAULTS.maxWidth;
+  d.mobileMaxWidth = Number.isInteger(Number(d.mobileMaxWidth)) && Number(d.mobileMaxWidth) > 0
+    ? Number(d.mobileMaxWidth) : DEFAULTS.mobileMaxWidth;
+  d.proxyBase = normalizeProxyBase(d.proxyBase);
+  d.excludeDomains = String(d.excludeDomains ?? DEFAULTS.excludeDomains);
+  return d;
+}
+
 async function load() {
   renderVersion();
-  const d = await chrome.storage.sync.get(DEFAULTS);
-  enabledEl.checked = !!d.enabled;
-  grayscaleEl.checked = !!d.grayscale;
-  failoverOriginalEl.checked = d.failoverOriginal !== false;
-  proxyBaseEl.value = d.proxyBase ? normalizeProxyBase(d.proxyBase) : "";
-  excludeEl.value = d.excludeDomains || "";
+  const raw = await chrome.storage.sync.get(DEFAULTS);
+  const d = normalizeSettings(raw);
+  enabledEl.checked = d.enabled;
+  grayscaleEl.checked = d.grayscale;
+  failoverOriginalEl.checked = d.failoverOriginal;
+  proxyBaseEl.value = d.proxyBase;
+  excludeEl.value = d.excludeDomains;
   proxyBaseEl.classList.remove("invalid");
-  setQualityUI(Number.isFinite(d.quality) ? d.quality : DEFAULTS.quality);
-  setWidthUI(Number.isFinite(d.maxWidth) ? d.maxWidth : DEFAULTS.maxWidth);
+  setQualityUI(d.quality);
+  setWidthUI(d.maxWidth);
 
   const { stats = STATS_DEFAULT } = await chrome.storage.local.get({ stats: STATS_DEFAULT });
   const saved = Number(stats.bytesSaved) || 0;
@@ -119,20 +136,28 @@ async function save() {
   }
 
   proxyBaseEl.classList.remove("invalid");
-  await chrome.storage.sync.set({
+  const settings = {
+    enabled: enabledEl.checked,
+    grayscale: grayscaleEl.checked,
+    failoverOriginal: failoverOriginalEl.checked,
     proxyBase,
     quality: readQuality(),
     maxWidth: readWidth(),
+    mobileMaxWidth: DEFAULTS.mobileMaxWidth,
     excludeDomains: excludeEl.value.trim(),
-    failoverOriginal: failoverOriginalEl.checked,
-  });
-  showToast("Saved", "ok");
+  };
+  await chrome.storage.sync.set(settings);
+  await load();
+  showToast("Settings saved", "ok");
 }
 
 async function resetAll() {
-  await chrome.storage.sync.set(DEFAULTS);
+  // Remove stale/legacy keys first, then write one complete recommended profile.
+  // Stats live in storage.local and are intentionally preserved.
+  await chrome.storage.sync.clear();
+  await chrome.storage.sync.set({ ...DEFAULTS });
   await load();
-  showToast("Reset to defaults");
+  showToast("Restored recommended defaults", "ok");
 }
 
 async function resetStats() {
@@ -225,18 +250,8 @@ customWidthEl.addEventListener("input", () => {
   if (parseCustomInput(customWidthEl, 0) !== null) widthPresets.forEach((b) => b.classList.remove("active"));
 });
 
-enabledEl.addEventListener("change", async () => {
-  await chrome.storage.sync.set({ enabled: enabledEl.checked });
-  showToast(enabledEl.checked ? "Compression enabled" : "Compression disabled", "ok");
-});
-grayscaleEl.addEventListener("change", async () => {
-  await chrome.storage.sync.set({ grayscale: grayscaleEl.checked });
-  showToast("Reload the page to apply", "warn");
-});
-failoverOriginalEl.addEventListener("change", async () => {
-  await chrome.storage.sync.set({ failoverOriginal: failoverOriginalEl.checked });
-  showToast(failoverOriginalEl.checked ? "Original failover enabled" : "Original failover disabled", "ok");
-});
+// Options page edits are committed by the Save button. This prevents
+// partially changed settings when the user is still configuring the page.
 
 saveBtn.addEventListener("click", save);
 resetAllBtn.addEventListener("click", resetAll);

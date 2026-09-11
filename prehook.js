@@ -9,7 +9,7 @@
     proxyBase: "",
     quality: 40,
     grayscale: true,
-    maxWidth: 1920,
+    maxWidth: 1280,
     mobileMaxWidth: 1280,
     excludeDomains: "google.com gstatic.com",
     isWebpSupported: false,
