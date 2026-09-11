@@ -7,6 +7,7 @@ export const DEFAULTS = {
   quality:        40,
   grayscale:      true,
   maxWidth:       1920,
+  mobileMaxWidth: 1280,
   excludeDomains: "google.com gstatic.com",
   isWebpSupported: false,
   failoverOriginal: true,

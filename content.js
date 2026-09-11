@@ -1,5 +1,5 @@
 // Bandwidth Guardian — conservative mobile image rewriter
-// v0.0.8: safe responsive-image savings layered on the stable mobile failover architecture.
+// v0.0.9: native responsive-image selection preserved; mobile proxy cap added.
 (() => {
   "use strict";
 
@@ -38,7 +38,6 @@
   const failed = new WeakSet();
   const doneLazy = new WeakSet();
   const doneBackground = new WeakSet();
-  const responsiveState = new WeakMap();
   const urlCache = new Map();
   const CACHE_LIMIT = 768;
 
@@ -88,7 +87,13 @@
   };
   const buildProxyUrl = original => {
     const u = resolveHTTP(original); if (!u || shouldSkip(u.href)) return original;
-    const key = u.href;
+    const mobile = !!matchMedia?.("(max-width: 900px)")?.matches;
+    const configuredMaxWidth = Number(opts.maxWidth) || 0;
+    const mobileCap = Number(opts.mobileMaxWidth) || 0;
+    const effectiveMaxWidth = mobile && configuredMaxWidth > 0 && mobileCap > 0
+      ? Math.min(configuredMaxWidth, mobileCap)
+      : configuredMaxWidth;
+    const key = `${u.href}|mw:${effectiveMaxWidth}|fmt:${opts.isWebpSupported ? "webp" : "jpeg"}|q:${opts.quality}|bw:${opts.grayscale ? 1 : 0}`;
     const cached = urlCache.get(key); if (cached) return cached;
     const params = new URLSearchParams({
       url: key,
@@ -99,78 +104,18 @@
     // On mobile, cap the requested proxy width for additional savings, but never
     // touch the browser's srcset/picture candidate selection. Desktop behavior stays
     // exactly at the configured maxWidth.
-    let effectiveMaxWidth = Number(opts.maxWidth) || 0;
-    if (effectiveMaxWidth > 0 && opts.mobileMaxWidth > 0 &&
-        matchMedia?.("(max-width: 900px)")?.matches) {
-      effectiveMaxWidth = Math.min(effectiveMaxWidth, Number(opts.mobileMaxWidth) || effectiveMaxWidth);
-    }
     if (effectiveMaxWidth > 0) params.set("max_width", String(Math.round(effectiveMaxWidth)));
     const result = `${opts.proxyBase}?${params.toString()}`;
     if (urlCache.size >= CACHE_LIMIT) urlCache.delete(urlCache.keys().next().value);
     urlCache.set(key, result);
     return result;
   };
-  const hasPictureCandidate = img => !!img?.closest?.("picture");
+  // IMPORTANT: never rewrite srcset or <picture>/<source> candidates.
+  // Chromium owns responsive candidate selection and exposes the winner through
+  // HTMLImageElement.currentSrc. Fighting that selection can cause duplicate
+  // downloads, wrong DPR candidates, broken art-direction, and LCP regressions.
   const hasSrcset = img => !!img?.getAttribute?.("srcset") || !!img?.getAttribute?.("data-srcset");
-  const hasResponsivePicture = img => !!img?.closest?.("picture");
-
-  // Responsive mode is intentionally narrow: only normal <img> elements with
-  // standard width-descriptor srcset candidates are rewritten. We leave <picture>,
-  // <source>, data-srcset, density (x) descriptors and unusual candidate syntax
-  // completely native so Chromium/Cromite keeps control of candidate selection.
-  function parseResponsiveSrcset(value) {
-    const text = String(value || "").trim();
-    if (!text || text.includes("\n")) return null;
-    const parts = text.split(",");
-    const out = [];
-    let sawWidth = false;
-    for (const raw of parts) {
-      const part = raw.trim();
-      if (!part) return null;
-      const m = part.match(/^(\S+)(?:\s+(\d+)w)?$/i);
-      if (!m) return null;
-      const url = m[1];
-      const descriptor = m[2] ? `${m[2]}w` : "";
-      if (descriptor) sawWidth = true;
-      else if (parts.length > 1) return null;
-      if (/^[a-z][a-z0-9+.-]*:/i.test(url) && !/^https?:/i.test(url)) return null;
-      out.push({ url, descriptor });
-    }
-    if (!sawWidth || out.length < 2 || out.length > 8) return null;
-    return out;
-  }
-
-  function restoreResponsive(img) {
-    const st = responsiveState.get(img);
-    if (!(img instanceof HTMLImageElement) || !st || st.restored) return false;
-    const current = img.currentSrc || "";
-    if (!st.rewritten.some(u => u === current) && img.getAttribute("srcset") !== st.rewrittenSrcset) return false;
-    st.restored = true;
-    failed.add(img);
-    setNativeAttr(img, "srcset", st.originalSrcset);
-    return true;
-  }
-
-  function rewriteResponsiveSrcset(img) {
-    if (!(img instanceof HTMLImageElement) || !opts.enabled || !opts.proxyBase) return false;
-    if (hasResponsivePicture(img) || img.getAttribute("data-srcset")) return false;
-    const original = img.getAttribute("srcset") || "";
-    if (!original || img.getAttribute("srcset")?.includes(opts.proxyBase)) return false;
-    const parsed = parseResponsiveSrcset(original);
-    if (!parsed) return false;
-    const rewritten = [];
-    for (const c of parsed) {
-      const abs = resolveHTTP(c.url);
-      if (!abs || shouldSkip(abs.href)) return false;
-      const proxied = buildProxyUrl(abs.href);
-      if (!proxied || proxied === abs.href) return false;
-      rewritten.push(proxied);
-    }
-    const rewrittenSrcset = parsed.map((c, i) => `${rewritten[i]}${c.descriptor ? ` ${c.descriptor}` : ""}`).join(", ");
-    responsiveState.set(img, { originalSrcset: original, rewrittenSrcset, rewritten, restored: false });
-    setNativeAttr(img, "srcset", rewrittenSrcset);
-    return true;
-  }
+  const hasPictureCandidate = img => !!img?.closest?.("picture");
 
   function setNativeSrc(img, value) {
     writing.add(img);
@@ -287,17 +232,17 @@
 
   function processElement(el) {
     if (!el || el.nodeType !== 1) return;
-    if (el instanceof HTMLImageElement) { rewriteResponsiveSrcset(el); handleImageMutation(el); }
+    if (el instanceof HTMLImageElement) handleImageMutation(el);
     rewriteLazy(el); rewriteBackground(el);
     el.querySelectorAll?.(IMAGE_SELECTOR).forEach(node => {
-      if (node instanceof HTMLImageElement) { rewriteResponsiveSrcset(node); handleImageMutation(node); }
+      if (node instanceof HTMLImageElement) handleImageMutation(node);
       rewriteLazy(node); rewriteBackground(node);
     });
   }
 
   function rewriteAll() {
     if (!document.documentElement || !opts.enabled || !opts.proxyBase) return;
-    document.querySelectorAll("img").forEach(img => { rewriteResponsiveSrcset(img); handleImageMutation(img); });
+    document.querySelectorAll("img").forEach(handleImageMutation);
     document.querySelectorAll(IMAGE_SELECTOR).forEach(el => { rewriteLazy(el); rewriteBackground(el); });
   }
   function queueRewrite() {
@@ -317,7 +262,7 @@
   window.addEventListener("error", event => {
     const img = event.target;
     if (img instanceof HTMLImageElement) {
-      if (!restoreResponsive(img)) restoreImage(img);
+      restoreImage(img);
     }
   }, true);
 
@@ -331,12 +276,10 @@
       if (!t?.tagName || writing.has(t)) continue;
       if (a === "src") handleImageMutation(t);
       else if (a === "srcset" || a === "data-srcset") {
+        // Deliberately untouched. Native Chromium candidate selection must remain
+        // the source of truth for srcset/<picture>.
         if (t instanceof HTMLImageElement) {
-          responsiveState.delete(t);
           failed.delete(t);
-          // Re-evaluate only genuine page-side changes. Our own write is tracked
-          // through `writing`, so it cannot recurse here.
-          rewriteResponsiveSrcset(t);
           imageState.delete(t);
         }
       } else if (LAZY_SET.has(a)) {

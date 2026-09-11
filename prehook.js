@@ -10,6 +10,7 @@
     quality: 40,
     grayscale: true,
     maxWidth: 1920,
+    mobileMaxWidth: 1280,
     excludeDomains: "google.com gstatic.com",
     isWebpSupported: false,
     failoverOriginal: true,
@@ -171,13 +172,19 @@
   function proxy(value) {
     const url = absoluteHTTP(value);
     if (!url || !opts.enabled || !opts.proxyBase || shouldBypass(url.href)) return value;
+    const mobile = !!matchMedia?.("(max-width: 900px)")?.matches;
+    const configuredMaxWidth = Number(opts.maxWidth) || 0;
+    const mobileCap = Number(opts.mobileMaxWidth) || 0;
+    const effectiveMaxWidth = mobile && configuredMaxWidth > 0 && mobileCap > 0
+      ? Math.min(configuredMaxWidth, mobileCap)
+      : configuredMaxWidth;
     const params = new URLSearchParams({
       url: url.href,
       jpeg: opts.isWebpSupported ? "0" : "1",
       bw: opts.grayscale ? "1" : "0",
       quality: String(opts.quality ?? 40),
     });
-    if (opts.maxWidth) params.set("max_width", String(opts.maxWidth));
+    if (effectiveMaxWidth > 0) params.set("max_width", String(Math.round(effectiveMaxWidth)));
     return opts.proxyBase + "?" + params.toString();
   }
 
