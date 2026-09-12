@@ -43,11 +43,10 @@ SOURCE_DATE_EPOCH=1709856000
 
 INCLUDE=(
   manifest.json
-  bridge.js
   defaults.js
   service-worker.js
   content.js
-  prehook-main.js
+  prehook.js
   popup.html
   popup.css
   popup.js
