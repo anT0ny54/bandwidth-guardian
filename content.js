@@ -1,5 +1,5 @@
 // Bandwidth Guardian — conservative mobile image rewriter
-// v0.0.9: native responsive-image selection preserved; mobile proxy cap added.
+// v0.0.9.6: conservative Android build; LRU proxy cache + deduplicated DOM work.
 (() => {
   "use strict";
 
@@ -12,8 +12,8 @@
 
   const LAZY_ATTRS = ["data-src", "data-iurl", "data-lazy-src", "data-original", "data-url", "data-hi-res", "data-lazy", "data-echo"];
   const LAZY_SET = new Set(LAZY_ATTRS);
-  const OBSERVED_ATTRS = ["src", "srcset", "style", "href", "rel", "as", ...LAZY_ATTRS, "data-srcset"];
-  const IMAGE_SELECTOR = ["img", "picture source", "[style]", ...LAZY_ATTRS.map(a => `[${a}]`), "[data-srcset]"].join(",");
+  const OBSERVED_ATTRS = ["src", "srcset", "style", ...LAZY_ATTRS, "data-srcset"];
+  const IMAGE_SELECTOR = ['[style*="url(" i]', ...LAZY_ATTRS.map(a => `[${a}]`)].join(",");
   const TRACKING_PATTERNS = [
     /pagead/i, /(pixel|cleardot)\.*\.(gif|jpg|jpeg)/i,
     /google\.([a-z.]+)\/(ads|generate_204|.*\/log204)+/i,
@@ -33,13 +33,16 @@
 
   // State belongs to the extension's isolated world and is never written into page markup.
   const imageState = new WeakMap();
+  const observedSrc = new WeakMap();
+  const observedLazy = new WeakMap();
   const lazyState = new WeakMap();
   const writing = new WeakSet();
   const failed = new WeakSet();
   const doneLazy = new WeakSet();
   const doneBackground = new WeakSet();
+  const lastBackgroundValue = new WeakMap();
   const urlCache = new Map();
-  const CACHE_LIMIT = 768;
+  const CACHE_LIMIT = 1536;
 
   let opts = { ...DEFAULTS };
   let excluded = new Set();
@@ -87,16 +90,26 @@
   };
   const buildProxyUrl = original => {
     const u = resolveHTTP(original); if (!u || shouldSkip(u.href)) return original;
+    // Fragments are never sent in an HTTP request. Removing them makes equivalent
+    // image URLs share the same proxy URL/cache entry instead of creating duplicates.
+    u.hash = "";
+    const canonical = u.href;
     const mobile = !!matchMedia?.("(max-width: 900px)")?.matches;
     const configuredMaxWidth = Number(opts.maxWidth) || 0;
     const mobileCap = Number(opts.mobileMaxWidth) || 0;
     const effectiveMaxWidth = mobile && configuredMaxWidth > 0 && mobileCap > 0
       ? Math.min(configuredMaxWidth, mobileCap)
       : configuredMaxWidth;
-    const key = `${u.href}|mw:${effectiveMaxWidth}|fmt:${opts.isWebpSupported ? "webp" : "jpeg"}|q:${opts.quality}|bw:${opts.grayscale ? 1 : 0}`;
-    const cached = urlCache.get(key); if (cached) return cached;
+    const key = `${canonical}|mw:${effectiveMaxWidth}|fmt:${opts.isWebpSupported ? "webp" : "jpeg"}|q:${opts.quality}|bw:${opts.grayscale ? 1 : 0}`;
+    const cached = urlCache.get(key);
+    if (cached) {
+      // Refresh hot entries so frequently reused images remain cached longer.
+      urlCache.delete(key);
+      urlCache.set(key, cached);
+      return cached;
+    }
     const params = new URLSearchParams({
-      url: key,
+      url: canonical,
       jpeg: opts.isWebpSupported ? "0" : "1",
       bw: opts.grayscale ? "1" : "0",
       quality: String(opts.quality ?? 40),
@@ -181,6 +194,8 @@
     if (writing.has(img)) return;
     const src = img.getAttribute("src") || "";
     const st = imageState.get(img);
+    if (observedSrc.get(img) === src && (!st || st.original === src || st.proxied === src || st.failedOnce)) return;
+    observedSrc.set(img, src);
     if (st?.failedOnce && src === st.original) return;
 
     // A genuine page-side URL change starts a new attempt. A previous failed proxy
@@ -204,6 +219,12 @@
     if (el instanceof HTMLImageElement && (hasSrcset(el) || hasPictureCandidate(el))) return;
     let changed = false;
     const originals = {};
+    let signature = "";
+    for (const attr of LAZY_ATTRS) {
+      signature += attr + "=" + (el.getAttribute(attr) || "") + "\n";
+    }
+    if (observedLazy.get(el) === signature) return;
+    observedLazy.set(el, signature);
     for (const attr of LAZY_ATTRS) {
       const value = el.getAttribute(attr);
       if (value && !shouldSkip(value)) {
@@ -220,30 +241,47 @@
     if (!st) return;
     for (const [attr, value] of Object.entries(st.originals || {})) setNativeAttr(el, attr, value);
     lazyState.delete(el);
+    observedLazy.delete(el);
   }
 
   function rewriteBackground(el) {
-    if (!el || doneBackground.has(el) || !opts.enabled || !opts.proxyBase) return;
-    const bg = el.style?.backgroundImage;
-    if (!bg || !/url\(/i.test(bg)) return;
-    const rewritten = bg.replace(/url\(\s*(["']?)([^"')]+)\1\s*\)/gi, (full, quote, url) => shouldSkip(url) ? full : `url("${buildProxyUrl(url)}")`);
-    if (rewritten !== bg) { writing.add(el); try { el.style.backgroundImage = rewritten; } finally { queueMicrotask(() => writing.delete(el)); } doneBackground.add(el); }
+    if (!el || !opts.enabled || !opts.proxyBase) return;
+    const bg = el.style?.backgroundImage || "";
+    if (lastBackgroundValue.get(el) === bg) return;
+    lastBackgroundValue.set(el, bg);
+    if (!bg || !/url\(/i.test(bg)) { doneBackground.delete(el); return; }
+    if (doneBackground.has(el)) return;
+    const rewritten = bg.replace(/url\(\s*(["']?)([^"')]+)\1\s*\)/gi, (full, quote, url) =>
+      shouldSkip(url) ? full : `url("${buildProxyUrl(url)}")`
+    );
+    if (rewritten !== bg) {
+      writing.add(el);
+      try { el.style.backgroundImage = rewritten; }
+      finally { queueMicrotask(() => writing.delete(el)); }
+      doneBackground.add(el);
+    }
   }
 
   function processElement(el) {
     if (!el || el.nodeType !== 1) return;
     if (el instanceof HTMLImageElement) handleImageMutation(el);
-    rewriteLazy(el); rewriteBackground(el);
+    rewriteLazy(el);
+    rewriteBackground(el);
     el.querySelectorAll?.(IMAGE_SELECTOR).forEach(node => {
-      if (node instanceof HTMLImageElement) handleImageMutation(node);
-      rewriteLazy(node); rewriteBackground(node);
+      rewriteLazy(node);
+      rewriteBackground(node);
     });
   }
 
   function rewriteAll() {
     if (!document.documentElement || !opts.enabled || !opts.proxyBase) return;
+    // Keep the hot path single-pass: IMG elements are handled once, while the
+    // secondary selector covers lazy/background/source elements only.
     document.querySelectorAll("img").forEach(handleImageMutation);
-    document.querySelectorAll(IMAGE_SELECTOR).forEach(el => { rewriteLazy(el); rewriteBackground(el); });
+    document.querySelectorAll(IMAGE_SELECTOR).forEach(el => {
+      rewriteLazy(el);
+      rewriteBackground(el);
+    });
   }
   function queueRewrite() {
     if (rewriteQueued) return;
@@ -266,27 +304,51 @@
     }
   }, true);
 
+  const pendingAdded = new Set();
+  let addedFlushQueued = false;
+
+  function flushAddedNodes() {
+    addedFlushQueued = false;
+    if (!pendingAdded.size) return;
+    const nodes = Array.from(pendingAdded);
+    pendingAdded.clear();
+    // Drop descendants when an ancestor was also added in the same batch.
+    const roots = [];
+    for (const node of nodes) {
+      if (!roots.some(root => root === node || root.contains?.(node))) roots.push(node);
+    }
+    for (const node of roots) processElement(node);
+  }
+
+  function queueAddedNode(node) {
+    pendingAdded.add(node);
+    if (addedFlushQueued) return;
+    addedFlushQueued = true;
+    queueMicrotask(flushAddedNodes);
+  }
+
   const observer = new MutationObserver(mutations => {
     for (const m of mutations) {
       if (m.type === "childList") {
-        for (const n of m.addedNodes) if (n.nodeType === 1) processElement(n);
+        for (const n of m.addedNodes) if (n.nodeType === 1) queueAddedNode(n);
         continue;
       }
       const t = m.target, a = m.attributeName;
       if (!t?.tagName || writing.has(t)) continue;
       if (a === "src") handleImageMutation(t);
       else if (a === "srcset" || a === "data-srcset") {
-        // Deliberately untouched. Native Chromium candidate selection must remain
-        // the source of truth for srcset/<picture>.
         if (t instanceof HTMLImageElement) {
           failed.delete(t);
           imageState.delete(t);
         }
       } else if (LAZY_SET.has(a)) {
-        doneLazy.delete(t); rewriteLazy(t);
-        // If a lazy loader promotes a data-* URL into src, handle it immediately.
+        doneLazy.delete(t); observedLazy.delete(t); rewriteLazy(t);
         if (t instanceof HTMLImageElement) handleImageMutation(t);
-      } else if (a === "style") { doneBackground.delete(t); rewriteBackground(t); }
+      } else if (a === "style") {
+        doneBackground.delete(t);
+        lastBackgroundValue.delete(t);
+        rewriteBackground(t);
+      }
     }
   });
 
