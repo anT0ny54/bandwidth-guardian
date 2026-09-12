@@ -1,136 +1,402 @@
-// Bandwidth Guardian 0.1.0 — MAIN-world early image prehook
-// Purpose: intercept page JavaScript image URL assignments before the page's own
-// JavaScript can trigger the original image request. No extension APIs are used here.
+// Bandwidth Guardian — early image URL prehook
+// Goal: proxy JS-created image URLs before a network request starts,
+// while failing open quickly enough to avoid hurting LCP/preload behavior.
 (() => {
   "use strict";
-  if (window.__BWG_MAIN_PREHOOK__) return;
-  window.__BWG_MAIN_PREHOOK__ = true;
 
-  const DEFAULTS = { enabled:true, proxyBase:"", quality:40, grayscale:true, maxWidth:1280, mobileMaxWidth:1280, isWebpSupported:false, failoverOriginal:true, excludeDomains:"google.com gstatic.com" };
-  let opts = {...DEFAULTS};
-  let excluded = new Set();
-  let proxyHost = "";
-  let configured = false;
+  const DEFAULTS = {
+    enabled: true,
+    proxyBase: "",
+    quality: 40,
+    grayscale: true,
+    maxWidth: 1280,
+    mobileMaxWidth: 1280,
+    excludeDomains: "google.com gstatic.com",
+    isWebpSupported: false,
+    failoverOriginal: true,
+  };
+
   const imgProto = HTMLImageElement.prototype;
   const sourceProto = HTMLSourceElement.prototype;
   const linkProto = HTMLLinkElement.prototype;
-  const srcDesc = Object.getOwnPropertyDescriptor(imgProto,"src");
-  const srcsetDesc = Object.getOwnPropertyDescriptor(imgProto,"srcset");
-  const sourceSrcsetDesc = Object.getOwnPropertyDescriptor(sourceProto,"srcset");
-  const linkHrefDesc = Object.getOwnPropertyDescriptor(linkProto,"href");
+  const srcDesc = Object.getOwnPropertyDescriptor(imgProto, "src");
+  const srcsetDesc = Object.getOwnPropertyDescriptor(imgProto, "srcset");
+  const sourceSrcsetDesc = Object.getOwnPropertyDescriptor(sourceProto, "srcset");
+  const linkHrefDesc = Object.getOwnPropertyDescriptor(linkProto, "href");
   const nativeSetAttribute = Element.prototype.setAttribute;
+  const nativeGetAttribute = Element.prototype.getAttribute;
+  const nativeRemoveAttribute = Element.prototype.removeAttribute;
   const NativeImage = window.Image;
-  const state = new WeakMap();
-  const lazyState = new WeakMap();
-  const writing = new WeakSet();
-  const urlCache = new Map();
-  const CACHE_LIMIT = 1024;
-  const LAZY_ATTRS = new Set(["data-src","data-iurl","data-lazy-src","data-original","data-url","data-hi-res","data-lazy","data-echo","data-image","data-original-src"]);
-  const PROXY_TIMEOUT_NORMAL = 4500;
-  const PROXY_TIMEOUT_LCP = 1800;
 
-  const parseURL = v => { try { return new URL(String(v||""), document.baseURI); } catch { return null; } };
-  const httpURL = v => { const u=parseURL(v); return u && /^https?:$/.test(u.protocol) ? u : null; };
-  function parseDomains(text){ const s=new Set(); for(const t of String(text||"").split(/[\s,]+/)){const h=t.trim().toLowerCase().replace(/^https?:\/\//,'').split('/')[0].replace(/\.$/,''); if(h)s.add(h);} return s; }
-  function hostExcluded(host){ host=String(host||'').toLowerCase(); if(excluded.has(host))return true; for(const d of excluded) if(host.endsWith('.'+d))return true; return false; }
-  function normalizeBase(v){ const raw=String(v||'').trim(); if(!raw)return ''; try{const u=new URL(raw); if(!/^https?:$/.test(u.protocol))return ''; u.hash='';u.search='';const p=u.pathname.replace(/\/+$/,'');u.pathname=(!p||p==='/')?'/api':p;return u.toString().replace(/\/$/,'');}catch{return '';}}
-  function shouldSkip(v){
-    if(!opts.enabled || !opts.proxyBase) return true;
-    const u=httpURL(v); if(!u)return true;
-    const host=u.hostname.toLowerCase(), href=u.href.toLowerCase(), path=u.pathname.toLowerCase();
-    if(proxyHost && host===proxyHost) return true;
-    if(hostExcluded(host) || hostExcluded(location.hostname)) return true;
-    return path.endsWith('.ico') || path.endsWith('.svg') || href.includes('favicon');
-  }
-  function proxy(v){
-    const u=httpURL(v); if(!u || shouldSkip(u.href)) return v;
-    const mobile=!!window.matchMedia?.('(max-width: 900px)')?.matches;
-    const mw0=Number(opts.maxWidth)||0, mm=Number(opts.mobileMaxWidth)||0;
-    const mw=mobile&&mw0>0&&mm>0?Math.min(mw0,mm):mw0;
-    const key=`${u.href}|mw:${mw}|fmt:${opts.isWebpSupported?'webp':'jpeg'}|q:${opts.quality}|bw:${opts.grayscale?1:0}`;
-    const hit=urlCache.get(key); if(hit)return hit;
-    const p=new URLSearchParams({url:u.href,jpeg:opts.isWebpSupported?'0':'1',bw:opts.grayscale?'1':'0',quality:String(opts.quality??40)});
-    if(mw>0)p.set('max_width',String(Math.round(mw)));
-    const r=opts.proxyBase+'?'+p.toString();
-    if(urlCache.size>=CACHE_LIMIT) urlCache.delete(urlCache.keys().next().value);
-    urlCache.set(key,r); return r;
-  }
-  function hasResponsive(img){ return !!img?.getAttribute?.('srcset') || !!img?.closest?.('picture'); }
-  function failover(img){
-    const s=state.get(img); if(!s||s.failed||!opts.failoverOriginal)return;
-    const current=img.currentSrc||img.getAttribute('src')||'';
-    if(current!==s.proxy && img.getAttribute('src')!==s.proxy)return;
-    s.failed=true; writing.add(img); try{srcDesc?.set?.call(img,s.original);}catch{} queueMicrotask(()=>writing.delete(img));
-  }
-  function arm(img, p){
-    if(!opts.failoverOriginal)return;
-    // Never allow a stalled proxy request to stall the page indefinitely.
-    // LCP/high-priority images get a shorter escape hatch; other images get more
-    // time for a Netlify cold start. This bounds LCP risk while retaining savings.
-    const priority=String(img.getAttribute?.("fetchpriority")||"").toLowerCase();
-    const lcpLike=priority==="high" || img.loading==="eager";
-    const timeout=lcpLike?PROXY_TIMEOUT_LCP:PROXY_TIMEOUT_NORMAL;
-    setTimeout(()=>{
-      const s=state.get(img);
-      if(s?.proxy===p && !s.failed && !img.complete) failover(img);
-    },timeout);
-    const check=()=>{const s=state.get(img); if(!s||s.proxy!==p||s.failed)return; const cur=img.currentSrc||img.getAttribute('src')||''; if(cur!==p||!img.complete)return; if(img.naturalWidth===0||img.naturalHeight===0){setTimeout(()=>{const x=state.get(img);if(x?.proxy===p&&!x.failed&&img.complete&&(img.naturalWidth===0||img.naturalHeight===0))failover(img)},80);return;} if(typeof img.decode==='function')Promise.resolve(img.decode()).catch(()=>failover(img));};
-    if(img.complete)queueMicrotask(check); else img.addEventListener('load',check,{once:true});
-  }
-  window.addEventListener('error',e=>{if(e.target instanceof HTMLImageElement)failover(e.target)},true);
-  function setSrc(img,v){ writing.add(img); try{srcDesc?.set?.call(img,v)}finally{queueMicrotask(()=>writing.delete(img));} }
-  function setAttr(el,n,v){ writing.add(el); try{nativeSetAttribute.call(el,n,v)}finally{queueMicrotask(()=>writing.delete(el));} }
+  let opts = { ...DEFAULTS };
+  let ready = false;
+  let excluded = new Set();
+  let proxyHost = "";
+  let readyTimer = 0;
 
-  function handleSrc(img,value){
-    const original=String(value??'');
-    if(!configured){ setSrc(img,original); return; }
-    if(!opts.enabled||!opts.proxyBase||shouldSkip(original)||hasResponsive(img)){ setSrc(img,original); state.delete(img); return; }
-    const p=proxy(original); if(p===original){setSrc(img,original);return;}
-    state.set(img,{original,proxy:p,failed:false}); setSrc(img,p); arm(img,p);
-  }
-  if(srcDesc?.set)Object.defineProperty(imgProto,'src',{configurable:true,enumerable:srcDesc.enumerable,get:srcDesc.get,set(v){try{handleSrc(this,v)}catch{srcDesc.set.call(this,v)}}});
+  // WeakMap avoids polluting page DOM with data-bh-* attributes.
+  const pending = new WeakMap();
+  const pendingElements = new Set();
 
-  function rewriteSelectedCandidate(img){
-    if(!(img instanceof HTMLImageElement) || !configured || !opts.enabled || !opts.proxyBase) return;
-    queueMicrotask(()=>{
-      const selected=img.currentSrc; const srcset=img.getAttribute("srcset");
-      if(!selected || !srcset || shouldSkip(selected) || selected.startsWith(opts.proxyBase)) return;
-      const resolved=httpURL(selected)?.href; if(!resolved) return;
-      const next=srcset.split(",").map(part=>{
-        const token=part.trim().split(/\s+/)[0]; if(!token)return part;
-        try{return new URL(token,document.baseURI).href===resolved?part.replace(token,proxy(resolved)):part}catch{return part}
-      }).join(",");
-      if(next!==srcset) setAttr(img,"srcset",next);
+  // One-shot proxy -> original failover. WeakMaps keep page DOM clean.
+  const failoverState = new WeakMap();
+  const FAILOVER_MARK = "__bgFailoverDone";
+  function rememberFailover(el, original, proxied) {
+    if (!el || !opts.failoverOriginal || !original || !proxied || original === proxied) return;
+    const state = failoverState.get(el) || { restored: false };
+    state.originalSrc = original;
+    state.proxiedSrc = proxied;
+    state.originalSrcset = state.originalSrcset ?? null;
+    failoverState.set(el, state);
+  }
+  function rememberSrcsetFailover(el, original) {
+    if (!el || !opts.failoverOriginal || !original) return;
+    const state = failoverState.get(el) || { restored: false };
+    state.originalSrcset = original;
+    failoverState.set(el, state);
+  }
+  function restoreOriginal(el) {
+    const state = failoverState.get(el);
+    if (!el || !state || state.restored || !opts.failoverOriginal) return false;
+    state.restored = true;
+    try { Object.defineProperty(el, FAILOVER_MARK, { configurable: true, value: true }); } catch {}
+    try {
+      const current = el.currentSrc || el.src || "";
+      const proxied = state.proxiedSrc || "";
+      // Restore the original src only if the currently selected resource is the proxy
+      // (or the element's src is the proxy). This avoids clobbering a site-selected
+      // srcset candidate that has already changed underneath us.
+      if (state.originalSrc != null && (current === proxied || el.src === proxied || !proxied)) {
+        srcDesc?.set?.call(el, state.originalSrc);
+      }
+      if (state.originalSrcset != null && el.getAttribute("srcset") !== state.originalSrcset) {
+        srcsetDesc?.set?.call(el, state.originalSrcset);
+      }
+      return true;
+    } catch { return false; }
+  }
+  function maybeFailover(el) {
+    if (!(el instanceof HTMLImageElement) || !opts.failoverOriginal) return;
+    const state = failoverState.get(el);
+    if (!state || state.restored) return;
+    // Error is sufficient for HTTP/decode failures; decode rejection catches corrupt/undecodable responses.
+    restoreOriginal(el);
+  }
+  function armDecodeCheck(el) {
+    if (!(el instanceof HTMLImageElement) || !opts.failoverOriginal) return;
+    const state = failoverState.get(el);
+    if (!state || state.restored) return;
+    const token = state.proxiedSrc;
+    const check = () => {
+      const current = el.currentSrc || el.src || "";
+      if (current !== token && el.src !== token) return;
+      const fail = () => {
+        const latest = failoverState.get(el);
+        if (latest?.proxiedSrc === token && !latest.restored) restoreOriginal(el);
+      };
+      if (!el.complete) return;
+      // A completed image with no decoded dimensions is invalid. Delay one task so
+      // Chromium/Cromite has a chance to publish naturalWidth/naturalHeight.
+      if (el.naturalWidth === 0 || el.naturalHeight === 0) {
+        setTimeout(() => {
+          if (el.complete && (el.naturalWidth === 0 || el.naturalHeight === 0)) fail();
+        }, 80);
+        return;
+      }
+      if (typeof el.decode === "function") Promise.resolve(el.decode()).catch(fail);
+    };
+    if (el.complete) queueMicrotask(check);
+    else el.addEventListener("load", check, { once: true });
+  }
+  window.addEventListener("error", (event) => {
+    if (event.target instanceof HTMLImageElement) maybeFailover(event.target);
+  }, true);
+
+  const isHttp = (v) => /^https?:\/\//i.test(String(v || ""));
+  const parseURL = (v) => { try { return new URL(v, document.baseURI); } catch { return null; } };
+
+  function parseDomains(text) {
+    const set = new Set();
+    for (const token of String(text || "").split(/[\s,]+/)) {
+      const host = token.trim().toLowerCase().replace(/^https?:\/\//, "").split("/")[0].replace(/\.$/, "");
+      if (host) set.add(host);
+    }
+    return set;
+  }
+
+  function normalizeProxyBase(value) {
+    const raw = String(value || "").trim();
+    if (!raw) return "";
+    try {
+      const url = new URL(raw);
+      if (url.protocol !== "http:" && url.protocol !== "https:") return raw;
+      url.hash = "";
+      url.search = "";
+      const path = url.pathname.replace(/\/+$/, "");
+      url.pathname = (!path || path === "/") ? "/api" : path;
+      return url.toString().replace(/\/$/, "");
+    } catch { return raw.replace(/\/+$/, ""); }
+  }
+
+  function configure(next) {
+    opts = { ...DEFAULTS, ...(next || {}) };
+    opts.proxyBase = normalizeProxyBase(opts.proxyBase);
+    excluded = parseDomains(opts.excludeDomains);
+    proxyHost = parseURL(opts.proxyBase)?.hostname?.toLowerCase() || "";
+  }
+
+  function excludedHost(host) {
+    host = String(host || "").toLowerCase();
+    if (excluded.has(host)) return true;
+    for (const domain of excluded) if (host.endsWith("." + domain)) return true;
+    return false;
+  }
+
+  function absoluteHTTP(value) {
+    const raw = String(value || "").trim();
+    if (!raw || /^(?:data|blob|javascript|mailto|tel|about):/i.test(raw)) return null;
+    const url = parseURL(raw);
+    return url && /^https?:$/.test(url.protocol) ? url : null;
+  }
+
+  function shouldBypass(value) {
+    const url = absoluteHTTP(value);
+    if (!url) return true;
+    const host = url.hostname.toLowerCase();
+    if (proxyHost && host === proxyHost) return true;
+    if (excludedHost(host) || excludedHost(location.hostname)) return true;
+    const path = url.pathname.toLowerCase();
+    return path.endsWith(".ico") || path.endsWith(".svg") || path.includes("favicon");
+  }
+
+  function proxy(value) {
+    const url = absoluteHTTP(value);
+    if (!url || !opts.enabled || !opts.proxyBase || shouldBypass(url.href)) return value;
+    const mobile = !!matchMedia?.("(max-width: 900px)")?.matches;
+    const configuredMaxWidth = Number(opts.maxWidth) || 0;
+    const mobileCap = Number(opts.mobileMaxWidth) || 0;
+    const effectiveMaxWidth = mobile && configuredMaxWidth > 0 && mobileCap > 0
+      ? Math.min(configuredMaxWidth, mobileCap)
+      : configuredMaxWidth;
+    const params = new URLSearchParams({
+      url: url.href,
+      jpeg: opts.isWebpSupported ? "0" : "1",
+      bw: opts.grayscale ? "1" : "0",
+      quality: String(opts.quality ?? 40),
+    });
+    if (effectiveMaxWidth > 0) params.set("max_width", String(Math.round(effectiveMaxWidth)));
+    return opts.proxyBase + "?" + params.toString();
+  }
+
+  function rewriteSrcset(value) { return value; }
+
+  function isImagePreload(link) {
+    if (!(link instanceof HTMLLinkElement)) return false;
+    return /(?:^|\s)preload(?:\s|$)/i.test(link.getAttribute("rel") || "") &&
+      String(link.getAttribute("as") || "").toLowerCase() === "image";
+  }
+
+  function rewriteLinkHref(link, value) { return value; }
+
+  function decideSrc(value) {
+    if (!ready) return null;
+    if (!opts.enabled || !opts.proxyBase) return value;
+    return shouldBypass(value) ? value : proxy(value);
+  }
+
+  function nativeSrc(el, value) { srcDesc?.set?.call(el, value); }
+  function nativeSrcset(el, value) { srcsetDesc?.set?.call(el, value); }
+  function nativeSourceSrcset(el, value) { sourceSrcsetDesc?.set?.call(el, value); }
+  function nativeLinkHref(el, value) { linkHrefDesc?.set?.call(el, value); }
+
+  // Fail-open helpers: while settings are loading, never replace a real URL with about:blank.
+  // That was a major source of blank images on sites such as twkan.com.
+  function recordSafeOriginal(el, original) {
+    if (el && original != null) {
+      const state = failoverState.get(el) || { restored: false };
+      state.originalSrc = String(original);
+      state.proxiedSrc = null;
+      state.restored = false;
+      failoverState.set(el, state);
+    }
+    return String(original ?? "");
+  }
+  function recordSafeSrcset(el, original) {
+    if (el && original != null) {
+      const state = failoverState.get(el) || { restored: false };
+      state.originalSrcset = String(original);
+      state.restored = false;
+      failoverState.set(el, state);
+    }
+    return String(original ?? "");
+  }
+
+  function queue(el, record) {
+    pending.set(el, { ...(pending.get(el) || {}), ...record });
+    pendingElements.add(el);
+  }
+
+  function flushPending() {
+    for (const el of pendingElements) {
+      const record = pending.get(el);
+      pending.delete(el);
+      pendingElements.delete(el);
+      if (!record) continue;
+      try {
+        if (record.src !== undefined && el instanceof HTMLImageElement) nativeSrc(el, decideSrc(record.src) ?? record.src);
+        if (record.srcset !== undefined) {
+          if (el instanceof HTMLImageElement) nativeSrcset(el, record.srcset);
+          else if (el instanceof HTMLSourceElement) nativeSourceSrcset(el, record.srcset);
+        }
+        if (record.href !== undefined && el instanceof HTMLLinkElement) nativeLinkHref(el, rewriteLinkHref(el, record.href));
+      } catch {}
+    }
+  }
+
+  function failOpen() {
+    if (ready) return;
+    ready = true;
+    flushPending();
+  }
+
+  // Storage is normally fast because the service worker mirrors sync -> local.
+  // Never hold a critical image request indefinitely if storage is unavailable.
+  readyTimer = setTimeout(failOpen, 180);
+
+  function loadOptions() {
+    chrome.storage.local.get({ bhOpts: null }, (data) => {
+      if (data?.bhOpts) {
+        configure(data.bhOpts);
+        ready = true;
+        clearTimeout(readyTimer);
+        flushPending();
+        return;
+      }
+      chrome.storage.sync.get(DEFAULTS, (synced) => {
+        configure(synced);
+        ready = true;
+        clearTimeout(readyTimer);
+        flushPending();
+        chrome.storage.local.set({ bhOpts: synced });
+      });
     });
   }
-  if(srcsetDesc?.set)Object.defineProperty(imgProto,'srcset',{configurable:true,enumerable:srcsetDesc.enumerable,get:srcsetDesc.get,set(v){srcsetDesc.set.call(this,v);rewriteSelectedCandidate(this)}});
-  if(sourceSrcsetDesc?.set)Object.defineProperty(sourceProto,'srcset',{configurable:true,enumerable:sourceSrcsetDesc.enumerable,get:sourceSrcsetDesc.get,set(v){sourceSrcsetDesc.set.call(this,v)}});
+  loadOptions();
 
-  Element.prototype.setAttribute=function(name,value){
-    try{
-      const a=String(name).toLowerCase();
-      if(this instanceof HTMLImageElement && a==='src'){handleSrc(this,value);return;}
-      if(this instanceof HTMLImageElement && a==='srcset'){nativeSetAttribute.call(this,name,value);rewriteSelectedCandidate(this);return;}
-      if(LAZY_ATTRS.has(a) && (this instanceof HTMLImageElement || this.tagName==='SOURCE')){
-        const v=String(value??'');
-        if(configured && opts.enabled && opts.proxyBase && !shouldSkip(v)){setAttr(this,name,proxy(v));return;}
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === "local" && changes.bhOpts) {
+      configure(changes.bhOpts.newValue);
+      ready = true;
+      flushPending();
+    } else if (area === "sync") {
+      chrome.storage.sync.get(DEFAULTS, (synced) => {
+        configure(synced);
+        ready = true;
+        flushPending();
+        chrome.storage.local.set({ bhOpts: synced });
+      });
+    }
+  });
+
+  if (srcDesc?.set) Object.defineProperty(imgProto, "src", {
+    configurable: true, enumerable: srcDesc.enumerable, get: srcDesc.get,
+    set(value) {
+      try {
+        const original = String(value);
+        const decided = decideSrc(original);
+        if (decided === null) {
+          queue(this, { src: original });
+          nativeSrc(this, recordSafeOriginal(this, original));
+        } else {
+          try { delete this[FAILOVER_MARK]; } catch {}
+          if (decided !== original) rememberFailover(this, original, decided);
+          else failoverState.delete(this);
+          nativeSrc(this, decided);
+          if (decided !== original) armDecodeCheck(this);
+        }
+      } catch { nativeSrc(this, value); }
+    },
+  });
+
+  if (srcsetDesc?.set) Object.defineProperty(imgProto, "srcset", {
+    configurable: true, enumerable: srcsetDesc.enumerable, get: srcsetDesc.get,
+    set(value) {
+      try {
+        const original = String(value || "");
+        if (!ready) { queue(this, { srcset: original }); nativeSrcset(this, recordSafeSrcset(this, original)); }
+        else nativeSrcset(this, original);
+      } catch { nativeSrcset(this, value); }
+    },
+  });
+
+  if (false && sourceSrcsetDesc?.set) Object.defineProperty(sourceProto, "srcset", {
+    configurable: true, enumerable: sourceSrcsetDesc.enumerable, get: sourceSrcsetDesc.get,
+    set(value) {
+      try {
+        const original = String(value || "");
+        if (!ready) { queue(this, { srcset: original }); nativeSourceSrcset(this, ""); }
+        else nativeSourceSrcset(this, (!opts.enabled || !opts.proxyBase) ? original : rewriteSrcset(original));
+      } catch { nativeSourceSrcset(this, value); }
+    },
+  });
+
+  if (linkHrefDesc?.set) Object.defineProperty(linkProto, "href", {
+    configurable: true, enumerable: linkHrefDesc.enumerable, get: linkHrefDesc.get,
+    set(value) {
+      try {
+        const original = String(value);
+        if (!isImagePreload(this) && !/preload/i.test(this.getAttribute?.("rel") || "")) {
+          nativeLinkHref(this, value); return;
+        }
+        if (!ready) { queue(this, { href: original }); nativeLinkHref(this, recordSafeOriginal(this, original)); }
+        else nativeLinkHref(this, rewriteLinkHref(this, original));
+      } catch { nativeLinkHref(this, value); }
+    },
+  });
+
+  Element.prototype.setAttribute = function(name, value) {
+    try {
+      const attr = String(name).toLowerCase();
+      if (this instanceof HTMLImageElement) {
+        if (attr === "src") {
+          const original = String(value);
+          const decided = decideSrc(original);
+          if (decided === null) { queue(this, { src: original }); return nativeSetAttribute.call(this, "src", recordSafeOriginal(this, original)); }
+          try { delete this[FAILOVER_MARK]; } catch {}
+          if (decided !== original) { rememberFailover(this, original, decided); armDecodeCheck(this); }
+          else failoverState.delete(this);
+          return nativeSetAttribute.call(this, "src", decided);
+        }
+        if (attr === "srcset") {
+          const original = String(value || "");
+          if (!ready) { queue(this, { srcset: original }); return nativeSetAttribute.call(this, "srcset", recordSafeSrcset(this, original)); }
+          try { delete this[FAILOVER_MARK]; } catch {}
+          // Responsive candidate selection stays native. The content script applies
+          // a narrow, fail-safe width-descriptor optimization after DOM insertion.
+          return nativeSetAttribute.call(this, "srcset", original);
+        }
       }
-    }catch{}
-    return nativeSetAttribute.call(this,name,value);
+      if (this instanceof HTMLSourceElement && attr === "srcset") {
+        const original = String(value || "");
+        if (!ready) { queue(this, { srcset: original }); return nativeSetAttribute.call(this, "srcset", recordSafeSrcset(this, original)); }
+        return nativeSetAttribute.call(this, "srcset", original);
+      }
+      if (this instanceof HTMLLinkElement && (attr === "href" || attr === "rel" || attr === "as")) {
+        const rel = attr === "rel" ? String(value) : this.getAttribute("rel") || "";
+        const as = attr === "as" ? String(value) : this.getAttribute("as") || "";
+        if (attr === "href" && /(?:^|\s)preload(?:\s|$)/i.test(rel) && as.toLowerCase() === "image") {
+          const original = String(value);
+          if (!ready) { queue(this, { href: original }); return nativeSetAttribute.call(this, "href", recordSafeOriginal(this, original)); }
+          return nativeSetAttribute.call(this, "href", rewriteLinkHref(this, original));
+        }
+      }
+    } catch {}
+    return nativeSetAttribute.call(this, name, value);
   };
 
-  // LCP SAFETY: do not intercept <link rel="preload" as="image">.
-  // Native preload behavior remains entirely under Chromium.
-  // Image() itself is also left native; its instances use the patched src setter.
-
-  function applyConfig(next){
-    const n={...DEFAULTS,...(next||{})}; n.proxyBase=normalizeBase(n.proxyBase); opts=n; excluded=parseDomains(n.excludeDomains); proxyHost=httpURL(n.proxyBase)?.hostname?.toLowerCase()||''; configured=true; urlCache.clear();
-  }
-  // Config bridge. Only accept a structured object and validate proxyBase locally.
-  window.addEventListener('message',e=>{
-    if(e.source!==window || !e.data || e.data.__BWG__!=='CONFIG')return;
-    try{applyConfig(e.data.options)}catch{}
-  },false);
-  // Also accept a synchronous DOM bootstrap written by the isolated bridge if available.
-  try{const node=document.documentElement?.dataset?.bwgConfig; if(node)applyConfig(JSON.parse(decodeURIComponent(node)));}catch{}
+  // Preserve Image() behavior/shape as closely as possible.
+  function PatchedImage(width, height) { return new NativeImage(width, height); }
+  PatchedImage.prototype = NativeImage.prototype;
+  try { Object.setPrototypeOf(PatchedImage, NativeImage); } catch {}
+  Object.defineProperty(window, "Image", { configurable: true, writable: true, value: PatchedImage });
 })();

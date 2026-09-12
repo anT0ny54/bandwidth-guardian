@@ -4,7 +4,7 @@
   "name": "__MSG_extensionName__",
   "short_name": "BW Guardian",
   "description": "__MSG_extensionDescription__",
-  "version": "0.1.1",
+  "version": "0.0.9",
   "action": {
     "default_popup": "popup.html",
     "default_icon": {
@@ -40,23 +40,10 @@
         "<all_urls>"
       ],
       "js": [
-        "prehook-main.js"
-      ],
-      "run_at": "document_start",
-      "all_frames": true,
-      "world": "MAIN"
-    },
-    {
-      "matches": [
-        "<all_urls>"
-      ],
-      "js": [
-        "bridge.js",
         "content.js"
       ],
       "run_at": "document_start",
-      "all_frames": true,
-      "world": "ISOLATED"
+      "all_frames": true
     }
   ],
   "browser_specific_settings": {
