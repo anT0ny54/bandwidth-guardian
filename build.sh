@@ -46,7 +46,7 @@ INCLUDE=(
   defaults.js
   service-worker.js
   content.js
-  prehook.js
+  prehook-main.js
   popup.html
   popup.css
   popup.js
