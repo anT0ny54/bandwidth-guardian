@@ -1,5 +1,5 @@
 // Bandwidth Guardian — conservative mobile image rewriter
-// v0.0.9: native responsive-image selection preserved; mobile proxy cap added.
+// v0.1.0: MAIN-world prehook + isolated DOM fallback; LCP-safe stable build.
 (() => {
   "use strict";
 
@@ -12,7 +12,7 @@
 
   const LAZY_ATTRS = ["data-src", "data-iurl", "data-lazy-src", "data-original", "data-url", "data-hi-res", "data-lazy", "data-echo"];
   const LAZY_SET = new Set(LAZY_ATTRS);
-  const OBSERVED_ATTRS = ["src", "srcset", "style", "href", "rel", "as", ...LAZY_ATTRS, "data-srcset"];
+  const OBSERVED_ATTRS = ["src", "srcset", "style", ...LAZY_ATTRS, "data-srcset"];
   const IMAGE_SELECTOR = ["img", "picture source", "[style]", ...LAZY_ATTRS.map(a => `[${a}]`), "[data-srcset]"].join(",");
   const TRACKING_PATTERNS = [
     /pagead/i, /(pixel|cleardot)\.*\.(gif|jpg|jpeg)/i,
@@ -40,6 +40,8 @@
   const doneBackground = new WeakSet();
   const urlCache = new Map();
   const CACHE_LIMIT = 768;
+  const PROXY_TIMEOUT_NORMAL = 2500;
+  const PROXY_TIMEOUT_LCP = 1200;
 
   let opts = { ...DEFAULTS };
   let excluded = new Set();
@@ -96,7 +98,7 @@
     const key = `${u.href}|mw:${effectiveMaxWidth}|fmt:${opts.isWebpSupported ? "webp" : "jpeg"}|q:${opts.quality}|bw:${opts.grayscale ? 1 : 0}`;
     const cached = urlCache.get(key); if (cached) return cached;
     const params = new URLSearchParams({
-      url: key,
+      url: u.href,
       jpeg: opts.isWebpSupported ? "0" : "1",
       bw: opts.grayscale ? "1" : "0",
       quality: String(opts.quality ?? 40),
@@ -158,6 +160,13 @@
 
   function armDecodeCheck(img, proxied) {
     if (!(img instanceof HTMLImageElement) || !opts.failoverOriginal) return;
+    const priority = String(img.getAttribute("fetchpriority") || "").toLowerCase();
+    const lcpLike = priority === "high" || img.loading === "eager";
+    const timeout = lcpLike ? PROXY_TIMEOUT_LCP : PROXY_TIMEOUT_NORMAL;
+    setTimeout(() => {
+      const st = imageState.get(img);
+      if (st?.proxied === proxied && !st.failedOnce && !img.complete) restoreImage(img);
+    }, timeout);
     const check = () => {
       const st = imageState.get(img);
       if (!st || st.proxied !== proxied || st.failedOnce) return;
