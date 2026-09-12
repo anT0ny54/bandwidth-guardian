@@ -24,8 +24,6 @@
   const sourceSrcsetDesc = Object.getOwnPropertyDescriptor(sourceProto, "srcset");
   const linkHrefDesc = Object.getOwnPropertyDescriptor(linkProto, "href");
   const nativeSetAttribute = Element.prototype.setAttribute;
-  const nativeGetAttribute = Element.prototype.getAttribute;
-  const nativeRemoveAttribute = Element.prototype.removeAttribute;
   const NativeImage = window.Image;
 
   let opts = { ...DEFAULTS };
@@ -188,8 +186,6 @@
     return opts.proxyBase + "?" + params.toString();
   }
 
-  function rewriteSrcset(value) { return value; }
-
   function isImagePreload(link) {
     if (!(link instanceof HTMLLinkElement)) return false;
     return /(?:^|\s)preload(?:\s|$)/i.test(link.getAttribute("rel") || "") &&
@@ -326,17 +322,6 @@
         if (!ready) { queue(this, { srcset: original }); nativeSrcset(this, recordSafeSrcset(this, original)); }
         else nativeSrcset(this, original);
       } catch { nativeSrcset(this, value); }
-    },
-  });
-
-  if (false && sourceSrcsetDesc?.set) Object.defineProperty(sourceProto, "srcset", {
-    configurable: true, enumerable: sourceSrcsetDesc.enumerable, get: sourceSrcsetDesc.get,
-    set(value) {
-      try {
-        const original = String(value || "");
-        if (!ready) { queue(this, { srcset: original }); nativeSourceSrcset(this, ""); }
-        else nativeSourceSrcset(this, (!opts.enabled || !opts.proxyBase) ? original : rewriteSrcset(original));
-      } catch { nativeSourceSrcset(this, value); }
     },
   });
 

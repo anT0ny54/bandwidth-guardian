@@ -90,11 +90,12 @@ rm -f "$ZIPFILE"
 )
 
 unzip -tq "$ZIPFILE" >/dev/null
-unzip -Z1 "$ZIPFILE" | grep -Fxq 'manifest.json'
-unzip -Z1 "$ZIPFILE" | grep -Fxq 'popup.css'
-unzip -Z1 "$ZIPFILE" | grep -Fxq 'options.css'
-unzip -Z1 "$ZIPFILE" | grep -Fxq 'shield.svg'
-! unzip -Z1 "$ZIPFILE" | grep -q '^bandwidth-guardian-main/'
+ZIP_ENTRIES="$(unzip -Z1 "$ZIPFILE")"
+grep -Fxq 'manifest.json' <<< "$ZIP_ENTRIES"
+grep -Fxq 'popup.css' <<< "$ZIP_ENTRIES"
+grep -Fxq 'options.css' <<< "$ZIP_ENTRIES"
+grep -Fxq 'shield.svg' <<< "$ZIP_ENTRIES"
+! grep -q '^bandwidth-guardian-main/' <<< "$ZIP_ENTRIES"
 
 echo "Built: $ZIPFILE"
 echo "SHA256: $(sha256sum "$ZIPFILE" | awk '{print $1}')"

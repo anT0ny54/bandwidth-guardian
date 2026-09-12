@@ -29,7 +29,6 @@
 
   const imgSrc = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, "src");
   const nativeSetAttribute = Element.prototype.setAttribute;
-  const nativeRemoveAttribute = Element.prototype.removeAttribute;
 
   // State belongs to the extension's isolated world and is never written into page markup.
   const imageState = new WeakMap();
@@ -138,11 +137,6 @@
     writing.add(el);
     try { nativeSetAttribute.call(el, name, value); } finally { queueMicrotask(() => writing.delete(el)); }
   }
-  function removeNativeAttr(el, name) {
-    writing.add(el);
-    try { nativeRemoveAttribute.call(el, name); } finally { queueMicrotask(() => writing.delete(el)); }
-  }
-
   function proxyPlainSrc(img, original) {
     if (!(img instanceof HTMLImageElement) || !original || shouldSkip(original)) return false;
     // Do not touch src when native candidate selection is active. This is the key

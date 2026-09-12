@@ -23,6 +23,10 @@ let statsLoaded = false;
 let statsDirty = false;
 let statsFlushTimer = 0;
 let statsWrite = Promise.resolve();
+// Cached origin of the configured proxy, used to make sure stats are only
+// recorded for responses that actually came from the user's proxy — not
+// from an arbitrary site setting the same header names on an image response.
+let proxyOrigin = "";
 
 function getSync(keys) {
   return new Promise((resolve) => chrome.storage.sync.get(keys, resolve));
@@ -37,8 +41,17 @@ function setLocal(value) {
   return chrome.storage.local.set(value);
 }
 
+function computeOrigin(url) {
+  try {
+    return new URL(url).origin;
+  } catch {
+    return "";
+  }
+}
+
 async function mirrorToLocal() {
   const opts = await getSync(DEFAULTS);
+  proxyOrigin = computeOrigin(opts.proxyBase);
   await setLocal({ bhOpts: opts });
 }
 
@@ -130,8 +143,12 @@ function queueStatsWrite() {
   }, 250);
 }
 
-async function recordProxyStats(responseHeaders, fromCache) {
+async function recordProxyStats(url, responseHeaders, fromCache) {
   if (fromCache) return;
+  // Guard against any site setting x-bytes-saved/x-original-size on an
+  // ordinary image response to inflate the stats — only trust responses
+  // that actually came from the configured proxy's origin.
+  if (!proxyOrigin || computeOrigin(url) !== proxyOrigin) return;
   const saved = parseHeaderInt(responseHeaders, "x-bytes-saved");
   const original = parseHeaderInt(responseHeaders, "x-original-size");
   if (saved === null || original === null) return;
@@ -186,7 +203,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
 if (chrome.webRequest?.onCompleted) {
   chrome.webRequest.onCompleted.addListener(
     (details) => {
-      recordProxyStats(details.responseHeaders, details.fromCache).catch((error) => {
+      recordProxyStats(details.url, details.responseHeaders, details.fromCache).catch((error) => {
         console.warn("Bandwidth Guardian: stats update failed", error);
       });
     },
