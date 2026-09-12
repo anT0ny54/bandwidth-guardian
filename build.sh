@@ -43,6 +43,7 @@ SOURCE_DATE_EPOCH=1709856000
 
 INCLUDE=(
   manifest.json
+  bridge.js
   defaults.js
   service-worker.js
   content.js
