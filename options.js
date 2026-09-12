@@ -12,6 +12,7 @@ const resetAllBtn = $("resetAll");
 const resetStatsBtn = $("resetStats");
 const statImagesEl = $("statImages");
 const statBytesEl = $("statBytes");
+const statDirectEl = $("statDirect");
 const toastEl = $("toast");
 const checkUpdateBtn = $("checkUpdate");
 const updateStatusEl = $("updateStatus");
@@ -107,6 +108,7 @@ async function load() {
   const pct = processed > 0 ? Math.round((saved / processed) * 100) : 0;
   statImagesEl.textContent = (Number(stats.filesProcessed) || 0).toLocaleString();
   statBytesEl.textContent = fmtBytes(saved) + (pct > 0 ? ` (${pct}%)` : "");
+  statDirectEl.textContent = fmtBytes(Number(stats.directImageBytes) || 0);
 }
 
 function isValidProxyURL(value) {

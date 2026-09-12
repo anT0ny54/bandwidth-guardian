@@ -1,5 +1,5 @@
 // Bandwidth Guardian — conservative mobile image rewriter
-// v0.1.0: MAIN-world prehook + isolated DOM fallback; LCP-safe stable build.
+// v0.1.0: MAIN-world prehook + isolated DOM fallback; native responsive selection preserved.
 (() => {
   "use strict";
 
@@ -10,9 +10,9 @@
     mobileMaxWidth: 1280,
   };
 
-  const LAZY_ATTRS = ["data-src", "data-iurl", "data-lazy-src", "data-original", "data-url", "data-hi-res", "data-lazy", "data-echo"];
+  const LAZY_ATTRS = ["data-src", "data-iurl", "data-lazy-src", "data-original", "data-url", "data-hi-res", "data-lazy", "data-echo", "data-lazy-srcset", "data-original-src", "data-image", "data-bg", "data-background-image"];
   const LAZY_SET = new Set(LAZY_ATTRS);
-  const OBSERVED_ATTRS = ["src", "srcset", "style", ...LAZY_ATTRS, "data-srcset"];
+  const OBSERVED_ATTRS = ["src", "srcset", "style", "href", "rel", "as", ...LAZY_ATTRS, "data-srcset"];
   const IMAGE_SELECTOR = ["img", "picture source", "[style]", ...LAZY_ATTRS.map(a => `[${a}]`), "[data-srcset]"].join(",");
   const TRACKING_PATTERNS = [
     /pagead/i, /(pixel|cleardot)\.*\.(gif|jpg|jpeg)/i,
@@ -39,9 +39,11 @@
   const doneLazy = new WeakSet();
   const doneBackground = new WeakSet();
   const urlCache = new Map();
+  const requestDedupe = new Map(); // original URL -> proxy URL + active element count
+  const responsiveState = new WeakMap();
   const CACHE_LIMIT = 768;
-  const PROXY_TIMEOUT_NORMAL = 2500;
-  const PROXY_TIMEOUT_LCP = 1200;
+  const PROXY_TIMEOUT_NORMAL = 4500;
+  const PROXY_TIMEOUT_LCP = 1800;
 
   let opts = { ...DEFAULTS };
   let excluded = new Set();
@@ -132,18 +134,97 @@
     try { nativeRemoveAttribute.call(el, name); } finally { queueMicrotask(() => writing.delete(el)); }
   }
 
+  // Catch JS-driven style.backgroundImage/background assignments without touching
+  // unrelated CSS properties. The page keeps the same CSS semantics; only url()
+  // tokens are replaced.
+  const cssProto = window.CSSStyleDeclaration?.prototype;
+  const bgImageDesc = cssProto && Object.getOwnPropertyDescriptor(cssProto, "backgroundImage");
+  const bgDesc = cssProto && Object.getOwnPropertyDescriptor(cssProto, "background");
+  if (bgImageDesc?.set) Object.defineProperty(cssProto, "backgroundImage", { configurable: bgImageDesc.configurable, enumerable: bgImageDesc.enumerable, get: bgImageDesc.get, set(value) {
+    if (writing.has(this)) return bgImageDesc.set.call(this, value);
+    const rewritten = String(value).replace(/url\(\s*(["']?)([^"')]+)\1\s*\)/gi, (full, q, url) => { const abs=resolveHTTP(url)?.href; return abs && !shouldSkip(abs) ? `url("${buildProxyUrl(abs)}")` : full; });
+    return bgImageDesc.set.call(this, rewritten);
+  }});
+  if (bgDesc?.set) Object.defineProperty(cssProto, "background", { configurable: bgDesc.configurable, enumerable: bgDesc.enumerable, get: bgDesc.get, set(value) {
+    if (writing.has(this)) return bgDesc.set.call(this, value);
+    const rewritten = String(value).replace(/url\(\s*(["']?)([^"')]+)\1\s*\)/gi, (full, q, url) => { const abs=resolveHTTP(url)?.href; return abs && !shouldSkip(abs) ? `url("${buildProxyUrl(abs)}")` : full; });
+    return bgDesc.set.call(this, rewritten);
+  }});
+
+  function noteDedupe(original, proxied) {
+    const hit = requestDedupe.get(original);
+    if (hit) { hit.count += 1; return hit.proxy; }
+    requestDedupe.set(original, { proxy: proxied, count: 1, t: performance.now() });
+    if (requestDedupe.size > CACHE_LIMIT) requestDedupe.delete(requestDedupe.keys().next().value);
+    return proxied;
+  }
+
   function proxyPlainSrc(img, original) {
     if (!(img instanceof HTMLImageElement) || !original || shouldSkip(original)) return false;
-    // Do not touch src when native candidate selection is active. This is the key
-    // compatibility rule for sites using srcset/picture (including Twkan variants).
     if (hasSrcset(img) || hasPictureCandidate(img)) return false;
-    const proxied = buildProxyUrl(original);
-    if (!proxied || proxied === original) return false;
+    const generated = buildProxyUrl(original);
+    if (!generated || generated === original) return false;
+    const proxied = noteDedupe(new URL(original, document.baseURI).href, generated);
     const old = imageState.get(img);
     if (old?.original === original && old?.proxied === proxied && !old.failedOnce) return false;
-    imageState.set(img, { original: String(original), proxied: String(proxied), failedOnce: false });
+    imageState.set(img, { original: String(original), proxied: String(proxied), failedOnce: false, source: "src" });
     setNativeSrc(img, proxied);
     return true;
+  }
+
+  // Rewrite only the candidate Chromium has selected, not the entire srcset list.
+  // This preserves responsive selection while giving the browser a chance to replace
+  // the selected request immediately after a framework updates srcset.
+  function proxySelectedResponsiveCandidate(img) {
+    if (!(img instanceof HTMLImageElement) || !opts.enabled || !opts.proxyBase) return false;
+    const selected = img.currentSrc;
+    if (!selected || shouldSkip(selected) || selected.startsWith(opts.proxyBase)) return false;
+    const srcset = img.getAttribute("srcset");
+    if (!srcset) return false;
+    const resolved = resolveHTTP(selected)?.href;
+    if (!resolved) return false;
+    const parts = srcset.split(",");
+    let changed = false;
+    const rewritten = parts.map(part => {
+      const m = part.trim().match(/^(\S+)(\s+.*)?$/);
+      if (!m) return part;
+      let candidate;
+      try { candidate = new URL(m[1], document.baseURI).href; } catch { return part; }
+      if (candidate !== resolved || shouldSkip(candidate)) return part;
+      const proxy = buildProxyUrl(candidate);
+      if (!proxy || proxy === candidate) return part;
+      changed = true;
+      return part.replace(m[1], proxy);
+    }).join(",");
+    if (!changed) return false;
+    responsiveState.set(img, { original: resolved, proxied: buildProxyUrl(resolved) });
+    setNativeAttr(img, "srcset", rewritten);
+    return true;
+  }
+
+  function armResponsiveWinner(img) {
+    if (!(img instanceof HTMLImageElement)) return;
+    queueMicrotask(() => {
+      if (hasSrcset(img)) proxySelectedResponsiveCandidate(img);
+      else if (img.closest?.("picture")) {
+        // For <picture>, wait for the browser to expose currentSrc, then ask the
+        // owning source element to replace only the matching candidate.
+        const selected = img.currentSrc;
+        if (!selected) return;
+        const resolved = resolveHTTP(selected)?.href;
+        if (!resolved || shouldSkip(resolved)) return;
+        const source = [...(img.closest("picture")?.querySelectorAll("source[srcset]") || [])]
+          .find(el => el.srcset && el.srcset.split(",").some(part => { try { return new URL(part.trim().split(/\s+/)[0], document.baseURI).href === resolved; } catch { return false; } }));
+        if (!source) return;
+        const old = source.getAttribute("srcset") || "";
+        const proxy = buildProxyUrl(resolved);
+        const next = old.split(",").map(part => {
+          const token=part.trim().split(/\s+/)[0];
+          try { return new URL(token, document.baseURI).href === resolved ? part.replace(token, proxy) : part; } catch { return part; }
+        }).join(",");
+        if (next !== old) setNativeAttr(source, "srcset", next);
+      }
+    });
   }
 
   function restoreImage(img) {
@@ -198,7 +279,7 @@
     if (failed.has(img) && src !== imageState.get(img)?.original) failed.delete(img);
 
     if (!src || shouldSkip(src)) return;
-    if (hasSrcset(img) || hasPictureCandidate(img)) return;
+    if (hasSrcset(img) || hasPictureCandidate(img)) { armResponsiveWinner(img); return; }
     if (src.startsWith(opts.proxyBase)) return;
     if (proxyPlainSrc(img, src)) {
       const next = imageState.get(img);
@@ -233,10 +314,25 @@
 
   function rewriteBackground(el) {
     if (!el || doneBackground.has(el) || !opts.enabled || !opts.proxyBase) return;
-    const bg = el.style?.backgroundImage;
-    if (!bg || !/url\(/i.test(bg)) return;
-    const rewritten = bg.replace(/url\(\s*(["']?)([^"')]+)\1\s*\)/gi, (full, quote, url) => shouldSkip(url) ? full : `url("${buildProxyUrl(url)}")`);
-    if (rewritten !== bg) { writing.add(el); try { el.style.backgroundImage = rewritten; } finally { queueMicrotask(() => writing.delete(el)); } doneBackground.add(el); }
+    const style = el.style;
+    if (!style) return;
+    const candidates = [style.backgroundImage, style.background].filter(Boolean);
+    if (!candidates.length) return;
+    let changedAny = false;
+    for (const property of ["backgroundImage", "background"]) {
+      const bg = style[property];
+      if (!bg || !/url\(/i.test(bg)) continue;
+      const rewritten = bg.replace(/url\(\s*(["']?)([^"')]+)\1\s*\)/gi, (full, quote, url) => {
+        const absolute = resolveHTTP(url)?.href;
+        if (!absolute || shouldSkip(absolute)) return full;
+        const proxy = buildProxyUrl(absolute);
+        if (!proxy || proxy === absolute) return full;
+        changedAny = true;
+        return `url("${proxy}")`;
+      });
+      if (rewritten !== bg) { writing.add(el); try { style[property] = rewritten; } finally { queueMicrotask(() => writing.delete(el)); } }
+    }
+    if (changedAny) doneBackground.add(el);
   }
 
   function processElement(el) {
@@ -290,6 +386,7 @@
         if (t instanceof HTMLImageElement) {
           failed.delete(t);
           imageState.delete(t);
+          armResponsiveWinner(t);
         }
       } else if (LAZY_SET.has(a)) {
         doneLazy.delete(t); rewriteLazy(t);

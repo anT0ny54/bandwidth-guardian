@@ -1,4 +1,4 @@
-// Bandwidth Guardian 0.1.0 — MAIN-world early image prehook (LCP-safe stable)
+// Bandwidth Guardian 0.1.0 — MAIN-world early image prehook
 // Purpose: intercept page JavaScript image URL assignments before the page's own
 // JavaScript can trigger the original image request. No extension APIs are used here.
 (() => {
@@ -13,9 +13,11 @@
   let configured = false;
   const imgProto = HTMLImageElement.prototype;
   const sourceProto = HTMLSourceElement.prototype;
+  const linkProto = HTMLLinkElement.prototype;
   const srcDesc = Object.getOwnPropertyDescriptor(imgProto,"src");
   const srcsetDesc = Object.getOwnPropertyDescriptor(imgProto,"srcset");
   const sourceSrcsetDesc = Object.getOwnPropertyDescriptor(sourceProto,"srcset");
+  const linkHrefDesc = Object.getOwnPropertyDescriptor(linkProto,"href");
   const nativeSetAttribute = Element.prototype.setAttribute;
   const NativeImage = window.Image;
   const state = new WeakMap();
@@ -23,8 +25,9 @@
   const writing = new WeakSet();
   const urlCache = new Map();
   const CACHE_LIMIT = 1024;
-  const PROXY_TIMEOUT_NORMAL = 2500;
-  const PROXY_TIMEOUT_LCP = 1200;
+  const LAZY_ATTRS = new Set(["data-src","data-iurl","data-lazy-src","data-original","data-url","data-hi-res","data-lazy","data-echo","data-image","data-original-src"]);
+  const PROXY_TIMEOUT_NORMAL = 4500;
+  const PROXY_TIMEOUT_LCP = 1800;
 
   const parseURL = v => { try { return new URL(String(v||""), document.baseURI); } catch { return null; } };
   const httpURL = v => { const u=parseURL(v); return u && /^https?:$/.test(u.protocol) ? u : null; };
@@ -86,28 +89,39 @@
     state.set(img,{original,proxy:p,failed:false}); setSrc(img,p); arm(img,p);
   }
   if(srcDesc?.set)Object.defineProperty(imgProto,'src',{configurable:true,enumerable:srcDesc.enumerable,get:srcDesc.get,set(v){try{handleSrc(this,v)}catch{srcDesc.set.call(this,v)}}});
-  if(srcsetDesc?.set)Object.defineProperty(imgProto,'srcset',{configurable:true,enumerable:srcsetDesc.enumerable,get:srcsetDesc.get,set(v){try{srcsetDesc.set.call(this,v)}catch{}}});
 
-  // Do not rewrite srcset/picture candidates. Let Chromium choose the winner natively.
+  function rewriteSelectedCandidate(img){
+    if(!(img instanceof HTMLImageElement) || !configured || !opts.enabled || !opts.proxyBase) return;
+    queueMicrotask(()=>{
+      const selected=img.currentSrc; const srcset=img.getAttribute("srcset");
+      if(!selected || !srcset || shouldSkip(selected) || selected.startsWith(opts.proxyBase)) return;
+      const resolved=httpURL(selected)?.href; if(!resolved) return;
+      const next=srcset.split(",").map(part=>{
+        const token=part.trim().split(/\s+/)[0]; if(!token)return part;
+        try{return new URL(token,document.baseURI).href===resolved?part.replace(token,proxy(resolved)):part}catch{return part}
+      }).join(",");
+      if(next!==srcset) setAttr(img,"srcset",next);
+    });
+  }
+  if(srcsetDesc?.set)Object.defineProperty(imgProto,'srcset',{configurable:true,enumerable:srcsetDesc.enumerable,get:srcsetDesc.get,set(v){srcsetDesc.set.call(this,v);rewriteSelectedCandidate(this)}});
   if(sourceSrcsetDesc?.set)Object.defineProperty(sourceProto,'srcset',{configurable:true,enumerable:sourceSrcsetDesc.enumerable,get:sourceSrcsetDesc.get,set(v){sourceSrcsetDesc.set.call(this,v)}});
 
-  // LCP safety: never rewrite <link rel="preload" as="image">.
-  // Let the browser own preload semantics and credentials.
+  Element.prototype.setAttribute=function(name,value){
+    try{
+      const a=String(name).toLowerCase();
+      if(this instanceof HTMLImageElement && a==='src'){handleSrc(this,value);return;}
+      if(this instanceof HTMLImageElement && a==='srcset'){nativeSetAttribute.call(this,name,value);rewriteSelectedCandidate(this);return;}
+      if(LAZY_ATTRS.has(a) && (this instanceof HTMLImageElement || this.tagName==='SOURCE')){
+        const v=String(value??'');
+        if(configured && opts.enabled && opts.proxyBase && !shouldSkip(v)){setAttr(this,name,proxy(v));return;}
+      }
+    }catch{}
+    return nativeSetAttribute.call(this,name,value);
+  };
 
-  // Scope setAttribute interception to images only. Do not replace
-  // Element.prototype.setAttribute globally; page frameworks depend on it.
-  const nativeImgSetAttribute = imgProto.setAttribute;
-  if (nativeImgSetAttribute) {
-    imgProto.setAttribute = function(name, value) {
-      try {
-        if (String(name).toLowerCase() === "src") { handleSrc(this, value); return; }
-      } catch {}
-      return nativeImgSetAttribute.call(this, name, value);
-    };
-  }
-
-  // Do not replace window.Image. Native Image() returns an HTMLImageElement,
-  // so the patched HTMLImageElement.src setter already catches Image().src.
+  // LCP SAFETY: do not intercept <link rel="preload" as="image">.
+  // Native preload behavior remains entirely under Chromium.
+  // Image() itself is also left native; its instances use the patched src setter.
 
   function applyConfig(next){
     const n={...DEFAULTS,...(next||{})}; n.proxyBase=normalizeBase(n.proxyBase); opts=n; excluded=parseDomains(n.excludeDomains); proxyHost=httpURL(n.proxyBase)?.hostname?.toLowerCase()||''; configured=true; urlCache.clear();

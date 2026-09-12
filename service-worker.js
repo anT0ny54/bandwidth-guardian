@@ -15,7 +15,7 @@ const DEFAULTS = {
 
 const RULE_ID_CSP = 2;
 const ALL_RULE_IDS = [1, RULE_ID_CSP];
-const EMPTY_STATS = { filesProcessed: 0, bytesProcessed: 0, bytesSaved: 0 };
+const EMPTY_STATS = { filesProcessed: 0, bytesProcessed: 0, bytesSaved: 0, proxyRequests: 0, proxyCompressedBytes: 0, directImageRequests: 0, directImageBytes: 0 };
 
 let ruleRefreshTimer = 0;
 let stats = { ...EMPTY_STATS };
@@ -130,16 +130,38 @@ function queueStatsWrite() {
   }, 250);
 }
 
-async function recordProxyStats(responseHeaders, fromCache) {
-  if (fromCache) return;
-  const saved = parseHeaderInt(responseHeaders, "x-bytes-saved");
-  const original = parseHeaderInt(responseHeaders, "x-original-size");
-  if (saved === null || original === null) return;
-
+function getContentLength(headers) {
+  return parseHeaderInt(headers, "content-length");
+}
+function isProxyRequest(url) {
+  try {
+    const u = new URL(url);
+    return !!proxyHostForStats && u.origin + u.pathname === proxyHostForStats;
+  } catch { return false; }
+}
+let proxyHostForStats = "";
+async function refreshStatsProxyHost() {
+  const opts = await getSync(DEFAULTS);
+  try { const u = new URL(opts.proxyBase || ""); proxyHostForStats = u.origin + u.pathname.replace(/\/$/, ""); }
+  catch { proxyHostForStats = ""; }
+}
+async function recordImageStats(details) {
+  if (details.fromCache) return;
   await ensureStatsLoaded();
-  stats.filesProcessed += 1;
-  stats.bytesProcessed += original;
-  stats.bytesSaved += saved;
+  if (isProxyRequest(details.url)) {
+    const saved = parseHeaderInt(details.responseHeaders, "x-bytes-saved");
+    const original = parseHeaderInt(details.responseHeaders, "x-original-size");
+    const compressed = parseHeaderInt(details.responseHeaders, "x-compressed-size") ?? getContentLength(details.responseHeaders);
+    stats.proxyRequests += 1;
+    if (original !== null) stats.bytesProcessed += original;
+    if (compressed !== null) stats.proxyCompressedBytes += compressed;
+    if (saved !== null) stats.bytesSaved += saved;
+    if (original !== null) stats.filesProcessed += 1;
+  } else {
+    const bytes = getContentLength(details.responseHeaders);
+    stats.directImageRequests += 1;
+    if (bytes !== null) stats.directImageBytes += bytes;
+  }
   statsDirty = true;
   queueStatsWrite();
 }
@@ -174,6 +196,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
   if (!relevant.length) return;
 
   mirrorToLocal().catch((error) => console.warn("Bandwidth Guardian: mirror failed", error));
+  refreshStatsProxyHost().catch(() => {});
 
   if ("enabled" in changes) {
     updateIcon(!!changes.enabled.newValue).catch(() => {});
@@ -186,7 +209,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
 if (chrome.webRequest?.onCompleted) {
   chrome.webRequest.onCompleted.addListener(
     (details) => {
-      recordProxyStats(details.responseHeaders, details.fromCache).catch((error) => {
+      recordImageStats(details).catch((error) => {
         console.warn("Bandwidth Guardian: stats update failed", error);
       });
     },

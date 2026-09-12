@@ -131,9 +131,13 @@
           <div class="stat-lbl">Data saved</div>
           <div class="stat-val" id="statBytes">—</div>
         </div>
+        <div class="stat">
+          <div class="stat-lbl">Direct image bytes</div>
+          <div class="stat-val" id="statDirect">—</div>
+        </div>
       </div>
       <div class="hint hint-spaced">
-        Reads <code>x-bytes-saved</code> and <code>x-original-size</code> headers from your proxy.
+        Measures BHP2 original/compressed bytes and observed direct image responses. Direct bytes include intentionally excluded/non-proxied images.
       </div>
       <div class="btn-row btn-row-spaced">
         <button id="resetStats" class="btn ghost" type="button">Clear stats</button>
