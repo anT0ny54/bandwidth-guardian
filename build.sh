@@ -1,30 +1,46 @@
 #!/usr/bin/env bash
-# Bandwidth Guardian — reproducible build script
-#
-# Produces a deterministic zip that can be uploaded to the Chrome Web Store.
-# The zip is byte-for-byte reproducible on any machine because:
-#   - All file timestamps are set to a fixed value (SOURCE_DATE_EPOCH)
-#   - Files are sorted before zipping (consistent ordering)
-#   - No system-specific metadata is included
-#
-# Usage:
-#   bash build.sh           # builds bandwidth-guardian-<version>.zip
-#   bash build.sh --out dir # write zip to a specific directory
+# Bandwidth Guardian — reproducible extension build
 
 set -euo pipefail
 
-VERSION=$(python3 -c "import json,sys; print(json.load(open('manifest.json'))['version'])")
-OUTDIR="${2:-$(pwd)}"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+OUTDIR="$ROOT_DIR/dist"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --out)
+      [[ $# -ge 2 ]] || { echo "ERROR: --out requires a directory" >&2; exit 2; }
+      OUTDIR="$2"
+      shift 2
+      ;;
+    *)
+      echo "Usage: bash build.sh [--out DIR]" >&2
+      exit 2
+      ;;
+  esac
+done
+
+OUTDIR="$(mkdir -p "$OUTDIR" && cd "$OUTDIR" && pwd)"
+
+VERSION="$(python3 - "$ROOT_DIR/manifest.json" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding='utf-8') as f:
+    print(json.load(f)['version'])
+PY
+)"
+
+# The manifest is the single source of truth for the extension version.
+# Do not hard-code a release version here: every manifest version must build.
+python3 - "$VERSION" <<'PYVERCHECK'
+import re, sys
+version = sys.argv[1]
+if not re.fullmatch(r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)", version):
+    raise SystemExit(f"ERROR: invalid extension version: {version!r}")
+PYVERCHECK
+
 ZIPFILE="$OUTDIR/bandwidth-guardian-$VERSION.zip"
+SOURCE_DATE_EPOCH=1709856000
 
-# Fixed epoch makes the build reproducible regardless of when it runs.
-# Update this only when you intentionally want a different timestamp embedded.
-SOURCE_DATE_EPOCH=1709856000  # 2024-03-08 00:00:00 UTC
-
-echo "Building Bandwidth Guardian v$VERSION..."
-
-# Files and directories to include in the extension zip.
-# Explicitly listed — nothing stray goes in.
 INCLUDE=(
   manifest.json
   defaults.js
@@ -39,25 +55,43 @@ INCLUDE=(
   icons
 )
 
-# Create a temp staging dir with fixed timestamps
-STAGING=$(mktemp -d)
+STAGING="$(mktemp -d)"
 trap 'rm -rf "$STAGING"' EXIT
 
 for item in "${INCLUDE[@]}"; do
-  if [ -e "$item" ]; then
-    cp -r "$item" "$STAGING/"
-  else
-    echo "WARNING: $item not found, skipping"
+  if [[ ! -e "$ROOT_DIR/$item" ]]; then
+    echo "ERROR: required build file is missing: $item" >&2
+    exit 1
   fi
+  cp -R "$ROOT_DIR/$item" "$STAGING/"
 done
 
-# Apply fixed timestamps to every file recursively
-find "$STAGING" -exec touch -d "@$SOURCE_DATE_EPOCH" {} +
+python3 - "$STAGING/manifest.json" "${INCLUDE[@]}" <<'PY'
+import json, os, sys
+manifest_path = sys.argv[1]
+with open(manifest_path, encoding='utf-8') as f:
+    manifest = json.load(f)
+assert manifest.get('manifest_version') == 3, 'Manifest V3 required'
+version = manifest.get('version')
+assert isinstance(version, str) and version, 'Manifest version missing'
+for item in sys.argv[2:]:
+    if not os.path.exists(os.path.join(os.path.dirname(manifest_path), item)):
+        raise SystemExit(f'Missing staged item: {item}')
+PY
 
-# Build the zip with sorted, reproducible entry order
-cd "$STAGING"
-find . -type f | sort | zip -X -@ "$ZIPFILE"
-cd - > /dev/null
+find "$STAGING" -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} +
+rm -f "$ZIPFILE"
+(
+  cd "$STAGING"
+  find . -type f -print | sed 's#^\./##' | LC_ALL=C sort | zip -X -q "$ZIPFILE" -@
+)
 
-echo "Done: $ZIPFILE"
-echo "Size: $(du -sh "$ZIPFILE" | cut -f1)"
+unzip -tq "$ZIPFILE" >/dev/null
+ZIP_ENTRIES="$(unzip -Z1 "$ZIPFILE")"
+grep -Fxq 'manifest.json' <<< "$ZIP_ENTRIES"
+grep -Fxq 'popup.html' <<< "$ZIP_ENTRIES"
+grep -Fxq 'options.html' <<< "$ZIP_ENTRIES"
+! grep -q '^bandwidth-guardian-main/' <<< "$ZIP_ENTRIES"
+
+echo "Built: $ZIPFILE"
+echo "SHA256: $(sha256sum "$ZIPFILE" | awk '{print $1}')"
