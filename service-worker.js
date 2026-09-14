@@ -124,7 +124,14 @@ function updateIcon() {
     const path = on
       ? { 16: "icons/icon-16.png", 32: "icons/icon-32.png", 48: "icons/icon-48.png", 128: "icons/icon-128.png" }
       : { 16: "icons/icon-16-disabled.png", 32: "icons/icon-32-disabled.png", 48: "icons/icon-48-disabled.png", 128: "icons/icon-128-disabled.png" };
-    chrome.action.setIcon({ path }).catch?.(() => {});
+    // chrome.action.setIcon() returns a Promise on modern Chrome, but some
+    // Chromium forks (older Kiwi/Cromite builds) only support the
+    // callback-style API and return undefined — calling .catch on that
+    // would throw. Guard properly instead of chaining blindly.
+    try {
+      const p = chrome.action.setIcon({ path });
+      if (p && typeof p.then === "function") p.catch(() => {});
+    } catch (e) { /* ignore — icon update is best-effort */ }
   });
 }
 
@@ -198,17 +205,4 @@ function doRefreshRules() {
 
     chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: removeRuleIds, addRules: addRules });
   });
-}
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-function hostnameOf(u) {
-  try { return new URL(u).hostname.toLowerCase(); } catch { return ""; }
-}
-
-function parseDomains(text) {
-  return String(text || "")
-    .split(/[,\s]+/)
-    .map(s => s.trim().toLowerCase()).filter(Boolean)
-    .map(s => s.replace(/^https?:\/\//, "").split("/")[0]);
 }
