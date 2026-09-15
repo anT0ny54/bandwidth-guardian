@@ -1,129 +1,16 @@
 // Bandwidth Guardian — prehook (runs at document_start)
 // Intercepts <img src>, srcset, and new Image() assignments to prevent the
 // original full-resolution images from ever being downloaded.
-// Also applies the same tracking-pixel / icon / favicon skip rules as
-// content.js (see TRACKING_PATTERNS below), so JS-set beacon images can't
-// bypass the filter just because they're assigned before the HTML parser
-// would have seen them.
+//
+// Shared constants and the URL-skip / proxy-URL-building logic (defaults,
+// tracking patterns, bhShouldSkip, bhBuildProxyUrl) live in shared.js,
+// loaded immediately before this file — see manifest.json's content_scripts
+// entry and the notice at the top of shared.js for why that file exists.
 
 (() => {
-  // ── KEEP IN SYNC WITH defaults.js ──────────────────────────────────────────
-  // Content scripts cannot use ES module imports, so defaults are inlined here.
-  const defaults = {
-    enabled:         true,
-    proxyBase:       "",
-    quality:         40,
-    grayscale:       true,   // matches original convertBw: true
-    maxWidth:        1280,
-    excludeDomains:  "google.com gstatic.com challenges.cloudflare.com",
-    isWebpSupported: false
-  };
-  // ──────────────────────────────────────────────────────────────────────────
-
   let opts = null;        // loaded options (null until storage responds)
   let ready = false;      // true once options have loaded
-  const pending = new Set(); // <img> elements waiting for opts to be ready
-
-  const safeURL = u => { try { return new URL(u); } catch { return null; } };
-  const toDomainSet = text => new Set(
-    String(text || "")
-      .split(/[, \n\r\t]+/)
-      .map(s => s.trim().toLowerCase())
-      .filter(Boolean)
-      .map(s => s.replace(/^https?:\/\//, "").split("/")[0])
-  );
-  const isHttp = u => /^https?:\/\//i.test(u);
-
-  // ── KEEP IN SYNC WITH content.js "TRACKING_PATTERNS" ───────────────────────
-  // Without this, tracking pixels set via `new Image().src = ...` (very
-  // common — Image() is the classic beacon pattern) would bypass content.js's
-  // filter entirely and get proxied anyway, since prehook.js patches src
-  // *before* content.js ever sees the element. Both layers must agree on
-  // what to skip.
-  const TRACKING_PATTERNS = [
-    /pagead/i,
-    /(pixel|cleardot)[^/]*\.(gif|jpg|jpeg)/i,
-    /google\.([a-z.]+)\/(ads|generate_204|.*\/log204)+/i,
-    /google-analytics\.([a-z.]+)\/(r|collect)+/i,
-    /youtube\.([a-z.]+)\/(api|ptracking|player_204|live_204)+/i,
-    /doubleclick\.([a-z.]+)\/(pcs|pixel|r)+/i,
-    /googlesyndication\.([a-z.]+)\/ddm/i,
-    /pixel\.facebook\.([a-z.]+)/i,
-    /facebook\.([a-z.]+)\/(impression\.php|tr)+/i,
-    /ad\.bitmedia\.io/i,
-    /yahoo\.([a-z.]+)\/pixel/i,
-    /criteo\.net\/img/i,
-    /ad\.doubleclick\.net/i
-  ];
-
-  // Combines domain exclusion, tracking-pixel filtering, and the .ico/.svg/
-  // favicon skips that content.js applies — the single decision point both
-  // decideSrc() and rewriteSrcset() call into below.
-  function shouldSkipUrl(url, hostname) {
-    if (excludedHost(hostname)) return true;
-    const path = url.toLowerCase();
-    if (path.endsWith(".ico") || path.endsWith(".svg")) return true;
-    if (path.includes("favicon")) return true;
-    if (TRACKING_PATTERNS.some(p => p.test(url))) return true;
-    return false;
-  }
-
-  function buildProxyUrl(orig) {
-    if (!opts || !opts.proxyBase || !isHttp(orig)) return orig;
-    const base = opts.proxyBase.trim();
-    if (!base) return orig;
-    const sep = base.includes("?") ? "&" : "?";
-    // jpeg=1 when WebP not supported — mirrors original: jpeg=${isWebpSupported ? 0 : 1}
-    const jpeg = opts.isWebpSupported ? "0" : "1";
-    // bw= always sent as 0 or 1 — mirrors original: bw=${convertBw ? 1 : 0}
-    const bw   = opts.grayscale ? "1" : "0";
-    const parts = [
-      "url="     + encodeURIComponent(orig),
-      "jpeg="    + jpeg,
-      "bw="      + bw,
-      "quality=" + encodeURIComponent(String(opts.quality ?? 40)),
-    ];
-    if (opts.maxWidth) parts.push("max_width=" + encodeURIComponent(String(opts.maxWidth)));
-    return base + sep + parts.join("&");
-  }
-
-  function excludedHost(host) {
-    if (!opts) return false;
-    const ex = toDomainSet(opts.excludeDomains);
-    return ex.has(host.toLowerCase());
-  }
-
-  // Flush any <img> elements that were queued before opts loaded.
-  function flushPending() {
-    for (const img of Array.from(pending)) {
-      pending.delete(img);
-      try {
-        const orig = img.dataset.bhPendingSrc;
-        if (orig) {
-          const u = safeURL(orig);
-          if (u && !shouldSkipUrl(orig, u.hostname)) {
-            img.removeAttribute("data-bh-pending-src");
-            nativeSetSrc(img, buildProxyUrl(orig));
-          } else {
-            nativeSetSrc(img, orig);
-          }
-        }
-        const pendingSrcset = img.dataset.bhPendingSrcset;
-        if (pendingSrcset) {
-          img.removeAttribute("data-bh-pending-srcset");
-          // <source> (inside <picture>) and <img> use different native
-          // accessors — calling the wrong one throws "Illegal invocation"
-          // and is silently swallowed by the outer try/catch, so the
-          // element's srcset would never be restored. Dispatch by tag.
-          if (img.tagName === "SOURCE") {
-            nativeSourceSetSrcset(img, rewriteSrcset(pendingSrcset));
-          } else {
-            nativeSetSrcset(img, rewriteSrcset(pendingSrcset));
-          }
-        }
-      } catch {}
-    }
-  }
+  const pending = new Set(); // <img>/<source> elements waiting for opts to be ready
 
   // Try storage.local first (bhOpts mirror written by the service worker, ~5 ms).
   // If bhOpts is missing — fresh install, service worker not yet run, or browser
@@ -135,7 +22,7 @@
       ready = true;
       flushPending();
     } else {
-      chrome.storage.sync.get(defaults, synced => {
+      chrome.storage.sync.get(BH_DEFAULTS, synced => {
         opts = synced;
         ready = true;
         flushPending();
@@ -151,10 +38,10 @@
   // or not supported (Kiwi/Cromite).
   chrome.storage.onChanged?.addListener((changes, area) => {
     if (area === "local" && changes.bhOpts) {
-      opts = changes.bhOpts.newValue || defaults;
+      opts = changes.bhOpts.newValue || BH_DEFAULTS;
       ready = true;
     } else if (area === "sync") {
-      chrome.storage.sync.get(defaults, synced => {
+      chrome.storage.sync.get(BH_DEFAULTS, synced => {
         opts = synced;
         ready = true;
         chrome.storage.local.set({ bhOpts: synced });
@@ -181,23 +68,55 @@
       if (!m) return part;
       const url = m[1];
       const desc = m[2] || "";
-      if (!isHttp(url)) return part;
-      const u = safeURL(url);
+      if (!bhIsHttp(url)) return part;
+      const u = bhSafeURL(url);
       if (!u) return part;
-      if (opts && shouldSkipUrl(url, u.hostname)) return part;
-      return buildProxyUrl(url) + desc;
+      if (opts && bhShouldSkip(url, u.hostname, opts, location.hostname)) return part;
+      return bhBuildProxyUrl(url, opts) + desc;
     }).join(", ");
   }
 
   function decideSrc(original) {
-    if (!isHttp(original)) return original;
-    const u = safeURL(original);
+    if (!bhIsHttp(original)) return original;
+    const u = bhSafeURL(original);
     if (!u) return original;
-    if (opts && shouldSkipUrl(original, u.hostname)) return original;
+    if (opts && bhShouldSkip(original, u.hostname, opts, location.hostname)) return original;
     if (!ready || !opts || !opts.proxyBase) {
       return null; // signal to queue this element
     }
-    return buildProxyUrl(original);
+    return bhBuildProxyUrl(original, opts);
+  }
+
+  // Flush any <img>/<source> elements that were queued before opts loaded.
+  function flushPending() {
+    for (const img of Array.from(pending)) {
+      pending.delete(img);
+      try {
+        const orig = img.dataset.bhPendingSrc;
+        if (orig) {
+          const u = bhSafeURL(orig);
+          if (u && !bhShouldSkip(orig, u.hostname, opts, location.hostname)) {
+            img.removeAttribute("data-bh-pending-src");
+            nativeSetSrc(img, bhBuildProxyUrl(orig, opts));
+          } else {
+            nativeSetSrc(img, orig);
+          }
+        }
+        const pendingSrcset = img.dataset.bhPendingSrcset;
+        if (pendingSrcset) {
+          img.removeAttribute("data-bh-pending-srcset");
+          // <source> (inside <picture>) and <img> use different native
+          // accessors — calling the wrong one throws "Illegal invocation"
+          // and is silently swallowed by the outer try/catch, so the
+          // element's srcset would never be restored. Dispatch by tag.
+          if (img.tagName === "SOURCE") {
+            nativeSourceSetSrcset(img, rewriteSrcset(pendingSrcset));
+          } else {
+            nativeSetSrcset(img, rewriteSrcset(pendingSrcset));
+          }
+        }
+      } catch {}
+    }
   }
 
   // ── Patch <img>.src ────────────────────────────────────────────────────────

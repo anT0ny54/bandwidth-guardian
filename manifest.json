@@ -4,7 +4,7 @@
   "name": "__MSG_extensionName__",
   "short_name": "BW Guardian",
   "description": "__MSG_extensionDescription__",
-  "version": "0.0.4",
+  "version": "0.0.5",
 
   "action": {
     "default_popup": "popup.html",
@@ -39,22 +39,9 @@
   "content_scripts": [
     {
       "matches": ["<all_urls>"],
-      "js": ["prehook.js"],
-      "run_at": "document_start",
-      "all_frames": true
-    },
-    {
-      "matches": ["<all_urls>"],
-      "js": ["content.js"],
+      "js": ["shared.js", "prehook.js", "content.js"],
       "run_at": "document_start",
       "all_frames": true
     }
-  ],
-
-  "browser_specific_settings": {
-    "gecko": {
-      "id": "bandwidth-guardian@github.com",
-      "strict_min_version": "128.0"
-    }
-  }
+  ]
 }

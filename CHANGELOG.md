@@ -6,6 +6,72 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.0.5] — 2026-09-16
+
+### Fixed
+- **"Exclude this site" didn't cover images set via JavaScript.**
+  `prehook.js`'s URL-skip check only ever compared the *image's own*
+  hostname against `excludeDomains`. `content.js` also checks the current
+  *page's* hostname — which is what popup.js's "Exclude this site" button
+  actually adds to the list — but `prehook.js` never did. So on a site
+  marked excluded, any image assigned via JavaScript (lazy-loaders, SPA
+  frameworks, `new Image()`) whose own host wasn't *also* separately
+  excluded was still routed through the proxy. Only HTML-parsed
+  `<img src>` (handled by `content.js`) actually respected the exclusion.
+  Fixed by moving both layers onto one shared decision function,
+  `bhShouldSkip()` (see `shared.js`), which always checks both hosts.
+- **Lazy-loaded images could be proxied twice.** `content.js` rewrites
+  `data-src` / `data-lazy-src` / etc. attributes to the *proxy* URL, so
+  that when a lazy-loader later runs `img.src = img.dataset.src`,
+  `prehook.js` receives an already-correct URL. `prehook.js` had no way to
+  recognize that: its `src` setter patch treated the incoming value like
+  any other `http(s)` URL and wrapped it in the proxy a second time —
+  `proxy?url=<proxy%3Furl%3D...>` — which most proxies can't serve,
+  breaking the image. `content.js` already guarded against this
+  ("already proxied" check); `prehook.js` did not. `bhShouldSkip()` now
+  applies the same guard to both.
+
+### Changed
+- **Deduplicated content-script logic into `shared.js`.** Default
+  settings, `TRACKING_PATTERNS`, and the URL-skip / proxy-URL-building
+  logic existed as two independently maintained ("KEEP IN SYNC") copies —
+  one in `prehook.js`, one in `content.js`. Both bugs above were a direct
+  result of those copies drifting apart. The logic now lives once, in
+  `shared.js`, loaded before both via a single `content_scripts` entry in
+  `manifest.json` (`"js": ["shared.js", "prehook.js", "content.js"]`) —
+  all three run in the same per-frame isolated world, so `shared.js`'s
+  top-level declarations are ordinary globals to the other two.
+  `service-worker.js` and `defaults.js` keep their own copies of the
+  defaults object, as before, since neither can load a plain script the
+  way content scripts do — see the notice at the top of `shared.js`.
+- **Trimmed `content.js`'s background-image scan selector.** The full-page
+  scan queried every `div, section, article, header, footer, aside, main,
+  figure, li, a, span, td, th` element — on top of `[style*='background']`
+  — just to check `.style.backgroundImage` on each. On a large page that
+  meant walking thousands of elements that could never carry an inline
+  background. Now scans `[style*='background' i]` only, matching what the
+  `MutationObserver` path already used, with a case-insensitive flag added
+  so `style="Background-Image:..."` is no longer missed. Less CPU/battery
+  spent per page load, which matters most on the mobile browsers this
+  extension targets.
+- **Removed the `browser_specific_settings.gecko` block from
+  `manifest.json`.** This extension targets Chrome, Kiwi Browser, Cromite,
+  and other Chromium-based MV3 browsers only (per the README) — nothing in
+  the codebase has been written or tested for Firefox, so shipping Firefox
+  metadata implied support that doesn't exist.
+- **Merged the two `content_scripts` manifest entries into one,
+  explicitly ordered** (`shared.js` → `prehook.js` → `content.js`) instead
+  of relying on separate entries happening to run in declaration order.
+
+
+### Housekeeping
+- Bumped `manifest.json` version to `0.0.5`.
+- Added `shared.js` to `build.sh`'s `INCLUDE` list.
+- Synced `README.md`'s version badge, architecture table, project
+  structure tree, and build-output example.
+
+---
+
 ## [0.0.4] — 2026-09-15
 
 ### Fixed

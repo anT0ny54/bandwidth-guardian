@@ -2,7 +2,8 @@
 //
 // ══ ARCHITECTURE ══════════════════════════════════════════════════════════════
 //
-//  Image interception is now split across two layers:
+//  Image interception is split across two layers, sharing constants and
+//  URL-decision logic from shared.js (loaded first — see manifest.json):
 //
 //  Layer 1 — prehook.js (document_start, synchronous)
 //    Patches HTMLImageElement.prototype.src, srcset, setAttribute, and Image()
@@ -24,7 +25,9 @@
 //
 //    B) Lazy-load data attributes (data-src, data-lazy-src…) — rewritten so
 //       that when a lazy-loader later does img.src = img.dataset.src, prehook
-//       receives the proxy URL and the browser never fetches the original.
+//       receives the (already) proxy URL. bhShouldSkip()'s "already proxied"
+//       check (shared.js) means prehook recognizes that and leaves it alone
+//       instead of wrapping it in the proxy a second time.
 //
 //    C) Inline CSS background-image — rewritten via el.style.backgroundImage.
 //       Best-effort: stylesheet-defined backgrounds may already be loading.
@@ -38,102 +41,22 @@
 // ══════════════════════════════════════════════════════════════════════════════
 
 (function () {
-  // ── KEEP IN SYNC WITH defaults.js ─────────────────────────────────────────
-  const DEFAULTS = {
-    enabled:         true,
-    proxyBase:       "",
-    quality:         40,
-    grayscale:       true,
-    maxWidth:        1280,
-    excludeDomains:  "google.com gstatic.com challenges.cloudflare.com",
-    isWebpSupported: false
-  };
-  // ──────────────────────────────────────────────────────────────────────────
-
   // Lazy-load attributes used by common image libraries
   const LAZY_ATTRS = [
     "data-src", "data-iurl", "data-lazy-src", "data-original",
     "data-url", "data-hi-res", "data-lazy", "data-echo"
   ];
 
-  // Tracking pixel URL patterns (ported from original shouldCompress.js)
-  // Catches tracking pixels by URL pattern, regardless of domain.
-  // NOTE: not redundant with excludeDomains — these match ad/analytics paths
-  // across many hosts that aren't in the (short, user-editable) domain list.
-  const TRACKING_PATTERNS = [
-    /pagead/i,
-    // Fixed: was `\.*\.` (a literal, escaped dot repeated) which only matched
-    // "pixel.gif"/"cleardot.gif" verbatim. `[^/]*` matches any filename chars
-    // in between, so real paths like "tracking-pixel-123.gif" now match too.
-    /(pixel|cleardot)[^/]*\.(gif|jpg|jpeg)/i,
-    /google\.([a-z.]+)\/(ads|generate_204|.*\/log204)+/i,
-    /google-analytics\.([a-z.]+)\/(r|collect)+/i,
-    /youtube\.([a-z.]+)\/(api|ptracking|player_204|live_204)+/i,
-    /doubleclick\.([a-z.]+)\/(pcs|pixel|r)+/i,
-    /googlesyndication\.([a-z.]+)\/ddm/i,
-    /pixel\.facebook\.([a-z.]+)/i,
-    /facebook\.([a-z.]+)\/(impression\.php|tr)+/i,
-    /ad\.bitmedia\.io/i,
-    /yahoo\.([a-z.]+)\/pixel/i,
-    /criteo\.net\/img/i,
-    /ad\.doubleclick\.net/i
-  ];
+  // Elements whose inline style could carry a background-image. Matching on
+  // the attribute directly — instead of every div/section/article/header/
+  // footer/aside/main/figure/li/a/span/td/th on the page — keeps the full-page
+  // scan cheap even on large, image-heavy pages: the broad tag list this used
+  // to include walked thousands of elements that could never have an inline
+  // background. The "i" flag also catches style="Background-Image:...".
+  const BG_SELECTOR = "[style*='background' i]";
 
   let opts = null;
   const done = new WeakSet(); // elements already processed — no double-rewrites
-
-  // ── Helpers ────────────────────────────────────────────────────────────────
-  const safeURL = u => { try { return new URL(u); } catch { return null; } };
-  const isHttp  = u => /^https?:\/\//i.test(u);
-
-  function domainSet(text) {
-    return new Set(
-      String(text || "").split(/[,\s]+/)
-        .map(s => s.trim().toLowerCase()).filter(Boolean)
-        .map(s => s.replace(/^https?:\/\//, "").split("/")[0])
-    );
-  }
-
-  function shouldSkip(url) {
-    if (!opts?.enabled || !opts?.proxyBase) return true;
-    if (!isHttp(url)) return true;
-    const u = safeURL(url);
-    if (!u) return true;
-    // Already proxied
-    const proxyHost = safeURL(opts.proxyBase)?.hostname?.toLowerCase();
-    if (proxyHost && u.hostname.toLowerCase() === proxyHost) return true;
-    // Excluded domain (page or image host)
-    const ex = domainSet(opts.excludeDomains);
-    if (ex.has(u.hostname.toLowerCase())) return true;
-    if (ex.has(location.hostname.toLowerCase())) return true;
-    // Skip .ico, .svg (original shouldCompress.js check)
-    const path = u.pathname.toLowerCase();
-    if (path.endsWith(".ico") || path.endsWith(".svg")) return true;
-    // Skip favicons
-    if (url.toLowerCase().includes("favicon")) return true;
-    // Skip tracking pixels
-    if (TRACKING_PATTERNS.some(p => p.test(url))) return true;
-    return false;
-  }
-
-  // Builds the proxy URL with full param set, all values properly encoded.
-  // Mirrors original buildCompressUrl() plus himshim proxy2 additions.
-  function buildProxyUrl(orig) {
-    const base = (opts.proxyBase || "").trim();
-    const sep  = base.includes("?") ? "&" : "?";
-    // jpeg=1 when WebP not supported — proxy returns JPEG instead (original: jpeg=${isWebpSupported ? 0 : 1})
-    const jpeg = opts.isWebpSupported ? "0" : "1";
-    // bw= always sent as 0 or 1 — proxy must receive explicit value (original: bw=${convertBw ? 1 : 0})
-    const bw   = opts.grayscale ? "1" : "0";
-    const parts = [
-      "url="       + encodeURIComponent(orig),
-      "jpeg="      + jpeg,
-      "bw="        + bw,
-      "quality="   + (opts.quality ?? 40),
-    ];
-    if (opts.maxWidth) parts.push("max_width=" + opts.maxWidth);
-    return base + sep + parts.join("&");
-  }
 
   // ── A) <img src> and <source srcset> rewriting ────────────────────────────
   // Handles images whose src was set by the HTML parser (bypasses prehook).
@@ -154,13 +77,16 @@
     if (el.tagName === "IMG") {
       // src — only real <img> elements have one that means "image URL".
       const src = el.getAttribute("src");
-      if (src && isHttp(src) && !shouldSkip(src)) {
-        try {
-          // Use native src setter to avoid triggering prehook's patch again.
-          Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, "src")
-            ?.set?.call(el, buildProxyUrl(src));
-          rewrote = true;
-        } catch { /* illegal invocation on an unexpected element type */ }
+      if (src && bhIsHttp(src)) {
+        const u = bhSafeURL(src);
+        if (u && !bhShouldSkip(src, u.hostname, opts, location.hostname)) {
+          try {
+            // Use native src setter to avoid triggering prehook's patch again.
+            Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, "src")
+              ?.set?.call(el, bhBuildProxyUrl(src, opts));
+            rewrote = true;
+          } catch { /* illegal invocation on an unexpected element type */ }
+        }
       }
     }
 
@@ -173,9 +99,11 @@
           const m = part.trim().match(/^(\S+)(\s.*)?$/);
           if (!m) return part;
           const [, url, desc = ""] = m;
-          if (!isHttp(url) || shouldSkip(url)) return part;
+          if (!bhIsHttp(url)) return part;
+          const u = bhSafeURL(url);
+          if (!u || bhShouldSkip(url, u.hostname, opts, location.hostname)) return part;
           touched = true;
-          return buildProxyUrl(url) + desc;
+          return bhBuildProxyUrl(url, opts) + desc;
         }).join(", ");
         if (touched) { el.setAttribute("srcset", rewritten); rewrote = true; }
       }
@@ -194,8 +122,10 @@
 
     for (const attr of LAZY_ATTRS) {
       const val = el.getAttribute(attr);
-      if (!val || !isHttp(val) || shouldSkip(val)) continue;
-      el.setAttribute(attr, buildProxyUrl(val));
+      if (!val || !bhIsHttp(val)) continue;
+      const u = bhSafeURL(val);
+      if (!u || bhShouldSkip(val, u.hostname, opts, location.hostname)) continue;
+      el.setAttribute(attr, bhBuildProxyUrl(val, opts));
       rewrote = true;
     }
 
@@ -207,9 +137,11 @@
         const m = part.trim().match(/^(\S+)(\s.*)?$/);
         if (!m) return part;
         const [, url, desc = ""] = m;
-        if (!isHttp(url) || shouldSkip(url)) return part;
+        if (!bhIsHttp(url)) return part;
+        const u = bhSafeURL(url);
+        if (!u || bhShouldSkip(url, u.hostname, opts, location.hostname)) return part;
         touched = true;
-        return buildProxyUrl(url) + desc;
+        return bhBuildProxyUrl(url, opts) + desc;
       }).join(", ");
       if (touched) { el.setAttribute("data-srcset", rewritten); rewrote = true; }
     }
@@ -227,8 +159,10 @@
     const bg = el.style?.backgroundImage;
     if (!bg || !bg.startsWith("url(")) return;
     const raw = bg.slice(4, -1).replace(/['"]/g, "").trim();
-    if (!raw || !isHttp(raw) || shouldSkip(raw)) return;
-    el.style.backgroundImage = `url("${buildProxyUrl(raw)}")`;
+    if (!raw || !bhIsHttp(raw)) return;
+    const u = bhSafeURL(raw);
+    if (!u || bhShouldSkip(raw, u.hostname, opts, location.hostname)) return;
+    el.style.backgroundImage = `url("${bhBuildProxyUrl(raw, opts)}")`;
     done.add(el);
   }
 
@@ -241,11 +175,8 @@
     const lazySel = LAZY_ATTRS.concat(["data-srcset"]).map(a => `[${a}]`).join(",");
     document.querySelectorAll(lazySel).forEach(rewriteLazy);
 
-    // Inline backgrounds on container elements
-    document.querySelectorAll(
-      "div, section, article, header, footer, aside, main, " +
-      "figure, li, a, span, td, th, [style*='background']"
-    ).forEach(rewriteBg);
+    // Inline backgrounds
+    document.querySelectorAll(BG_SELECTOR).forEach(rewriteBg);
   }
 
   // ── MutationObserver ───────────────────────────────────────────────────────
@@ -261,7 +192,7 @@
           n.querySelectorAll?.("img, source").forEach(rewriteImg);
           const lazySel = LAZY_ATTRS.concat(["data-srcset"]).map(a => `[${a}]`).join(",");
           n.querySelectorAll?.(lazySel).forEach(rewriteLazy);
-          n.querySelectorAll?.("[style*='background']").forEach(rewriteBg);
+          n.querySelectorAll?.(BG_SELECTOR).forEach(rewriteBg);
         });
       } else if (m.type === "attributes") {
         const t = m.target;
@@ -324,7 +255,7 @@
         rewriteAll();
       }
     } else {
-      chrome.storage.sync.get(DEFAULTS, synced => {
+      chrome.storage.sync.get(BH_DEFAULTS, synced => {
         opts = synced;
         // Write mirror so next page load takes the fast path
         chrome.storage.local.set({ bhOpts: synced });
@@ -342,10 +273,10 @@
   // restarting, or not supported (Kiwi/Cromite). Both paths update opts.
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area === "local" && changes.bhOpts) {
-      opts = changes.bhOpts.newValue || DEFAULTS;
+      opts = changes.bhOpts.newValue || BH_DEFAULTS;
     } else if (area === "sync") {
       // Rebuild opts from the sync change and also refresh the local mirror
-      chrome.storage.sync.get(DEFAULTS, synced => {
+      chrome.storage.sync.get(BH_DEFAULTS, synced => {
         opts = synced;
         chrome.storage.local.set({ bhOpts: synced });
       });

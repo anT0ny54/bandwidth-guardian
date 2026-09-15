@@ -1,6 +1,9 @@
-// Bandwidth Guardian — shared defaults
-// Single source of truth. service-worker.js, options.js, popup.js import this.
-// content.js and prehook.js inline a copy (search "KEEP IN SYNC").
+// Bandwidth Guardian — shared defaults (ES module)
+// Used by options.js and popup.js, which load as `type="module"` documents.
+// service-worker.js inlines its own copy — classic (non-module) service
+// workers can't `import` on Kiwi/Cromite (see the comment there). The
+// content-script copy (prehook.js + content.js) now lives once in
+// shared.js instead of two independently maintained copies.
 //
 // Defaults mirror the original extension (ayastreb/bandwidth-hero):
 //   convertBw: true  → grayscale: true

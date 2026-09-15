@@ -2,7 +2,7 @@
 
 > Save mobile data by compressing images through a self-hosted proxy before they load.
 
-[![Version](https://img.shields.io/badge/version-0.0.4-0891b2?style=flat-square)](https://github.com/anT0ny54/bandwidth-guardian/releases)
+[![Version](https://img.shields.io/badge/version-0.0.5-0891b2?style=flat-square)](https://github.com/anT0ny54/bandwidth-guardian/releases)
 [![MV3](https://img.shields.io/badge/Manifest-V3-22c55e?style=flat-square)](https://developer.chrome.com/docs/extensions/mv3/intro/)
 [![License](https://img.shields.io/badge/license-MIT-1a3e99?style=flat-square)](LICENSE)
 
@@ -38,7 +38,7 @@ Works on **Chrome**, **Kiwi Browser**, **Cromite**, and any Chromium-based brows
 
 ```bash
 bash build.sh
-# outputs: bandwidth-guardian-0.0.4.zip
+# outputs: bandwidth-guardian-0.0.5.zip
 ```
 
 The build script produces a deterministic zip using a fixed timestamp so the output is byte-for-byte reproducible on any machine.
@@ -60,10 +60,11 @@ The proxy must:
 
 ## Architecture
 
-Image interception uses two content scripts injected at `document_start`:
+Image interception uses three content scripts injected at `document_start`, in this order:
 
 | Script | Role |
 |---|---|
+| `shared.js` | Single source of truth for default settings, tracking-pixel patterns, the "should this URL be proxied?" decision, and the proxy-URL builder. Loaded first so `prehook.js` and `content.js` — which run in the same per-frame isolated world — see it as ordinary globals instead of each keeping their own copy. |
 | `prehook.js` | Patches `HTMLImageElement.prototype.src`, `srcset`, `setAttribute`, and `Image()` before the HTML parser runs. Catches all JS-set images with zero wasted bytes. |
 | `content.js` | Rewrites HTML-parsed `<img src>`, srcset, lazy `data-*` attributes, and inline `background-image` after settings load. Also injects `<link rel="preconnect">` to warm the proxy connection. |
 
@@ -79,12 +80,13 @@ DNR is used only to strip CSP headers — image redirection is done in content s
 bandwidth-guardian/
 ├── _locales/en/messages.json   # Extension name and description (i18n)
 ├── icons/                      # 16 / 32 / 48 / 128 px, active + disabled
+├── shared.js                   # Shared content-script constants + URL logic
+├── prehook.js                  # Layer 1 prototype patcher
 ├── content.js                  # Layer 2 image rewriter
-├── defaults.js                 # Single source of truth for default settings
+├── defaults.js                 # Defaults for popup.js / options.js (ES module)
 ├── manifest.json
 ├── options.html / options.js   # Full settings page
 ├── popup.html / popup.js       # Toolbar popup
-├── prehook.js                  # Layer 1 prototype patcher
 ├── service-worker.js           # DNR rules, storage mirror, icon, stats
 ├── build.sh                    # Reproducible zip builder
 ├── CHANGELOG.md                # Version history
@@ -108,6 +110,7 @@ Based on [bandwidth-hero](https://github.com/ayastreb/bandwidth-hero) by Anatoli
 ## License
 
 MIT — see [LICENSE](LICENSE)
+
 
 ## 🌐 Free DNS Services
 
