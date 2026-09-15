@@ -1,30 +1,5 @@
 # Changelog
 
-## [0.0.4] — 2026-09-15
-
-### Fixed
-- **Removed the prehook/content `srcset` rewrite conflict.** `content.js` now uses the captured native `setAttribute()` for rewritten attributes, so `prehook.js` cannot encode a proxy URL a second time.
-- **Fixed `<source srcset>` interception before settings are available.** The prehook now queues the original value and temporarily clears the attribute instead of leaving the original URL exposed to the browser.
-- **Fixed disabled/no-proxy handling in `prehook.js`.** Once settings are loaded, image assignments now pass through unchanged when compression is disabled or no proxy URL is configured.
-- **Prevented cross-layer proxy loops.** Both layers now recognize the configured proxy hostname and leave already-proxied URLs untouched.
-- **Made excluded domains apply to subdomains and to both the page host and image host.** Defaults now reliably cover `*.google.com`, `*.gstatic.com`, and `*.challenges.cloudflare.com`.
-
-### Changed
-- **Bumped extension version to `0.0.4`.**
-- **Default max image width remains `1280px`.**
-- **Settings version is now a link to `manifest.json`** while still reading the displayed version dynamically from `chrome.runtime.getManifest()`.
-- **Settings links** continue to use `https://github.com/anT0ny54/bhp2` for “Need a proxy?” and `https://github.com/anT0ny54/bandwidth-guardian` for “Source”.
-- **Reduced repeated parsing/work on hot image paths** by caching normalized excluded domains and proxy hostname instead of rebuilding them for every URL.
-- **Kept the two-layer interception architecture intact:** `prehook.js` remains synchronous at `document_start`; `content.js` remains the asynchronous document-start backstop for parser-created images, lazy attributes, inline backgrounds, and SPA mutations.
-
-### Compatibility
-- The build continues to use Manifest V3 callback-style service-worker APIs where practical for better tolerance across Chromium forks.
-- Current Chromium documentation confirms that ordinary MV3 extensions cannot use `webRequestBlocking`; this project therefore continues to avoid it and keeps DNR limited to CSP response-header modification.
-
-### Housekeeping
-- Updated README release/version references to `0.0.4`.
-- Kept generated extension archives rooted at `manifest.json` so the built ZIP is directly suitable for extension loading rather than requiring a nested project-directory extraction.
-
 All notable changes to Bandwidth Guardian are documented here.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
