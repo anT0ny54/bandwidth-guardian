@@ -44,8 +44,8 @@
     proxyBase:       "",
     quality:         40,
     grayscale:       true,
-    maxWidth:        1920,
-    excludeDomains:  "google.com gstatic.com",
+    maxWidth:        1280,
+    excludeDomains:  "google.com gstatic.com challenges.cloudflare.com",
     isWebpSupported: false
   };
   // ──────────────────────────────────────────────────────────────────────────
@@ -58,9 +58,14 @@
 
   // Tracking pixel URL patterns (ported from original shouldCompress.js)
   // Catches tracking pixels by URL pattern, regardless of domain.
+  // NOTE: not redundant with excludeDomains — these match ad/analytics paths
+  // across many hosts that aren't in the (short, user-editable) domain list.
   const TRACKING_PATTERNS = [
     /pagead/i,
-    /(pixel|cleardot)\.*\.(gif|jpg|jpeg)/i,
+    // Fixed: was `\.*\.` (a literal, escaped dot repeated) which only matched
+    // "pixel.gif"/"cleardot.gif" verbatim. `[^/]*` matches any filename chars
+    // in between, so real paths like "tracking-pixel-123.gif" now match too.
+    /(pixel|cleardot)[^/]*\.(gif|jpg|jpeg)/i,
     /google\.([a-z.]+)\/(ads|generate_204|.*\/log204)+/i,
     /google-analytics\.([a-z.]+)\/(r|collect)+/i,
     /youtube\.([a-z.]+)\/(api|ptracking|player_204|live_204)+/i,

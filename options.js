@@ -15,9 +15,14 @@ const statBytesEl    = $("statBytes");
 const toastEl        = $("toast");
 const customQualityEl = $("customQuality");
 const customWidthEl   = $("customWidth");
+const extVersionEl    = $("extVersion");
 
 const qualityPresets = Array.from(document.querySelectorAll("#qualityPresets .preset"));
 const widthPresets   = Array.from(document.querySelectorAll("#widthPresets  .preset"));
+
+// Version footer: read from manifest.json (single source of truth) instead
+// of a hardcoded string in options.html that has to be bumped by hand.
+extVersionEl.textContent = "v" + (chrome.runtime.getManifest().version || "?");
 
 const QUALITY_PRESETS = [20, 40, 80];
 const WIDTH_PRESETS   = [1280, 1920, 0];

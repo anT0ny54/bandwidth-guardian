@@ -1,7 +1,10 @@
 // Bandwidth Guardian — prehook (runs at document_start)
 // Intercepts <img src>, srcset, and new Image() assignments to prevent the
 // original full-resolution images from ever being downloaded.
-// Logic is unchanged from the original; only comments and the typo are fixed.
+// Also applies the same tracking-pixel / icon / favicon skip rules as
+// content.js (see TRACKING_PATTERNS below), so JS-set beacon images can't
+// bypass the filter just because they're assigned before the HTML parser
+// would have seen them.
 
 (() => {
   // ── KEEP IN SYNC WITH defaults.js ──────────────────────────────────────────
@@ -11,8 +14,8 @@
     proxyBase:       "",
     quality:         40,
     grayscale:       true,   // matches original convertBw: true
-    maxWidth:        1920,
-    excludeDomains:  "google.com gstatic.com",
+    maxWidth:        1280,
+    excludeDomains:  "google.com gstatic.com challenges.cloudflare.com",
     isWebpSupported: false
   };
   // ──────────────────────────────────────────────────────────────────────────
@@ -30,6 +33,40 @@
       .map(s => s.replace(/^https?:\/\//, "").split("/")[0])
   );
   const isHttp = u => /^https?:\/\//i.test(u);
+
+  // ── KEEP IN SYNC WITH content.js "TRACKING_PATTERNS" ───────────────────────
+  // Without this, tracking pixels set via `new Image().src = ...` (very
+  // common — Image() is the classic beacon pattern) would bypass content.js's
+  // filter entirely and get proxied anyway, since prehook.js patches src
+  // *before* content.js ever sees the element. Both layers must agree on
+  // what to skip.
+  const TRACKING_PATTERNS = [
+    /pagead/i,
+    /(pixel|cleardot)[^/]*\.(gif|jpg|jpeg)/i,
+    /google\.([a-z.]+)\/(ads|generate_204|.*\/log204)+/i,
+    /google-analytics\.([a-z.]+)\/(r|collect)+/i,
+    /youtube\.([a-z.]+)\/(api|ptracking|player_204|live_204)+/i,
+    /doubleclick\.([a-z.]+)\/(pcs|pixel|r)+/i,
+    /googlesyndication\.([a-z.]+)\/ddm/i,
+    /pixel\.facebook\.([a-z.]+)/i,
+    /facebook\.([a-z.]+)\/(impression\.php|tr)+/i,
+    /ad\.bitmedia\.io/i,
+    /yahoo\.([a-z.]+)\/pixel/i,
+    /criteo\.net\/img/i,
+    /ad\.doubleclick\.net/i
+  ];
+
+  // Combines domain exclusion, tracking-pixel filtering, and the .ico/.svg/
+  // favicon skips that content.js applies — the single decision point both
+  // decideSrc() and rewriteSrcset() call into below.
+  function shouldSkipUrl(url, hostname) {
+    if (excludedHost(hostname)) return true;
+    const path = url.toLowerCase();
+    if (path.endsWith(".ico") || path.endsWith(".svg")) return true;
+    if (path.includes("favicon")) return true;
+    if (TRACKING_PATTERNS.some(p => p.test(url))) return true;
+    return false;
+  }
 
   function buildProxyUrl(orig) {
     if (!opts || !opts.proxyBase || !isHttp(orig)) return orig;
@@ -64,7 +101,7 @@
         const orig = img.dataset.bhPendingSrc;
         if (orig) {
           const u = safeURL(orig);
-          if (u && !excludedHost(u.hostname)) {
+          if (u && !shouldSkipUrl(orig, u.hostname)) {
             img.removeAttribute("data-bh-pending-src");
             nativeSetSrc(img, buildProxyUrl(orig));
           } else {
@@ -139,7 +176,7 @@
       if (!isHttp(url)) return part;
       const u = safeURL(url);
       if (!u) return part;
-      if (opts && excludedHost(u.hostname)) return part;
+      if (opts && shouldSkipUrl(url, u.hostname)) return part;
       return buildProxyUrl(url) + desc;
     }).join(", ");
   }
@@ -148,7 +185,7 @@
     if (!isHttp(original)) return original;
     const u = safeURL(original);
     if (!u) return original;
-    if (opts && excludedHost(u.hostname)) return original;
+    if (opts && shouldSkipUrl(original, u.hostname)) return original;
     if (!ready || !opts || !opts.proxyBase) {
       return null; // signal to queue this element
     }

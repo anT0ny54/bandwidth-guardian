@@ -6,6 +6,54 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.0.3] — 2026-09-15
+
+### Fixed
+- **`prehook.js` didn't filter tracking pixels.** Only `content.js` (Layer 2,
+  HTML-parsed `<img>`) applied `TRACKING_PATTERNS` and the `.ico`/`.svg`/
+  favicon skips. `prehook.js` (Layer 1, which patches `HTMLImageElement.src`
+  and runs *before* `content.js` ever sees the element) had no such filter,
+  so any tracking pixel set the classic way — `new Image().src = "..."` —
+  was proxied anyway, unconditionally. Ported the same pattern list into
+  `prehook.js` as a shared `shouldSkipUrl()` check used by `decideSrc()`,
+  `rewriteSrcset()`, and `flushPending()`, so both layers now agree on what
+  to skip.
+- **Overly narrow tracking-pixel regex.** `/(pixel|cleardot)\.*\.(gif|jpg|jpeg)/i`
+  used an escaped, repeated literal dot (`\.*`) between the keyword and the
+  extension, which only matched exact strings like `pixel.gif` — it missed
+  realistic paths such as `tracking-pixel-123.gif`. Changed to
+  `[^/]*` so any filename characters in between are matched.
+
+### Changed
+- **Default max image width: 1920px → 1280px.** Lower default bandwidth
+  footprint out of the box; users who want full-HD images can still pick the
+  1920 preset.
+- **Default excluded domains** now include `challenges.cloudflare.com`
+  alongside `google.com` and `gstatic.com` — proxying Cloudflare Turnstile's
+  challenge images breaks the widget, same reasoning as the existing
+  reCAPTCHA exclusions.
+- **Settings page footer version** is now read from `chrome.runtime.getManifest().version`
+  instead of a hardcoded string in `options.html`, so it can't drift from
+  `manifest.json` again.
+- **"Need a proxy?" and "Source" links** in Settings now point at this
+  fork (`anT0ny54/bhp2` and `anT0ny54/bandwidth-guardian`) instead of the
+  upstream `himshim` repos.
+
+### Verified (no code changes required)
+- Confirmed the tracking-pixel filter is not redundant with `excludeDomains`:
+  the default exclusion list only covers two exact hostnames, while
+  `TRACKING_PATTERNS` catches ad/analytics *paths* across many different
+  domains (`doubleclick.net`, `google-analytics.com`, `facebook.com`,
+  `criteo.net`, etc.) that aren't in that list. Removing it would route ad
+  beacon requests through the user's own proxy for no bandwidth benefit.
+
+### Housekeeping
+- Bumped `manifest.json` version to `0.0.3`.
+- Synced `README.md`'s version badge, build-output example, and proxy
+  recommendation.
+
+---
+
 ## [0.0.2] — 2026-09-15
 
 ### Fixed

@@ -33,8 +33,8 @@ const DEFAULTS = {
   proxyBase:       "",
   quality:         40,
   grayscale:       true,
-  maxWidth:        1920,
-  excludeDomains:  "google.com gstatic.com",
+  maxWidth:        1280,
+  excludeDomains:  "google.com gstatic.com challenges.cloudflare.com",
   isWebpSupported: false,
 };
 
