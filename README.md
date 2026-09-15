@@ -109,7 +109,6 @@ Based on [bandwidth-hero](https://github.com/ayastreb/bandwidth-hero) by Anatoli
 
 MIT — see [LICENSE](LICENSE)
 
-
 ## 🌐 Free DNS Services
 
 High-performance DNS utilizing HaGeZi Blocklists (Multi Pro + TIF).
@@ -129,13 +128,6 @@ A lightweight image optimization proxy designed to slash bandwidth usage and acc
 Bandwidth Hero Server fetches remote images, compresses them on the fly, and delivers optimized versions to the client. This significantly reduces data consumption while improving page load performance.
 
 🖥️ **Live Demo:** [Bandwidth Hero](https://bhserv.netlify.app/).
-
-
-# ⚡ User Script Bandwidth Hero
-
-This alternative Bandwidth Guardian extension.
-Run User Script Bandwidth Hero Proxy for [Violentmonkey](https://violentmonkey.github.io/) and [Tampermonkey](https://www.tampermonkey.net/). Download [UserScript Bandwidth Hero](https://github.com/anT0ny54/filtrite/raw/main/myfolder/BandwidthHero.zip).
-
 
 ## Supporting the Project
 
