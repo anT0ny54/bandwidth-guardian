@@ -144,16 +144,27 @@
 
     let rewrote = false;
 
-    if (el.tagName === "IMG" || el.tagName === "SOURCE") {
-      // src
+    // <source> only carries an image "src" inside <picture>; the same tag is
+    // reused by <audio>/<video> for media files, where "src" is a video/audio
+    // URL, not an image. The MutationObserver scan below uses a broad "img,
+    // source" selector for simplicity, so guard here rather than narrowing
+    // the selector everywhere it's used.
+    const isPictureSource = el.tagName === "SOURCE" && el.parentElement?.tagName === "PICTURE";
+
+    if (el.tagName === "IMG") {
+      // src — only real <img> elements have one that means "image URL".
       const src = el.getAttribute("src");
       if (src && isHttp(src) && !shouldSkip(src)) {
-        // Use native src setter to avoid triggering prehook's patch again
-        Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, "src")
-          ?.set?.call(el, buildProxyUrl(src));
-        rewrote = true;
+        try {
+          // Use native src setter to avoid triggering prehook's patch again.
+          Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, "src")
+            ?.set?.call(el, buildProxyUrl(src));
+          rewrote = true;
+        } catch { /* illegal invocation on an unexpected element type */ }
       }
+    }
 
+    if (el.tagName === "IMG" || isPictureSource) {
       // srcset
       const ss = el.getAttribute("srcset");
       if (ss) {

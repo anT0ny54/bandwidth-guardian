@@ -111,7 +111,15 @@
         const pendingSrcset = img.dataset.bhPendingSrcset;
         if (pendingSrcset) {
           img.removeAttribute("data-bh-pending-srcset");
-          nativeSetSrcset(img, rewriteSrcset(pendingSrcset));
+          // <source> (inside <picture>) and <img> use different native
+          // accessors — calling the wrong one throws "Illegal invocation"
+          // and is silently swallowed by the outer try/catch, so the
+          // element's srcset would never be restored. Dispatch by tag.
+          if (img.tagName === "SOURCE") {
+            nativeSourceSetSrcset(img, rewriteSrcset(pendingSrcset));
+          } else {
+            nativeSetSrcset(img, rewriteSrcset(pendingSrcset));
+          }
         }
       } catch {}
     }
@@ -246,7 +254,12 @@
         try {
           const v = String(value || "");
           if (!ready || !opts || !opts.proxyBase) {
+            // Queue it, same as <img>.srcset above — without this the
+            // native setter is never called, so the attribute stays empty
+            // forever and the <picture> element never gets an image.
             this.dataset.bhPendingSrcset = v;
+            pending.add(this);
+            nativeSourceSetSrcset(this, "");
           } else {
             nativeSourceSetSrcset(this, rewriteSrcset(v));
           }
@@ -283,8 +296,13 @@
       if (this instanceof HTMLSourceElement && n === "srcset") {
         const v = String(value || "");
         if (!ready || !opts || !opts.proxyBase) {
+          // Was setting the raw (unproxied) URL immediately and never
+          // revisiting it — the original image loaded uncompressed and
+          // flushPending() had no record of the element. Queue it instead,
+          // same as every other pending case.
           this.dataset.bhPendingSrcset = v;
-          return setAttr.call(this, "srcset", v);
+          pending.add(this);
+          return setAttr.call(this, "srcset", "");
         }
         return setAttr.call(this, "srcset", rewriteSrcset(v));
       }

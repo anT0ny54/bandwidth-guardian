@@ -2,7 +2,7 @@
 
 > Save mobile data by compressing images through a self-hosted proxy before they load.
 
-[![Version](https://img.shields.io/badge/version-0.0.3-0891b2?style=flat-square)](https://github.com/anT0ny54/bandwidth-guardian/releases)
+[![Version](https://img.shields.io/badge/version-0.0.4-0891b2?style=flat-square)](https://github.com/anT0ny54/bandwidth-guardian/releases)
 [![MV3](https://img.shields.io/badge/Manifest-V3-22c55e?style=flat-square)](https://developer.chrome.com/docs/extensions/mv3/intro/)
 [![License](https://img.shields.io/badge/license-MIT-1a3e99?style=flat-square)](LICENSE)
 
@@ -38,7 +38,7 @@ Works on **Chrome**, **Kiwi Browser**, **Cromite**, and any Chromium-based brows
 
 ```bash
 bash build.sh
-# outputs: bandwidth-guardian-0.0.3.zip
+# outputs: bandwidth-guardian-0.0.4.zip
 ```
 
 The build script produces a deterministic zip using a fixed timestamp so the output is byte-for-byte reproducible on any machine.

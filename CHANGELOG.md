@@ -6,6 +6,48 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.0.4] — 2026-09-15
+
+### Fixed
+- **`<picture><source srcset>` elements set via JavaScript before settings
+  finished loading could end up with no image at all.** `prehook.js`
+  patches `HTMLSourceElement.prototype.srcset` and `Element.setAttribute`
+  separately from the `<img>` versions, but only the `<img>` paths queued
+  the element in `pending` for `flushPending()` to revisit once options
+  arrived:
+  - The `srcset` **property** setter on `<source>` just stored the pending
+    value on `dataset` and returned — the native setter was never called,
+    so the attribute stayed empty forever. The `<picture>` fell back to
+    whatever the browser could infer, often nothing.
+  - The `setAttribute("srcset", …)` path on `<source>` did the opposite:
+    it wrote the **original, unproxied** URL immediately (so the original
+    image downloaded uncompressed) and, like the property path, never
+    added the element to `pending`, so it was never corrected.
+
+  Both paths now blank the attribute and queue the element exactly like
+  `<img>` does, and `flushPending()` dispatches to the correct native
+  setter (`HTMLSourceElement` vs `HTMLImageElement`) by tag name instead
+  of always calling the `<img>` one — calling an `<img>` accessor on a
+  `<source>` element throws `TypeError: Illegal invocation`, which was
+  being silently swallowed by the surrounding `try/catch`.
+- **`content.js` could throw on `<source>` elements that aren't part of a
+  `<picture>`.** The `<source>` tag is reused by `<audio>`/`<video>` for
+  media files with a `src` attribute that isn't an image URL. The
+  `MutationObserver` scan uses a broad `"img, source"` selector, so a
+  dynamically-inserted `<video><source src="clip.mp4"></video>` reached
+  `rewriteImg()`, which called `HTMLImageElement`'s native `src` setter on
+  it — an illegal invocation with no surrounding `try/catch`. Rewriting
+  `src` is now restricted to actual `<img>` elements, `srcset` rewriting
+  is restricted to `<source>` elements whose parent is a `<picture>`, and
+  the remaining native-setter call is wrapped in `try/catch` as a safety
+  net against any other unexpected element shape.
+
+### Housekeeping
+- Bumped `manifest.json` version to `0.0.4`.
+- Synced `README.md`'s version badge and build-output example.
+
+---
+
 ## [0.0.3] — 2026-09-15
 
 ### Fixed
