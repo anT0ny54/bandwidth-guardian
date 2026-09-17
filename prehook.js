@@ -2,52 +2,21 @@
 // Intercepts <img src>, srcset, and new Image() assignments to prevent the
 // original full-resolution images from ever being downloaded.
 //
-// Shared constants and the URL-skip / proxy-URL-building logic (defaults,
-// tracking patterns, bhShouldSkip, bhBuildProxyUrl) live in shared.js,
-// loaded immediately before this file — see manifest.json's content_scripts
-// entry and the notice at the top of shared.js for why that file exists.
+// Shared constants, the URL-skip / proxy-URL-building logic, and the
+// options loader (defaults, tracking patterns, bhShouldSkip,
+// bhBuildProxyUrl, bhOnReady, bhOnOptsChange) live in shared.js, loaded
+// immediately before this file — see manifest.json's content_scripts entry
+// and the notice at the top of shared.js for why that file exists.
 
 (() => {
   let opts = null;        // loaded options (null until storage responds)
   let ready = false;      // true once options have loaded
   const pending = new Set(); // <img>/<source> elements waiting for opts to be ready
 
-  // Try storage.local first (bhOpts mirror written by the service worker, ~5 ms).
-  // If bhOpts is missing — fresh install, service worker not yet run, or browser
-  // restart before onStartup fired — fall back to storage.sync so we never
-  // silently use empty defaults and let original images through.
-  chrome.storage.local.get({ bhOpts: null }, d => {
-    if (d.bhOpts) {
-      opts = d.bhOpts;
-      ready = true;
-      flushPending();
-    } else {
-      chrome.storage.sync.get(BH_DEFAULTS, synced => {
-        opts = synced;
-        ready = true;
-        flushPending();
-        // Write the mirror so subsequent pages load fast
-        chrome.storage.local.set({ bhOpts: synced });
-      });
-    }
-  });
-
-  // Stay current when settings change.
-  // Primary: local area (bhOpts mirror, instant).
-  // Fallback: sync area — catches changes when the service worker is inactive
-  // or not supported (Kiwi/Cromite).
-  chrome.storage.onChanged?.addListener((changes, area) => {
-    if (area === "local" && changes.bhOpts) {
-      opts = changes.bhOpts.newValue || BH_DEFAULTS;
-      ready = true;
-    } else if (area === "sync") {
-      chrome.storage.sync.get(BH_DEFAULTS, synced => {
-        opts = synced;
-        ready = true;
-        chrome.storage.local.set({ bhOpts: synced });
-      });
-    }
-  });
+  // Options are loaded once, in shared.js, and shared with content.js via
+  // bhOnReady/bhOnOptsChange — see the v0.0.6 note at the top of shared.js.
+  bhOnReady(o => { opts = o; ready = true; flushPending(); });
+  bhOnOptsChange(o => { opts = o; ready = true; });
 
   // Capture native property descriptors BEFORE we patch them
   const imgProto = HTMLImageElement.prototype;

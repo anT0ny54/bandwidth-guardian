@@ -6,6 +6,66 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.0.6] — 2026-09-17
+
+### Fixed
+- **`refreshRules()`'s concurrency guard didn't actually guard anything.**
+  It set a `refreshing` flag to `true`, called `doRefreshRules()`, then set
+  the flag back to `false` immediately afterward. But `doRefreshRules()` is
+  asynchronous — it only *starts* a `chrome.storage.sync.get()` call and
+  returns right away, before that call's own callback (the part that
+  actually touches DNR rules) ever runs. So the flag was already `false`
+  again before the work it was meant to protect had even happened, and two
+  `refreshRules()` calls close together (e.g. `onInstalled` firing while a
+  `storage.onChanged` handler is also mid-flight) could still race their
+  `updateDynamicRules()` calls against each other. Replaced with a promise
+  chain that genuinely serializes every call — each refresh's storage read
+  now finishes before the next one starts. Verified with an isolated mock
+  of `chrome.storage`/`chrome.declarativeNetRequest` reproducing the race
+  before the fix and confirming strict serialization after it.
+
+### Changed
+- **Deduplicated the settings-loading logic in `prehook.js` and
+  `content.js`.** Both files ran their own, nearly identical "read
+  `bhOpts` from `storage.local`, fall back to `storage.sync`, then listen
+  for changes" sequence (~15 lines each) — meaning two separate
+  `chrome.storage.local.get()` round trips per page load instead of one.
+  This now lives once in `shared.js` as a small `bhOnReady()` /
+  `bhOnOptsChange()` subscription API that both files call into. Same
+  load order and timing as before, just one storage read instead of two
+  and one place to fix if the sequence ever needs to change.
+- **Removed the `tabs` permission from `manifest.json`.** The only tab
+  property this extension reads is `tab.url` (in `popup.js`, to show/
+  exclude the current site), and `host_permissions: ["<all_urls>"]`
+  already grants access to that on every `http(s)` tab — the `tabs`
+  permission only adds anything on tabs *outside* that host-permission
+  grant (e.g. unreachable `chrome://` pages), which the existing
+  `!tab?.url` fallback already handles. `chrome.tabs.query`/`create`/
+  `reload` themselves need no permission at all. One fewer permission
+  requested at install, no behavior change.
+- **`content.js`'s `MutationObserver` callback now uses the same
+  `"img, picture source"` selector as the initial full-page scan** when
+  scanning a newly-added subtree, instead of the broader `"img, source"`.
+  `rewriteImg()` already no-ops on a bare (non-`<picture>`) `<source>` via
+  its `isPictureSource` guard, so the broader selector was only ever
+  causing every `<audio>`/`<video><source>` added to the page to be
+  visited and immediately discarded. Consistent with the same
+  "don't visit elements that can never match" reasoning already applied
+  to the background-image selector in 0.0.5.
+
+### Added
+- **Confirmation before "Reset defaults" in Settings.** On a phone-sized
+  screen the button sits directly next to Save in the sticky bottom
+  action bar — an easy mis-tap that silently wiped the proxy URL, quality,
+  and exclusions with no way back. It now asks for confirmation first.
+
+
+### Housekeeping
+- Bumped `manifest.json` version to `0.0.6`.
+- Synced `README.md`'s version badge and build-output example.
+
+---
+
 ## [0.0.5] — 2026-09-16
 
 ### Fixed

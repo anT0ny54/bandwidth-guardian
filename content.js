@@ -189,7 +189,12 @@
           rewriteImg(n);
           rewriteLazy(n);
           rewriteBg(n);
-          n.querySelectorAll?.("img, source").forEach(rewriteImg);
+          // "picture source" here (not the broader "img, source" used
+          // elsewhere) skips <audio>/<video><source> elements outright —
+          // matches rewriteAll()'s initial-scan selector; rewriteImg()
+          // already no-ops on them via isPictureSource, so this just
+          // avoids visiting them at all.
+          n.querySelectorAll?.("img, picture source").forEach(rewriteImg);
           const lazySel = LAZY_ATTRS.concat(["data-srcset"]).map(a => `[${a}]`).join(",");
           n.querySelectorAll?.(lazySel).forEach(rewriteLazy);
           n.querySelectorAll?.(BG_SELECTOR).forEach(rewriteBg);
@@ -244,42 +249,14 @@
   }
 
   // ── Load settings then process page ───────────────────────────────────────
-  // Try storage.local first (bhOpts mirror, ~5 ms). If bhOpts isn't there yet
-  // (fresh install, service worker hasn't run, browser restart) fall back to
-  // storage.sync and write the mirror so subsequent pages are fast.
-  chrome.storage.local.get({ bhOpts: null }, d => {
-    if (d.bhOpts) {
-      opts = d.bhOpts;
-      if (opts.enabled && opts.proxyBase) {
-        injectPreconnect(opts.proxyBase);
-        rewriteAll();
-      }
-    } else {
-      chrome.storage.sync.get(BH_DEFAULTS, synced => {
-        opts = synced;
-        // Write mirror so next page load takes the fast path
-        chrome.storage.local.set({ bhOpts: synced });
-        if (opts.enabled && opts.proxyBase) {
-          injectPreconnect(opts.proxyBase);
-          rewriteAll();
-        }
-      });
+  // Options are loaded once, in shared.js, and shared with prehook.js via
+  // bhOnReady/bhOnOptsChange — see the v0.0.6 note at the top of shared.js.
+  bhOnReady(o => {
+    opts = o;
+    if (opts.enabled && opts.proxyBase) {
+      injectPreconnect(opts.proxyBase);
+      rewriteAll();
     }
   });
-
-  // Stay current when settings change.
-  // Primary: local area (bhOpts mirror updated by service worker, instant).
-  // Fallback: sync area — catches changes when the service worker is inactive,
-  // restarting, or not supported (Kiwi/Cromite). Both paths update opts.
-  chrome.storage.onChanged.addListener((changes, area) => {
-    if (area === "local" && changes.bhOpts) {
-      opts = changes.bhOpts.newValue || BH_DEFAULTS;
-    } else if (area === "sync") {
-      // Rebuild opts from the sync change and also refresh the local mirror
-      chrome.storage.sync.get(BH_DEFAULTS, synced => {
-        opts = synced;
-        chrome.storage.local.set({ bhOpts: synced });
-      });
-    }
-  });
+  bhOnOptsChange(o => { opts = o; });
 })();

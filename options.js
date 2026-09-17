@@ -194,6 +194,10 @@ async function save() {
 // ── Reset ─────────────────────────────────────────────────────────────────────
 
 async function resetAll() {
+  // Confirm first: this button sits right next to Save in the sticky
+  // bottom action bar, which on a phone-sized screen is an easy mis-tap —
+  // and a silent reset wipes the proxy URL along with everything else.
+  if (!confirm("Reset all settings to defaults? This clears your proxy URL, quality, and exclusions.")) return;
   await chrome.storage.sync.set(DEFAULTS);
   await load();
   showToast("Reset to defaults");

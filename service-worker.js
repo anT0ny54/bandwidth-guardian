@@ -45,15 +45,18 @@ const RULE_ID_CSP      = 2;  // strips CSP headers so proxy images can load
 const ALL_RULE_IDS     = [RULE_ID_REDIRECT, RULE_ID_CSP];
 
 // ── Concurrency guard ─────────────────────────────────────────────────────────
-let refreshing     = false;
-let pendingRefresh = false;
-
+// doRefreshRules() is async (chrome.storage.sync.get's callback fires on a
+// later tick), so a flag that's set true then immediately set back to false
+// around a bare call to it — the previous approach — guards nothing: the
+// flag is already false again before the callback that matters ever runs.
+// Two overlapping refreshRules() calls (e.g. onInstalled and a storage
+// change firing close together) could then race their updateDynamicRules()
+// calls. Chaining onto one promise instead genuinely serializes every call,
+// each one's storage read finishing before the next one starts.
+let refreshChain = Promise.resolve();
 function refreshRules() {
-  if (refreshing) { pendingRefresh = true; return; }
-  refreshing = true;
-  doRefreshRules();
-  refreshing = false;
-  if (pendingRefresh) { pendingRefresh = false; refreshRules(); }
+  refreshChain = refreshChain.then(doRefreshRules, doRefreshRules);
+  return refreshChain;
 }
 
 // ── WebP detection ────────────────────────────────────────────────────────────
@@ -181,28 +184,30 @@ function onProxyCompleted({ responseHeaders, fromCache }) {
 // (non-module) service workers on Kiwi/Cromite and causes Status code: 2.
 
 function doRefreshRules() {
-  chrome.storage.sync.get(DEFAULTS, function(opts) {
-    var removeRuleIds = ALL_RULE_IDS;
+  return new Promise(function(resolve) {
+    chrome.storage.sync.get(DEFAULTS, function(opts) {
+      var removeRuleIds = ALL_RULE_IDS;
 
-    if (!opts.enabled) {
-      chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: removeRuleIds });
-      return;
-    }
+      if (!opts.enabled) {
+        chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: removeRuleIds }, resolve);
+        return;
+      }
 
-    // Rule 2: Strip CSP headers so proxy-domain images aren't blocked by the page.
-    var addRules = [{
-      id: RULE_ID_CSP,
-      priority: 1,
-      action: {
-        type: "modifyHeaders",
-        responseHeaders: [
-          { header: "content-security-policy",             operation: "remove" },
-          { header: "content-security-policy-report-only", operation: "remove" }
-        ]
-      },
-      condition: { resourceTypes: ["main_frame", "sub_frame"] }
-    }];
+      // Rule 2: Strip CSP headers so proxy-domain images aren't blocked by the page.
+      var addRules = [{
+        id: RULE_ID_CSP,
+        priority: 1,
+        action: {
+          type: "modifyHeaders",
+          responseHeaders: [
+            { header: "content-security-policy",             operation: "remove" },
+            { header: "content-security-policy-report-only", operation: "remove" }
+          ]
+        },
+        condition: { resourceTypes: ["main_frame", "sub_frame"] }
+      }];
 
-    chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: removeRuleIds, addRules: addRules });
+      chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: removeRuleIds, addRules: addRules }, resolve);
+    });
   });
 }

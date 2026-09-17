@@ -30,6 +30,14 @@
 // ES module) is the copy used by popup.js/options.js for the same reason.
 // Three "sources of truth" still exist, but each is now used by exactly
 // one context instead of two files silently doing the same job.
+//
+// v0.0.6: the "load bhOpts from storage.local, fall back to storage.sync,
+// then listen for changes" sequence below used to be duplicated almost
+// verbatim in both prehook.js and content.js (~15 lines each, two separate
+// chrome.storage.local.get calls per page load). It now lives once, here,
+// as a tiny ready/subscribe API (bhOnReady / bhOnOptsChange) that both
+// files call into. Same behavior and timing, one storage read instead of
+// two, and one place to fix if the load sequence ever needs to change.
 
 const BH_DEFAULTS = {
   enabled:         true,
@@ -113,3 +121,71 @@ function bhBuildProxyUrl(orig, opts) {
   if (opts.maxWidth) parts.push("max_width=" + encodeURIComponent(String(opts.maxWidth)));
   return base + sep + parts.join("&");
 }
+
+// ── Shared options loader / subscription ────────────────────────────────────
+// Single storage.local (falling back to storage.sync) load, shared by
+// prehook.js and content.js instead of each running its own. See the v0.0.6
+// note above.
+let BH_OPTS  = null;   // latest known options, or null until the first load resolves
+let BH_READY = false;  // true once the first load has resolved at least once
+
+const BH_READY_CBS  = [];  // one-shot callbacks waiting on the first load
+const BH_CHANGE_CBS = [];  // persistent callbacks for every later change
+
+// Calls cb(opts) once options are available — immediately if already loaded,
+// otherwise as soon as the first load resolves. Safe to call from either
+// prehook.js or content.js regardless of which one happens to run first.
+function bhOnReady(cb) {
+  if (BH_READY) cb(BH_OPTS);
+  else BH_READY_CBS.push(cb);
+}
+
+// Calls cb(opts) every time options change after the first load (settings
+// page edits, popup toggles, sync from another device). Does NOT fire for
+// the initial load — use bhOnReady for that.
+function bhOnOptsChange(cb) { BH_CHANGE_CBS.push(cb); }
+
+function bhResolveReady() {
+  BH_READY = true;
+  const cbs = BH_READY_CBS.splice(0);
+  cbs.forEach(cb => { try { cb(BH_OPTS); } catch {} });
+}
+
+function bhNotifyChange() {
+  BH_CHANGE_CBS.forEach(cb => { try { cb(BH_OPTS); } catch {} });
+}
+
+// Try storage.local first (bhOpts mirror written by the service worker, ~5 ms).
+// If bhOpts is missing — fresh install, service worker not yet run, or browser
+// restart before onStartup fired — fall back to storage.sync so we never
+// silently use empty defaults and let original images through.
+chrome.storage.local.get({ bhOpts: null }, d => {
+  if (d.bhOpts) {
+    BH_OPTS = d.bhOpts;
+    bhResolveReady();
+  } else {
+    chrome.storage.sync.get(BH_DEFAULTS, synced => {
+      BH_OPTS = synced;
+      bhResolveReady();
+      // Write the mirror so subsequent pages load fast.
+      chrome.storage.local.set({ bhOpts: synced });
+    });
+  }
+});
+
+// Stay current when settings change.
+// Primary: local area (bhOpts mirror, instant).
+// Fallback: sync area — catches changes when the service worker is inactive
+// or not supported (Kiwi/Cromite).
+chrome.storage.onChanged?.addListener((changes, area) => {
+  if (area === "local" && changes.bhOpts) {
+    BH_OPTS = changes.bhOpts.newValue || BH_DEFAULTS;
+    if (!BH_READY) bhResolveReady(); else bhNotifyChange();
+  } else if (area === "sync") {
+    chrome.storage.sync.get(BH_DEFAULTS, synced => {
+      BH_OPTS = synced;
+      chrome.storage.local.set({ bhOpts: synced });
+      if (!BH_READY) bhResolveReady(); else bhNotifyChange();
+    });
+  }
+});
