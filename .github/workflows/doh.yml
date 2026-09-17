@@ -1,0 +1,174 @@
+name: SnapDeploy Health & DoH Check
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+env:
+  BASE_URL: https://dns-93aca.containers.snapdeploy.app
+  HEALTH_PATH: /healthz
+  DOH_PATH: /dns-query
+  DOH_QUERY: AAABAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE
+
+jobs:
+  health:
+    name: Health check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check SnapDeploy health
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          URL="${BASE_URL}${HEALTH_PATH}"
+
+          echo "Checking:"
+          echo "$URL"
+          echo
+
+          for attempt in {1..12}; do
+            echo "Attempt ${attempt}/12..."
+
+            rm -f /tmp/health-body /tmp/health-headers
+
+            HTTP_CODE="$(
+              curl \
+                --silent \
+                --show-error \
+                --connect-timeout 10 \
+                --max-time 20 \
+                --location \
+                --request GET \
+                --header 'Accept: text/plain' \
+                --user-agent 'GitHubActions-SnapDeploy-HealthCheck/1.0' \
+                --dump-header /tmp/health-headers \
+                --output /tmp/health-body \
+                --write-out '%{http_code}' \
+                "$URL" 2>/tmp/health-error
+            )"
+
+            CURL_EXIT=$?
+
+            echo "curl exit: ${CURL_EXIT}"
+            echo "HTTP status: ${HTTP_CODE}"
+
+            echo
+            echo "Response headers:"
+            cat /tmp/health-headers 2>/dev/null || true
+
+            echo
+            echo "Response body:"
+            cat /tmp/health-body 2>/dev/null || true
+
+            if [ "$CURL_EXIT" -eq 0 ] &&
+               [ "$HTTP_CODE" = "200" ] &&
+               [ "$(cat /tmp/health-body 2>/dev/null)" = "ok" ]; then
+              echo
+              echo "✓ SnapDeploy health check passed."
+              exit 0
+            fi
+
+            if [ -s /tmp/health-error ]; then
+              echo
+              echo "curl error:"
+              cat /tmp/health-error
+            fi
+
+            if [ "$HTTP_CODE" = "403" ]; then
+              echo
+              echo "⚠ HTTP 403 received."
+              echo "The request may be rejected by the SnapDeploy/edge gateway"
+              echo "before reaching the application."
+            fi
+
+            if [ "$attempt" -lt 12 ]; then
+              echo
+              echo "Waiting 10 seconds before retry..."
+              sleep 10
+            fi
+          done
+
+          echo
+          echo "✗ SnapDeploy health check failed."
+          exit 1
+
+  doh:
+    name: DoH GET check
+    needs: health
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Test DoH GET
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          URL="${BASE_URL}${DOH_PATH}?dns=${DOH_QUERY}"
+
+          echo "Testing DoH endpoint:"
+          echo "$URL"
+          echo
+
+          rm -f /tmp/doh-response /tmp/doh-headers
+
+          HTTP_CODE="$(
+            curl \
+              --silent \
+              --show-error \
+              --fail-with-body \
+              --connect-timeout 10 \
+              --max-time 20 \
+              --location \
+              --request GET \
+              --header 'Accept: application/dns-message' \
+              --user-agent 'GitHubActions-SnapDeploy-DoHCheck/1.0' \
+              --dump-header /tmp/doh-headers \
+              --output /tmp/doh-response \
+              --write-out '%{http_code}' \
+              "$URL"
+          )"
+
+          echo "HTTP status: ${HTTP_CODE}"
+
+          echo
+          echo "Response headers:"
+          cat /tmp/doh-headers
+
+          echo
+          echo "DNS response size:"
+          wc -c /tmp/doh-response
+
+          echo
+          echo "DNS response (hex):"
+          xxd -g 1 /tmp/doh-response | head -20
+
+          test "$HTTP_CODE" = "200"
+          test -s /tmp/doh-response
+
+          echo
+          echo "✓ DoH GET request passed."
+
+  summary:
+    name: Summary
+    needs:
+      - health
+      - doh
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Result
+        run: |
+          echo "======================================"
+          echo " SnapDeploy verification"
+          echo "======================================"
+          echo "Health:  PASS"
+          echo "DoH GET: PASS"
+          echo
+          echo "Endpoint:"
+          echo "${BASE_URL}${DOH_PATH}"
