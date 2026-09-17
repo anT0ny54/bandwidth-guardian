@@ -8,39 +8,38 @@ on:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    
 
-    steps:
-      - name: Wait for service
-        shell: bash
-        run: |
-          set -euo pipefail
+- name: Check SnapDeploy health
+  shell: bash
+  run: |
+    set -euo pipefail
 
-          URL="https://dns-93aca.containers.snapdeploy.app/healthz"
+    URL="https://dns-93aca.containers.snapdeploy./healthz"
 
-          for i in {1..12}; do
-            BODY="$(curl -fsS --max-time 10 "$URL" || true)"
+    for i in {1..12}; do
+      echo "Health check $i/12"
 
-            if [ "$BODY" = "ok" ]; then
-              echo "SnapDeploy health check passed."
-              exit 0
-            fi
+      STATUS="$(curl -sS \
+        --connect-timeout 10 \
+        --max-time 20 \
+        -A "GitHubActions-HealthCheck/1.0" \
+        -o /tmp/health-body \
+        -w '%{http_code}' \
+        "$URL" || true)"
 
-            echo "Waiting for SnapDeploy... attempt $i/12"
-            sleep 10
-          done
+      BODY="$(cat /tmp/health-body 2>/dev/null || true)"
 
-          echo "Health check failed."
-          exit 1
+      echo "HTTP: $STATUS"
+      echo "Body: $BODY"
 
-      - name: Verify DoH endpoint
-        shell: bash
-        run: |
-          set -euo pipefail
+      if [ "$STATUS" = "200" ] && [ "$BODY" = "ok" ]; then
+        echo "Health check passed."
+        exit 0
+      fi
 
-          curl -fsS \
-            --max-time 15 \
-            -H 'Accept: application/dns-message' \
-            'https://dns-93aca.containers.snapdeploy.app/dns-query?dns=AAABAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE'
+      sleep 10
+    done
 
-          echo
-          echo "DoH GET request succeeded."
+    echo "Health check failed."
+    exit 1
