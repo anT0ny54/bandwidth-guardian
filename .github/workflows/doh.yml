@@ -1,0 +1,46 @@
+name: Verify SnapDeploy DoH
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Wait for service
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          URL="https://dns-93aca.containers.snapdeploy.app/healthz"
+
+          for i in {1..12}; do
+            BODY="$(curl -fsS --max-time 10 "$URL" || true)"
+
+            if [ "$BODY" = "ok" ]; then
+              echo "SnapDeploy health check passed."
+              exit 0
+            fi
+
+            echo "Waiting for SnapDeploy... attempt $i/12"
+            sleep 10
+          done
+
+          echo "Health check failed."
+          exit 1
+
+      - name: Verify DoH endpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          curl -fsS \
+            --max-time 15 \
+            -H 'Accept: application/dns-message' \
+            'https://dns-93aca.containers.snapdeploy.app/dns-query?dns=AAABAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE'
+
+          echo
+          echo "DoH GET request succeeded."
