@@ -23,7 +23,7 @@
   const srcDesc = Object.getOwnPropertyDescriptor(imgProto, "src");
   const srcsetDesc = Object.getOwnPropertyDescriptor(imgProto, "srcset");
   const setAttr = Element.prototype.setAttribute;
-  const sourceProto = HTMLSourceElement?.prototype;
+  const sourceProto = typeof HTMLSourceElement !== "undefined" ? HTMLSourceElement.prototype : null;
   const sourceSrcsetDesc = sourceProto ? Object.getOwnPropertyDescriptor(sourceProto, "srcset") : null;
 
   function nativeSetSrc(el, v) { srcDesc.set.call(el, v); }
@@ -31,7 +31,7 @@
   function nativeSourceSetSrcset(el, v) { sourceSrcsetDesc?.set?.call(el, v); }
 
   function rewriteSrcset(ss) {
-    if (!ss) return ss;
+    if (!ss || !opts || opts.enabled === false || !opts.proxyBase) return ss;
     return ss.split(",").map(part => {
       const m = part.trim().match(/^(\S+)(\s+.+)?$/);
       if (!m) return part;
@@ -47,6 +47,7 @@
 
   function decideSrc(original) {
     if (!bhIsHttp(original)) return original;
+    if (opts && opts.enabled === false) return original;
     const u = bhSafeURL(original);
     if (!u) return original;
     if (opts && bhShouldSkip(original, u.hostname, opts, location.hostname)) return original;
@@ -64,12 +65,13 @@
         const orig = img.dataset.bhPendingSrc;
         if (orig) {
           const u = bhSafeURL(orig);
-          if (u && !bhShouldSkip(orig, u.hostname, opts, location.hostname)) {
-            img.removeAttribute("data-bh-pending-src");
+          if (u && opts?.enabled !== false && opts?.proxyBase &&
+              !bhShouldSkip(orig, u.hostname, opts, location.hostname)) {
             nativeSetSrc(img, bhBuildProxyUrl(orig, opts));
           } else {
             nativeSetSrc(img, orig);
           }
+          img.removeAttribute("data-bh-pending-src");
         }
         const pendingSrcset = img.dataset.bhPendingSrcset;
         if (pendingSrcset) {
@@ -181,7 +183,7 @@
           return setAttr.call(this, "srcset", rewriteSrcset(v));
         }
       }
-      if (this instanceof HTMLSourceElement && n === "srcset") {
+      if (sourceProto && sourceProto.isPrototypeOf(this) && n === "srcset") {
         const v = String(value || "");
         if (!ready || !opts || !opts.proxyBase) {
           // Was setting the raw (unproxied) URL immediately and never

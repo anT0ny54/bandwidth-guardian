@@ -77,28 +77,38 @@ function bhDomainSet(text) {
     String(text || "").split(/[,\s]+/)
       .map(s => s.trim().toLowerCase()).filter(Boolean)
       .map(s => s.replace(/^https?:\/\//, "").split("/")[0])
+      .map(s => s.replace(/^\*?\./, "").replace(/\.$/, ""))
+      .filter(Boolean)
   );
 }
 
-// The single decision point for "leave this URL alone": excluded image
-// host, excluded *page* host (so "Exclude this site" covers every image on
-// the page, not just ones sharing the page's own hostname), an
-// already-proxied URL (same host as the configured proxy — avoids
-// double-wrapping a URL content.js already rewrote, e.g. a lazy-load
-// attribute, when it's later assigned via JS), the tracking-pixel patterns
-// above, and .ico/.svg/favicon paths.
+function bhHostMatchesDomain(hostname, domainSet) {
+  const host = String(hostname || "").toLowerCase().replace(/\.$/, "");
+  if (!host) return false;
+  for (const domain of domainSet) {
+    if (host === domain || host.endsWith("." + domain)) return true;
+  }
+  return false;
+}
+
+// The single decision point for "leave this URL alone": disabled extension,
+// excluded image host, excluded *page* host (so "Exclude this site" covers
+// subdomains too), an already-proxied URL (same host as the configured proxy —
+// avoids double-wrapping a URL content.js already rewrote), tracking-pixel
+// patterns, and .ico/.svg/favicon paths.
 function bhShouldSkip(url, hostname, opts, pageHostname) {
   if (!opts) return false;
+  if (opts.enabled === false) return true;
   const host = String(hostname || "").toLowerCase();
   const ex = bhDomainSet(opts.excludeDomains);
-  if (ex.has(host)) return true;
-  if (pageHostname && ex.has(String(pageHostname).toLowerCase())) return true;
+  if (bhHostMatchesDomain(host, ex)) return true;
+  if (pageHostname && bhHostMatchesDomain(pageHostname, ex)) return true;
   const proxyHost = opts.proxyBase ? bhSafeURL(opts.proxyBase)?.hostname?.toLowerCase() : null;
   if (proxyHost && host === proxyHost) return true;
-  const path = url.toLowerCase();
+  const path = String(url || "").toLowerCase();
   if (path.endsWith(".ico") || path.endsWith(".svg")) return true;
   if (path.includes("favicon")) return true;
-  if (BH_TRACKING_PATTERNS.some(p => p.test(url))) return true;
+  if (BH_TRACKING_PATTERNS.some(p => p.test(String(url || "")))) return true;
   return false;
 }
 
@@ -106,7 +116,7 @@ function bhShouldSkip(url, hostname, opts, pageHostname) {
 // encoded (Chrome's DNR regexSubstitution can't do this — see
 // service-worker.js for why that matters).
 function bhBuildProxyUrl(orig, opts) {
-  if (!opts || !opts.proxyBase || !bhIsHttp(orig)) return orig;
+  if (!opts || opts.enabled === false || !opts.proxyBase || !bhIsHttp(orig)) return orig;
   const base = String(opts.proxyBase).trim();
   if (!base) return orig;
   const sep  = base.includes("?") ? "&" : "?";

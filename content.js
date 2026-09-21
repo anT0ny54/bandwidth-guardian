@@ -54,15 +54,20 @@
   // to include walked thousands of elements that could never have an inline
   // background. The "i" flag also catches style="Background-Image:...".
   const BG_SELECTOR = "[style*='background' i]";
+  const LAZY_SELECTOR = LAZY_ATTRS.concat(["data-srcset"]).map(a => `[${a}]`).join(",");
 
   let opts = null;
-  const done = new WeakSet(); // elements already processed — no double-rewrites
+  // Keep independent processing markers: an <img> can legitimately need all
+  // three passes (src/srcset, lazy attrs, and inline background) at once.
+  const doneImg = new WeakSet();
+  const doneLazy = new WeakSet();
+  const doneBg = new WeakSet();
 
   // ── A) <img src> and <source srcset> rewriting ────────────────────────────
   // Handles images whose src was set by the HTML parser (bypasses prehook).
   // Also handles srcset entries on both <img> and <source> elements.
   function rewriteImg(el) {
-    if (!el || done.has(el)) return;
+    if (!el || doneImg.has(el)) return;
     if (!opts?.proxyBase || !opts?.enabled) return;
 
     let rewrote = false;
@@ -109,13 +114,13 @@
       }
     }
 
-    if (rewrote) done.add(el);
+    if (rewrote) doneImg.add(el);
   }
 
   // ── B) Lazy-attr rewriting ─────────────────────────────────────────────────
   // Rewrites data-src etc. so lazy-loaders pass proxy URLs to prehook.
   function rewriteLazy(el) {
-    if (!el || done.has(el)) return;
+    if (!el || doneLazy.has(el)) return;
     if (!opts?.proxyBase || !opts?.enabled) return;
 
     let rewrote = false;
@@ -146,7 +151,7 @@
       if (touched) { el.setAttribute("data-srcset", rewritten); rewrote = true; }
     }
 
-    if (rewrote) done.add(el);
+    if (rewrote) doneLazy.add(el);
   }
 
   // ── C) Inline background-image rewriting ──────────────────────────────────
@@ -154,7 +159,7 @@
   // CSS stylesheet backgrounds can't be intercepted without getComputedStyle,
   // but overriding inline style is enough for most dynamic content.
   function rewriteBg(el) {
-    if (!el || done.has(el)) return;
+    if (!el || doneBg.has(el)) return;
     if (!opts?.proxyBase || !opts?.enabled) return;
     const bg = el.style?.backgroundImage;
     if (!bg || !bg.startsWith("url(")) return;
@@ -163,7 +168,7 @@
     const u = bhSafeURL(raw);
     if (!u || bhShouldSkip(raw, u.hostname, opts, location.hostname)) return;
     el.style.backgroundImage = `url("${bhBuildProxyUrl(raw, opts)}")`;
-    done.add(el);
+    doneBg.add(el);
   }
 
   // ── Full-page scan ────────────────────────────────────────────────────────
@@ -172,8 +177,7 @@
     document.querySelectorAll("img, picture source").forEach(rewriteImg);
 
     // Lazy-loaded images
-    const lazySel = LAZY_ATTRS.concat(["data-srcset"]).map(a => `[${a}]`).join(",");
-    document.querySelectorAll(lazySel).forEach(rewriteLazy);
+    document.querySelectorAll(LAZY_SELECTOR).forEach(rewriteLazy);
 
     // Inline backgrounds
     document.querySelectorAll(BG_SELECTOR).forEach(rewriteBg);
@@ -195,8 +199,7 @@
           // already no-ops on them via isPictureSource, so this just
           // avoids visiting them at all.
           n.querySelectorAll?.("img, picture source").forEach(rewriteImg);
-          const lazySel = LAZY_ATTRS.concat(["data-srcset"]).map(a => `[${a}]`).join(",");
-          n.querySelectorAll?.(lazySel).forEach(rewriteLazy);
+          n.querySelectorAll?.(LAZY_SELECTOR).forEach(rewriteLazy);
           n.querySelectorAll?.(BG_SELECTOR).forEach(rewriteBg);
         });
       } else if (m.type === "attributes") {
@@ -204,14 +207,14 @@
         if (!t) continue;
         if (m.attributeName === "src" || m.attributeName === "srcset") {
           if (t.tagName === "IMG" || t.tagName === "SOURCE") {
-            done.delete(t); // allow re-rewrite when src changes
+            doneImg.delete(t); // allow re-rewrite when src changes
             rewriteImg(t);
           }
         } else if (m.attributeName === "style") {
-          done.delete(t);
+          doneBg.delete(t);
           rewriteBg(t);
         } else if (LAZY_ATTRS.includes(m.attributeName) || m.attributeName === "data-srcset") {
-          done.delete(t);
+          doneLazy.delete(t);
           rewriteLazy(t);
         }
       }

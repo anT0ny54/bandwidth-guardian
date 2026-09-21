@@ -113,7 +113,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== "sync") return;
   mirrorToLocal();
   refreshRules();
-  if ("enabled" in changes || "excludeDomains" in changes) updateIcon();
+  if ("enabled" in changes) updateIcon();
 });
 
 mirrorToLocal();
@@ -157,23 +157,45 @@ if (chrome.webRequest && !chrome.webRequest.onCompleted.hasListener(onProxyCompl
   );
 }
 
+let statsWriteBusy = false;
+let pendingStats = { filesProcessed: 0, bytesProcessed: 0, bytesSaved: 0 };
+
+function flushStats() {
+  if (statsWriteBusy || pendingStats.filesProcessed === 0) return;
+  statsWriteBusy = true;
+
+  const delta = pendingStats;
+  pendingStats = { filesProcessed: 0, bytesProcessed: 0, bytesSaved: 0 };
+
+  // Batch completions that arrive while storage is busy. This both prevents
+  // read-modify-write races and reduces local-storage writes on image-heavy pages.
+  chrome.storage.local.get(
+    { stats: { filesProcessed: 0, bytesProcessed: 0, bytesSaved: 0 } },
+    function(d) {
+      const s = d.stats || { filesProcessed: 0, bytesProcessed: 0, bytesSaved: 0 };
+      s.filesProcessed += delta.filesProcessed;
+      s.bytesProcessed += delta.bytesProcessed;
+      s.bytesSaved     += delta.bytesSaved;
+      chrome.storage.local.set({ stats: s }, function() {
+        statsWriteBusy = false;
+        flushStats();
+      });
+    }
+  );
+}
+
 function onProxyCompleted({ responseHeaders, fromCache }) {
   if (fromCache) return;
   const bytesSaved    = getHeaderInt(responseHeaders, "x-bytes-saved");
   const bytesOriginal = getHeaderInt(responseHeaders, "x-original-size");
   if (bytesSaved === false || bytesOriginal === false) return;
 
-  chrome.storage.local.get(
-    { stats: { filesProcessed: 0, bytesProcessed: 0, bytesSaved: 0 } },
-    d => {
-      const s = d.stats || { filesProcessed: 0, bytesProcessed: 0, bytesSaved: 0 };
-      s.filesProcessed += 1;
-      s.bytesProcessed += bytesOriginal;
-      s.bytesSaved     += bytesSaved;
-      chrome.storage.local.set({ stats: s });
-    }
-  );
+  pendingStats.filesProcessed += 1;
+  pendingStats.bytesProcessed += bytesOriginal;
+  pendingStats.bytesSaved     += bytesSaved;
+  flushStats();
 }
+
 
 // ── DNR rules ─────────────────────────────────────────────────────────────────
 // Only Rule 2 (CSP stripping) is active. Rule 1 (redirect) is intentionally
@@ -188,7 +210,7 @@ function doRefreshRules() {
     chrome.storage.sync.get(DEFAULTS, function(opts) {
       var removeRuleIds = ALL_RULE_IDS;
 
-      if (!opts.enabled) {
+      if (!opts.enabled || !opts.proxyBase) {
         chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: removeRuleIds }, resolve);
         return;
       }
