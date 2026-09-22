@@ -25,7 +25,20 @@ function parseDomains(text) {
   return String(text || "")
     .split(/[,\s]+/)
     .map(s => s.trim().toLowerCase()).filter(Boolean)
-    .map(s => s.replace(/^https?:\/\//, "").split("/")[0]);
+    .map(s => s.replace(/^https?:\/\//, "").split("/")[0])
+    .map(s => s.replace(/^\*?\./, "").replace(/\.$/, ""))
+    .filter(Boolean);
+}
+
+function matchingExcludedDomain(host, domains) {
+  let match = "";
+  for (const domain of domains) {
+    if (host === domain || host.endsWith("." + domain)) {
+      // Prefer the most-specific match when exclusions overlap.
+      if (domain.length > match.length) match = domain;
+    }
+  }
+  return match;
 }
 
 function nearestPreset(q) {
@@ -138,7 +151,7 @@ async function loadSiteUI(d) {
   excludeBtn.disabled = false;
 
   const excluded = parseDomains(d.excludeDomains);
-  if (excluded.includes(currentHost)) {
+  if (matchingExcludedDomain(currentHost, excluded)) {
     sitePillEl.textContent = "Excluded";
     sitePillEl.className   = "site-pill excluded";
     sitePillEl.style.display = "";
@@ -155,7 +168,8 @@ excludeBtn.addEventListener("click", async () => {
   if (!currentIsWeb || !currentHost) return;
   const d    = await chrome.storage.sync.get(DEFAULTS);
   const list = new Set(parseDomains(d.excludeDomains));
-  if (list.has(currentHost)) list.delete(currentHost);
+  const matched = matchingExcludedDomain(currentHost, list);
+  if (matched) list.delete(matched);
   else list.add(currentHost);
   await chrome.storage.sync.set({ excludeDomains: Array.from(list).join(" ") });
   loadSiteUI(await chrome.storage.sync.get(DEFAULTS));

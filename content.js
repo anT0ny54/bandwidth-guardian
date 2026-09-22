@@ -221,12 +221,25 @@
     }
   });
 
-  mo.observe(document.documentElement, {
+  const observerConfig = {
     childList:       true,
     subtree:         true,
     attributes:      true,
     attributeFilter: ["src", "srcset", "style", ...LAZY_ATTRS, "data-srcset"]
-  });
+  };
+  let observing = false;
+
+  function setObserverEnabled(enabled) {
+    if (enabled === observing) return;
+    if (enabled) {
+      // Observe the document node so this remains safe even at document_start,
+      // before document.documentElement exists on slower navigations.
+      mo.observe(document, observerConfig);
+    } else {
+      mo.disconnect();
+    }
+    observing = enabled;
+  }
 
   // ── Preconnect to proxy ───────────────────────────────────────────────────
   // Injecting <link rel="preconnect"> opens the TCP+TLS connection to the proxy
@@ -256,10 +269,20 @@
   // bhOnReady/bhOnOptsChange — see the v0.0.6 note at the top of shared.js.
   bhOnReady(o => {
     opts = o;
-    if (opts.enabled && opts.proxyBase) {
+    const active = !!(opts.enabled && opts.proxyBase);
+    setObserverEnabled(active);
+    if (active) {
       injectPreconnect(opts.proxyBase);
       rewriteAll();
     }
   });
-  bhOnOptsChange(o => { opts = o; });
+  bhOnOptsChange(o => {
+    opts = o;
+    const active = !!(opts.enabled && opts.proxyBase);
+    setObserverEnabled(active);
+    if (active) {
+      injectPreconnect(opts.proxyBase);
+      rewriteAll();
+    }
+  });
 })();
