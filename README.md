@@ -2,9 +2,6 @@
 
 > Save mobile data by compressing images through a self-hosted proxy before they load.
 
-[![Version](https://img.shields.io/badge/version-0.0.7-0891b2?style=flat-square)](https://github.com/anT0ny54/bandwidth-guardian/releases)
-[![MV3](https://img.shields.io/badge/Manifest-V3-22c55e?style=flat-square)](https://developer.chrome.com/docs/extensions/mv3/intro/)
-[![License](https://img.shields.io/badge/license-MIT-1a3e99?style=flat-square)](LICENSE)
 
 Bandwidth Guardian is a Manifest V3 Chrome extension that routes every image through a compression proxy before the browser downloads it. It supports WebP output, grayscale mode, per-site exclusions, and configurable quality and max-width.
 
