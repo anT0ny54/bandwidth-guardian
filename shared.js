@@ -1,43 +1,14 @@
-// Bandwidth Guardian — shared content-script constants & helpers
+// Bandwidth Guardian — shared isolated-world helpers
 //
-// Loaded first — see manifest.json's single `content_scripts` entry:
-// "js": ["shared.js", "prehook.js", "content.js"]. All three run in the
-// same per-frame isolated world for this extension, so the top-level
-// `const`/`function` declarations below are ordinary globals to both
-// prehook.js and content.js.
+// The early prehook runs in the page's MAIN world because JavaScript prototype
+// patches made from an ISOLATED content-script world are not visible to the
+// page's own JavaScript. This file remains ISOLATED so it can use chrome.* APIs.
 //
-// This used to be two independently maintained ("KEEP IN SYNC") copies of
-// the same DEFAULTS / TRACKING_PATTERNS / skip-URL / build-proxy-URL logic,
-// one in each file. That duplication had already drifted apart in two
-// ways that are now fixed by having exactly one copy:
-//   1. prehook.js's skip check only compared the *image's* hostname
-//      against excludeDomains, never the current *page's* hostname the
-//      way content.js already did. So "Exclude this site" (popup.js)
-//      silently only worked for HTML-parsed images — any image assigned
-//      via JavaScript (lazy-loaders, SPA frameworks, `new Image()`) on an
-//      excluded page still went through the proxy.
-//   2. prehook.js had no "already proxied" guard. content.js rewrites lazy
-//      attributes (data-src, etc.) to the *proxy* URL so that when a
-//      lazy-loader later runs `img.src = img.dataset.src`, prehook.js
-//      would see an already-correct URL. Lacking the guard, prehook.js
-//      wrapped that URL in the proxy a second time — `proxy?url=<proxy
-//      URL>` — breaking every lazy-loaded image on any site using the
-//      common data-src pattern.
-//
-// service-worker.js still inlines its own copy of DEFAULTS — classic
-// (non-module) service workers on Kiwi/Cromite run in a separate context
-// that can't load this file the way content scripts do. defaults.js (an
-// ES module) is the copy used by popup.js/options.js for the same reason.
-// Three "sources of truth" still exist, but each is now used by exactly
-// one context instead of two files silently doing the same job.
-//
-// v0.0.6: the "load bhOpts from storage.local, fall back to storage.sync,
-// then listen for changes" sequence below used to be duplicated almost
-// verbatim in both prehook.js and content.js (~15 lines each, two separate
-// chrome.storage.local.get calls per page load). It now lives once, here,
-// as a tiny ready/subscribe API (bhOnReady / bhOnOptsChange) that both
-// files call into. Same behavior and timing, one storage read instead of
-// two, and one place to fix if the load sequence ever needs to change.
+// Settings are bridged to prehook.js with a tiny window.postMessage channel.
+// The page can observe/interfere with MAIN-world code by design, so the bridge
+// carries only non-secret extension configuration.
+
+const BH_MAIN_CHANNEL = "__bandwidth_guardian_v1__";
 
 const BH_DEFAULTS = {
   enabled:         true,
@@ -50,9 +21,7 @@ const BH_DEFAULTS = {
 };
 
 // Tracking-pixel URL patterns (ported from the original bandwidth-hero's
-// shouldCompress.js). Not redundant with excludeDomains: these match
-// ad/analytics *paths* across many hosts that aren't in the (short,
-// user-editable) domain list.
+// shouldCompress.js). These are path/host patterns, not editable exclusions.
 const BH_TRACKING_PATTERNS = [
   /pagead/i,
   /(pixel|cleardot)[^/]*\.(gif|jpg|jpeg)/i,
@@ -69,10 +38,24 @@ const BH_TRACKING_PATTERNS = [
   /ad\.doubleclick\.net/i
 ];
 
-function bhSafeURL(u) { try { return new URL(u); } catch { return null; } }
-function bhIsHttp(u) { return /^https?:\/\//i.test(u); }
+function bhSafeURL(u) {
+  try { return new URL(u); } catch { return null; }
+}
+
+function bhResolveHttpURL(raw, base = document.baseURI || location.href) {
+  const value = String(raw ?? "").trim();
+  if (!value) return null;
+  try {
+    const u = new URL(value, base);
+    return (u.protocol === "http:" || u.protocol === "https:") ? u : null;
+  } catch {
+    return null;
+  }
+}
 
 function bhDomainSet(text) {
+  if (text instanceof Set) return new Set(text);
+  if (Array.isArray(text)) return new Set(text);
   return new Set(
     String(text || "").split(/[,\s]+/)
       .map(s => s.trim().toLowerCase()).filter(Boolean)
@@ -91,111 +74,197 @@ function bhHostMatchesDomain(hostname, domainSet) {
   return false;
 }
 
-// The single decision point for "leave this URL alone": disabled extension,
-// excluded image host, excluded *page* host (so "Exclude this site" covers
-// subdomains too), an already-proxied URL (same host as the configured proxy —
-// avoids double-wrapping a URL content.js already rewrote), tracking-pixel
-// patterns, and .ico/.svg/favicon paths.
+let BH_EXCLUDE_SET = new Set();
+const BH_PROXY_SIGNATURES = new Set();
+
+function bhProxySignature(base) {
+  const u = bhSafeURL(base);
+  if (!u || (u.protocol !== "http:" && u.protocol !== "https:")) return "";
+  return u.origin + u.pathname;
+}
+
+function bhRegisterProxyBase(base) {
+  const signature = bhProxySignature(base);
+  if (signature) BH_PROXY_SIGNATURES.add(signature);
+}
+
+function bhLooksLikeGeneratedProxy(url) {
+  const u = bhSafeURL(url);
+  if (!u || !u.searchParams.has("url")) return false;
+  const signature = u.origin + u.pathname;
+  if (!BH_PROXY_SIGNATURES.has(signature)) return false;
+  // Require the parameters generated by bhBuildProxyUrl as well. This avoids
+  // skipping an unrelated image merely because it shares the proxy host/path.
+  return u.searchParams.has("quality") &&
+         u.searchParams.has("bw") &&
+         u.searchParams.has("jpeg");
+}
+
+// Single decision point for "leave this URL alone".
 function bhShouldSkip(url, hostname, opts, pageHostname) {
   if (!opts) return false;
   if (opts.enabled === false) return true;
+
   const host = String(hostname || "").toLowerCase();
-  const ex = bhDomainSet(opts.excludeDomains);
-  if (bhHostMatchesDomain(host, ex)) return true;
-  if (pageHostname && bhHostMatchesDomain(pageHostname, ex)) return true;
-  const proxyHost = opts.proxyBase ? bhSafeURL(opts.proxyBase)?.hostname?.toLowerCase() : null;
-  if (proxyHost && host === proxyHost) return true;
-  const path = String(url || "").toLowerCase();
+  if (bhHostMatchesDomain(host, BH_EXCLUDE_SET)) return true;
+  if (pageHostname && bhHostMatchesDomain(pageHostname, BH_EXCLUDE_SET)) return true;
+  if (bhLooksLikeGeneratedProxy(url)) return true;
+
+  let path = String(url || "").toLowerCase();
+  try {
+    path = new URL(url, document.baseURI || location.href).pathname.toLowerCase();
+  } catch {}
   if (path.endsWith(".ico") || path.endsWith(".svg")) return true;
   if (path.includes("favicon")) return true;
   if (BH_TRACKING_PATTERNS.some(p => p.test(String(url || "")))) return true;
   return false;
 }
 
-// Builds the proxy URL with the full param set, all values properly
-// encoded (Chrome's DNR regexSubstitution can't do this — see
-// service-worker.js for why that matters).
-function bhBuildProxyUrl(orig, opts) {
-  if (!opts || opts.enabled === false || !opts.proxyBase || !bhIsHttp(orig)) return orig;
-  const base = String(opts.proxyBase).trim();
-  if (!base) return orig;
-  const sep  = base.includes("?") ? "&" : "?";
-  const jpeg = opts.isWebpSupported ? "0" : "1"; // jpeg=1 when WebP unsupported
-  const bw   = opts.grayscale ? "1" : "0";
-  const parts = [
-    "url="     + encodeURIComponent(orig),
-    "jpeg="    + jpeg,
-    "bw="      + bw,
-    "quality=" + encodeURIComponent(String(opts.quality ?? 40)),
-  ];
-  if (opts.maxWidth) parts.push("max_width=" + encodeURIComponent(String(opts.maxWidth)));
-  return base + sep + parts.join("&");
+function bhIsValidProxyBase(base) {
+  const u = bhSafeURL(String(base || "").trim());
+  return !!u && (u.protocol === "http:" || u.protocol === "https:");
 }
+
+function bhBuildProxyUrl(orig, opts) {
+  if (!opts || opts.enabled === false || !opts.proxyBase) return orig;
+
+  const target = bhResolveHttpURL(orig);
+  if (!target || bhShouldSkip(target.href, target.hostname, opts, location.hostname)) {
+    return orig;
+  }
+
+  const base = String(opts.proxyBase).trim();
+  if (!bhIsValidProxyBase(base)) return orig;
+
+  try {
+    const proxy = new URL(base);
+    proxy.hash = "";
+
+    const quality = Number.isInteger(Number(opts.quality)) &&
+                    Number(opts.quality) >= 1 && Number(opts.quality) <= 100
+      ? Math.round(Number(opts.quality))
+      : 40;
+    const maxWidth = Number.isInteger(Number(opts.maxWidth)) &&
+                     Number(opts.maxWidth) >= 0
+      ? Math.round(Number(opts.maxWidth))
+      : 1280;
+
+    proxy.searchParams.set("url", target.href);
+    proxy.searchParams.set("jpeg", opts.isWebpSupported ? "0" : "1");
+    proxy.searchParams.set("bw", opts.grayscale ? "1" : "0");
+    proxy.searchParams.set("quality", String(quality));
+    if (maxWidth > 0) proxy.searchParams.set("max_width", String(maxWidth));
+    else proxy.searchParams.delete("max_width");
+
+    return proxy.href;
+  } catch {
+    return orig;
+  }
+}
+
+function bhNormalizeOpts(raw) {
+  const d = raw && typeof raw === "object" ? raw : {};
+  const proxyBase = String(d.proxyBase ?? "").trim();
+  const quality = Number(d.quality);
+  const maxWidth = Number(d.maxWidth);
+
+  return {
+    enabled:        d.enabled === undefined ? BH_DEFAULTS.enabled : d.enabled === true,
+    proxyBase:      bhIsValidProxyBase(proxyBase) ? proxyBase : "",
+    quality:        Number.isFinite(quality) && Number.isInteger(quality) && quality >= 1 && quality <= 100
+                      ? quality : BH_DEFAULTS.quality,
+    grayscale:      d.grayscale === undefined ? BH_DEFAULTS.grayscale : d.grayscale === true,
+    maxWidth:       Number.isFinite(maxWidth) && Number.isInteger(maxWidth) && maxWidth >= 0
+                      ? maxWidth : BH_DEFAULTS.maxWidth,
+    excludeDomains: String(d.excludeDomains ?? BH_DEFAULTS.excludeDomains).trim(),
+    isWebpSupported:
+      d.isWebpSupported === undefined
+        ? BH_DEFAULTS.isWebpSupported
+        : d.isWebpSupported === true,
+  };
+}
+
+function bhApplyOpts(raw) {
+  BH_OPTS = bhNormalizeOpts(raw);
+  BH_EXCLUDE_SET = bhDomainSet(BH_OPTS.excludeDomains);
+  bhRegisterProxyBase(BH_OPTS.proxyBase);
+}
+
+function bhPublishMainWorld() {
+  try {
+    window.postMessage({
+      channel: BH_MAIN_CHANNEL,
+      type: "config",
+      opts: BH_OPTS,
+    }, "*");
+  } catch {}
+}
+
+function bhHandleMainWorldRequest(event) {
+  if (event.source !== window) return;
+  const data = event.data;
+  if (!data || data.channel !== BH_MAIN_CHANNEL || data.type !== "request") return;
+  bhPublishMainWorld();
+}
+
+window.addEventListener("message", bhHandleMainWorldRequest, false);
 
 // ── Shared options loader / subscription ────────────────────────────────────
-// Single storage.local (falling back to storage.sync) load, shared by
-// prehook.js and content.js instead of each running its own. See the v0.0.6
-// note above.
-let BH_OPTS  = null;   // latest known options, or null until the first load resolves
-let BH_READY = false;  // true once the first load has resolved at least once
+let BH_OPTS  = null;
+let BH_READY = false;
 
-const BH_READY_CBS  = [];  // one-shot callbacks waiting on the first load
-const BH_CHANGE_CBS = [];  // persistent callbacks for every later change
+const BH_READY_CBS  = [];
+const BH_CHANGE_CBS = [];
 
-// Calls cb(opts) once options are available — immediately if already loaded,
-// otherwise as soon as the first load resolves. Safe to call from either
-// prehook.js or content.js regardless of which one happens to run first.
 function bhOnReady(cb) {
-  if (BH_READY) cb(BH_OPTS);
-  else BH_READY_CBS.push(cb);
+  if (BH_READY) {
+    try { cb(BH_OPTS); } catch {}
+  } else {
+    BH_READY_CBS.push(cb);
+  }
 }
 
-// Calls cb(opts) every time options change after the first load (settings
-// page edits, popup toggles, sync from another device). Does NOT fire for
-// the initial load — use bhOnReady for that.
-function bhOnOptsChange(cb) { BH_CHANGE_CBS.push(cb); }
+function bhOnOptsChange(cb) {
+  BH_CHANGE_CBS.push(cb);
+}
 
 function bhResolveReady() {
   BH_READY = true;
   const cbs = BH_READY_CBS.splice(0);
   cbs.forEach(cb => { try { cb(BH_OPTS); } catch {} });
+  bhPublishMainWorld();
 }
 
 function bhNotifyChange() {
+  bhPublishMainWorld();
   BH_CHANGE_CBS.forEach(cb => { try { cb(BH_OPTS); } catch {} });
 }
 
-// Try storage.local first (bhOpts mirror written by the service worker, ~5 ms).
-// If bhOpts is missing — fresh install, service worker not yet run, or browser
-// restart before onStartup fired — fall back to storage.sync so we never
-// silently use empty defaults and let original images through.
+// Try the fast local mirror first, then sync storage as the correctness
+// fallback. The service worker normally keeps bhOpts current.
 chrome.storage.local.get({ bhOpts: null }, d => {
   if (d.bhOpts) {
-    BH_OPTS = d.bhOpts;
+    bhApplyOpts(d.bhOpts);
     bhResolveReady();
   } else {
     chrome.storage.sync.get(BH_DEFAULTS, synced => {
-      BH_OPTS = synced;
+      bhApplyOpts(synced);
       bhResolveReady();
-      // Write the mirror so subsequent pages load fast.
-      chrome.storage.local.set({ bhOpts: synced });
+      chrome.storage.local.set({ bhOpts: BH_OPTS }, () => {});
     });
   }
 });
 
-// Stay current when settings change.
-// Primary: local area (bhOpts mirror, instant).
-// Fallback: sync area — catches changes when the service worker is inactive
-// or not supported (Kiwi/Cromite).
 chrome.storage.onChanged?.addListener((changes, area) => {
   if (area === "local" && changes.bhOpts) {
-    BH_OPTS = changes.bhOpts.newValue || BH_DEFAULTS;
+    bhApplyOpts(changes.bhOpts.newValue || BH_DEFAULTS);
     if (!BH_READY) bhResolveReady(); else bhNotifyChange();
   } else if (area === "sync") {
     chrome.storage.sync.get(BH_DEFAULTS, synced => {
-      BH_OPTS = synced;
-      chrome.storage.local.set({ bhOpts: synced });
+      bhApplyOpts(synced);
+      chrome.storage.local.set({ bhOpts: BH_OPTS }, () => {});
       if (!BH_READY) bhResolveReady(); else bhNotifyChange();
     });
   }
 });
+

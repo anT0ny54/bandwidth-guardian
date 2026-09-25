@@ -41,14 +41,9 @@ function matchingExcludedDomain(host, domains) {
   return match;
 }
 
-function nearestPreset(q) {
-  return PRESETS.reduce((best, v) =>
-    Math.abs(v - q) < Math.abs(best - q) ? v : best, PRESETS[0]);
-}
-
 function setActivePreset(q) {
-  const match = nearestPreset(q);
-  presetBtns.forEach(b => b.classList.toggle("active", Number(b.dataset.q) === match));
+  const value = Number(q);
+  presetBtns.forEach(b => b.classList.toggle("active", Number(b.dataset.q) === value));
 }
 
 function showNudge() {
@@ -74,19 +69,27 @@ function updateEnabledUI(enabled) {
 // ── Load ──────────────────────────────────────────────────────────────────────
 
 async function load() {
-  const d = await chrome.storage.sync.get(DEFAULTS);
-  applyUI(d);
-  loadSiteUI(d);
+  try {
+    const d = await chrome.storage.sync.get(DEFAULTS);
+    applyUI(d);
+    await loadSiteUI(d);
+  } catch {}
 }
-load();
+void load();
 
 // ── Enable toggle ─────────────────────────────────────────────────────────────
 
 enabledEl.addEventListener("change", async () => {
   const enabled = enabledEl.checked;
-  await chrome.storage.sync.set({ enabled });
-  updateEnabledUI(enabled);
-  loadSiteUI(await chrome.storage.sync.get(DEFAULTS));
+  try {
+    await chrome.storage.sync.set({ enabled });
+    updateEnabledUI(enabled);
+    loadSiteUI(await chrome.storage.sync.get(DEFAULTS));
+  } catch {
+    enabledEl.checked = !enabled;
+    updateEnabledUI(!enabled);
+    showNudge();
+  }
 });
 
 // ── Grayscale ─────────────────────────────────────────────────────────────────
@@ -94,18 +97,30 @@ enabledEl.addEventListener("change", async () => {
 // the page can't change without a reload.
 
 grayscaleEl.addEventListener("change", async () => {
-  await chrome.storage.sync.set({ grayscale: grayscaleEl.checked });
-  showNudge();
+  const grayscale = grayscaleEl.checked;
+  try {
+    await chrome.storage.sync.set({ grayscale });
+    showNudge();
+  } catch {
+    grayscaleEl.checked = !grayscale;
+    showNudge();
+  }
 });
 
 // ── Quality presets ───────────────────────────────────────────────────────────
 
 presetBtns.forEach(btn => {
   btn.addEventListener("click", async () => {
+    const quality = Number(btn.dataset.q);
     presetBtns.forEach(b => b.classList.remove("active"));
     btn.classList.add("active");
-    await chrome.storage.sync.set({ quality: Number(btn.dataset.q) });
-    showNudge();
+    try {
+      await chrome.storage.sync.set({ quality });
+      showNudge();
+    } catch {
+      void load();
+      showNudge();
+    }
   });
 });
 
@@ -114,7 +129,10 @@ presetBtns.forEach(btn => {
 reloadBtn.addEventListener("click", async () => {
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (tab?.id) chrome.tabs.reload(tab.id);
+    if (tab?.id) {
+      const result = chrome.tabs.reload(tab.id);
+      if (result && typeof result.catch === "function") result.catch(() => {});
+    }
   } catch {}
   window.close();
 });
@@ -122,6 +140,9 @@ reloadBtn.addEventListener("click", async () => {
 // ── Site card ─────────────────────────────────────────────────────────────────
 
 async function loadSiteUI(d) {
+  currentHost = "";
+  currentIsWeb = false;
+
   let tab;
   try { [tab] = await chrome.tabs.query({ active: true, currentWindow: true }); }
   catch { return; }
@@ -166,13 +187,17 @@ async function loadSiteUI(d) {
 
 excludeBtn.addEventListener("click", async () => {
   if (!currentIsWeb || !currentHost) return;
-  const d    = await chrome.storage.sync.get(DEFAULTS);
-  const list = new Set(parseDomains(d.excludeDomains));
-  const matched = matchingExcludedDomain(currentHost, list);
-  if (matched) list.delete(matched);
-  else list.add(currentHost);
-  await chrome.storage.sync.set({ excludeDomains: Array.from(list).join(" ") });
-  loadSiteUI(await chrome.storage.sync.get(DEFAULTS));
+  try {
+    const d    = await chrome.storage.sync.get(DEFAULTS);
+    const list = new Set(parseDomains(d.excludeDomains));
+    const matched = matchingExcludedDomain(currentHost, list);
+    if (matched) list.delete(matched);
+    else list.add(currentHost);
+    await chrome.storage.sync.set({ excludeDomains: Array.from(list).join(" ") });
+    loadSiteUI(await chrome.storage.sync.get(DEFAULTS));
+  } catch {
+    showNudge();
+  }
 });
 
 // ── Open settings page ────────────────────────────────────────────────────────
@@ -180,13 +205,19 @@ excludeBtn.addEventListener("click", async () => {
 // tabs.create() works everywhere.
 
 settingsBtn.addEventListener("click", () => {
-  chrome.tabs.create({ url: chrome.runtime.getURL("options.html") })
-    .catch(() => chrome.runtime.openOptionsPage?.());
+  try {
+    const result = chrome.tabs.create({ url: chrome.runtime.getURL("options.html") });
+    if (result && typeof result.catch === "function") {
+      result.catch(() => { chrome.runtime.openOptionsPage?.(); });
+    }
+  } catch {
+    try { chrome.runtime.openOptionsPage?.(); } catch {}
+  }
 });
 
 // ── Sync with changes made on the settings page ───────────────────────────────
 
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== "sync") return;
-  chrome.storage.sync.get(DEFAULTS, applyUI);
+  void load();
 });

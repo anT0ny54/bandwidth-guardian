@@ -25,9 +25,8 @@
 //
 // ══════════════════════════════════════════════════════════════════════════════
 
-// Kiwi/Cromite do not support ES module service workers ("type": "module"),
-// so DEFAULTS is inlined here rather than imported from defaults.js.
-// Keep in sync with defaults.js if either file changes.
+// Kiwi/Cromite compatibility: keep the service worker classic (non-module),
+// so this small defaults copy remains local to the worker.
 const DEFAULTS = {
   enabled:         true,
   proxyBase:       "",
@@ -37,6 +36,48 @@ const DEFAULTS = {
   excludeDomains:  "google.com gstatic.com challenges.cloudflare.com",
   isWebpSupported: false,
 };
+
+function isValidProxyBase(value) {
+  try {
+    const u = new URL(String(value || "").trim());
+    return u.protocol === "http:" || u.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+function normalizeOptions(raw) {
+  const d = raw && typeof raw === "object" ? raw : {};
+  const quality = Number(d.quality);
+  const maxWidth = Number(d.maxWidth);
+  const proxyBase = String(d.proxyBase ?? "").trim();
+
+  return {
+    enabled:         d.enabled === undefined ? DEFAULTS.enabled : d.enabled === true,
+    proxyBase:       isValidProxyBase(proxyBase) ? proxyBase : "",
+    quality:         Number.isInteger(quality) && quality >= 1 && quality <= 100
+                       ? quality : DEFAULTS.quality,
+    grayscale:       d.grayscale === undefined ? DEFAULTS.grayscale : d.grayscale === true,
+    maxWidth:        Number.isInteger(maxWidth) && maxWidth >= 0
+                       ? maxWidth : DEFAULTS.maxWidth,
+    excludeDomains:  String(d.excludeDomains ?? DEFAULTS.excludeDomains).trim(),
+    isWebpSupported:
+      d.isWebpSupported === undefined
+        ? DEFAULTS.isWebpSupported
+        : d.isWebpSupported === true,
+  };
+}
+
+function parseExcludedDomains(text) {
+  return Array.from(new Set(
+    String(text || "").split(/[,\s]+/)
+      .map(s => s.trim().toLowerCase())
+      .filter(Boolean)
+      .map(s => s.replace(/^https?:\/\//, "").split("/")[0])
+      .map(s => s.replace(/^\*?\./, "").replace(/\.$/, ""))
+      .filter(Boolean)
+  ));
+}
 
 // Rule 1 is no longer added, but we still remove it on every refresh so any
 // leftover rule from a previous version of the extension is cleaned up.
@@ -80,14 +121,16 @@ function checkWebpSupport(callback) {
 // before prehook can intercept it. The service worker keeps bhOpts current.
 function mirrorToLocal() {
   chrome.storage.sync.get(DEFAULTS, opts => {
-    chrome.storage.local.set({ bhOpts: opts });
+    chrome.storage.local.set({ bhOpts: normalizeOptions(opts) }, () => {});
   });
 }
 
 // ── Lifecycle ─────────────────────────────────────────────────────────────────
 
 chrome.runtime.onInstalled.addListener(function() {
-  chrome.storage.sync.get(DEFAULTS, function(d) { chrome.storage.sync.set(d); });
+  chrome.storage.sync.get(DEFAULTS, function(d) {
+    chrome.storage.sync.set(normalizeOptions(d));
+  });
   chrome.storage.local.get(
     { stats: { filesProcessed: 0, bytesProcessed: 0, bytesSaved: 0 } },
     function(d) { chrome.storage.local.set(d); }
@@ -207,7 +250,8 @@ function onProxyCompleted({ responseHeaders, fromCache }) {
 
 function doRefreshRules() {
   return new Promise(function(resolve) {
-    chrome.storage.sync.get(DEFAULTS, function(opts) {
+    chrome.storage.sync.get(DEFAULTS, function(raw) {
+      var opts = normalizeOptions(raw);
       var removeRuleIds = ALL_RULE_IDS;
 
       if (!opts.enabled || !opts.proxyBase) {
@@ -216,6 +260,12 @@ function doRefreshRules() {
       }
 
       // Rule 2: Strip CSP headers so proxy-domain images aren't blocked by the page.
+      var condition = { resourceTypes: ["main_frame", "sub_frame"] };
+      var excludedInitiatorDomains = parseExcludedDomains(opts.excludeDomains);
+      if (excludedInitiatorDomains.length) {
+        condition.excludedInitiatorDomains = excludedInitiatorDomains;
+      }
+
       var addRules = [{
         id: RULE_ID_CSP,
         priority: 1,
@@ -226,7 +276,7 @@ function doRefreshRules() {
             { header: "content-security-policy-report-only", operation: "remove" }
           ]
         },
-        condition: { resourceTypes: ["main_frame", "sub_frame"] }
+        condition: condition
       }];
 
       chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: removeRuleIds, addRules: addRules }, resolve);

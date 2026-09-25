@@ -72,16 +72,22 @@ function setWidthUI(w) {
 
 // Read the currently selected quality value (preset or custom).
 function readQuality() {
-  const custom = parseInt(customQualityEl.value, 10);
-  if (!isNaN(custom) && custom >= 1 && custom <= 100) return custom;
+  const raw = customQualityEl.value.trim();
+  if (raw !== "") {
+    const custom = Number(raw);
+    return Number.isInteger(custom) && custom >= 1 && custom <= 100 ? custom : null;
+  }
   const active = qualityPresets.find(b => b.classList.contains("active"));
   return active ? Number(active.dataset.q) : DEFAULTS.quality;
 }
 
 // Read the currently selected width value (preset or custom).
 function readWidth() {
-  const custom = parseInt(customWidthEl.value, 10);
-  if (!isNaN(custom) && custom >= 0) return custom;
+  const raw = customWidthEl.value.trim();
+  if (raw !== "") {
+    const custom = Number(raw);
+    return Number.isInteger(custom) && custom >= 0 ? custom : null;
+  }
   const active = widthPresets.find(b => b.classList.contains("active"));
   return active ? Number(active.dataset.w) : DEFAULTS.maxWidth;
 }
@@ -89,23 +95,31 @@ function readWidth() {
 // ── Load ──────────────────────────────────────────────────────────────────────
 
 async function load() {
-  const d = await chrome.storage.sync.get(DEFAULTS);
-  enabledEl.checked   = !!d.enabled;
-  grayscaleEl.checked = !!d.grayscale;
-  proxyBaseEl.value   = d.proxyBase     || "";
-  excludeEl.value     = d.excludeDomains || "";
-  proxyBaseEl.classList.remove("invalid");
-  setQualityUI(d.quality  ?? DEFAULTS.quality);
-  setWidthUI(d.maxWidth ?? DEFAULTS.maxWidth);
+  try {
+    const d = await chrome.storage.sync.get(DEFAULTS);
+    enabledEl.checked   = !!d.enabled;
+    grayscaleEl.checked = !!d.grayscale;
+    proxyBaseEl.value   = d.proxyBase     || "";
+    excludeEl.value     = d.excludeDomains || "";
+    proxyBaseEl.classList.remove("invalid");
+    setQualityUI(d.quality ?? DEFAULTS.quality);
+    setWidthUI(d.maxWidth ?? DEFAULTS.maxWidth);
 
-  const s  = await chrome.storage.local.get({ stats: { filesProcessed: 0, bytesProcessed: 0, bytesSaved: 0 } });
-  const st = s.stats || {};
-  const pct = st.bytesProcessed > 0
-    ? Math.round(st.bytesSaved / st.bytesProcessed * 100) : 0;
-  statImagesEl.textContent = (st.filesProcessed || 0).toLocaleString();
-  statBytesEl.textContent  = fmtBytes(st.bytesSaved) + (pct > 0 ? ` (${pct}%)` : "");
+    const s = await chrome.storage.local.get({
+      stats: { filesProcessed: 0, bytesProcessed: 0, bytesSaved: 0 }
+    });
+    const st = s.stats || {};
+    const filesProcessed = Math.max(0, Number(st.filesProcessed) || 0);
+    const bytesProcessed = Math.max(0, Number(st.bytesProcessed) || 0);
+    const bytesSaved = Math.max(0, Number(st.bytesSaved) || 0);
+    const pct = bytesProcessed > 0
+      ? Math.round(bytesSaved / bytesProcessed * 100) : 0;
+
+    statImagesEl.textContent = Math.trunc(filesProcessed).toLocaleString();
+    statBytesEl.textContent  = fmtBytes(bytesSaved) + (pct > 0 ? ` (${pct}%)` : "");
+  } catch {}
 }
-load();
+void load();
 
 // ── Quality preset buttons ────────────────────────────────────────────────────
 
@@ -151,13 +165,25 @@ customWidthEl.addEventListener("input", () => {
 // These two feel like instant switches; everything else uses the Save button.
 
 enabledEl.addEventListener("change", async () => {
-  await chrome.storage.sync.set({ enabled: !!enabledEl.checked });
-  showToast(enabledEl.checked ? "Compression enabled" : "Compression disabled", "ok");
+  const enabled = !!enabledEl.checked;
+  try {
+    await chrome.storage.sync.set({ enabled });
+    showToast(enabled ? "Compression enabled" : "Compression disabled", "ok");
+  } catch {
+    enabledEl.checked = !enabled;
+    showToast("Could not save setting", "err");
+  }
 });
 
 grayscaleEl.addEventListener("change", async () => {
-  await chrome.storage.sync.set({ grayscale: !!grayscaleEl.checked });
-  showToast("Reload the page to apply", "warn");
+  const grayscale = !!grayscaleEl.checked;
+  try {
+    await chrome.storage.sync.set({ grayscale });
+    showToast("Reload the page to apply", "warn");
+  } catch {
+    grayscaleEl.checked = !grayscale;
+    showToast("Could not save setting", "err");
+  }
 });
 
 // ── Save ──────────────────────────────────────────────────────────────────────
@@ -172,6 +198,8 @@ function isValidUrl(str) {
 
 async function save() {
   const proxyBase = (proxyBaseEl.value || "").trim();
+  const quality = readQuality();
+  const maxWidth = readWidth();
 
   if (!isValidUrl(proxyBase)) {
     proxyBaseEl.classList.add("invalid");
@@ -179,16 +207,30 @@ async function save() {
     proxyBaseEl.focus();
     return;
   }
+  if (quality === null) {
+    showToast("Quality must be an integer from 1 to 100", "err");
+    customQualityEl.focus();
+    return;
+  }
+  if (maxWidth === null) {
+    showToast("Max width must be a whole number ≥ 0", "err");
+    customWidthEl.focus();
+    return;
+  }
+
   proxyBaseEl.classList.remove("invalid");
 
-  await chrome.storage.sync.set({
-    proxyBase,
-    quality:        readQuality(),
-    maxWidth:       readWidth(),
-    excludeDomains: (excludeEl.value || "").trim(),
-  });
-
-  showToast("Saved", "ok");
+  try {
+    await chrome.storage.sync.set({
+      proxyBase,
+      quality,
+      maxWidth,
+      excludeDomains: (excludeEl.value || "").trim(),
+    });
+    showToast("Saved", "ok");
+  } catch {
+    showToast("Could not save settings", "err");
+  }
 }
 
 // ── Reset ─────────────────────────────────────────────────────────────────────
@@ -198,22 +240,31 @@ async function resetAll() {
   // bottom action bar, which on a phone-sized screen is an easy mis-tap —
   // and a silent reset wipes the proxy URL along with everything else.
   if (!confirm("Reset all settings to defaults? This clears your proxy URL, quality, and exclusions.")) return;
-  await chrome.storage.sync.set(DEFAULTS);
-  await load();
-  showToast("Reset to defaults");
+  try {
+    await chrome.storage.sync.set(DEFAULTS);
+    await load();
+    showToast("Reset to defaults");
+  } catch {
+    showToast("Could not reset settings", "err");
+  }
 }
 
 async function resetStats() {
-  await chrome.storage.local.set({ stats: { filesProcessed: 0, bytesProcessed: 0, bytesSaved: 0 } });
-  await load();
-  showToast("Stats cleared");
+  try {
+    await chrome.storage.local.set({ stats: { filesProcessed: 0, bytesProcessed: 0, bytesSaved: 0 } });
+    await load();
+    showToast("Stats cleared");
+  } catch {
+    showToast("Could not clear stats", "err");
+  }
 }
 
 // ── Test proxy ────────────────────────────────────────────────────────────────
 // AbortSignal.timeout() requires Chromium 103+. Kiwi/Cromite may be older.
 
 function fetchWithTimeout(url, ms) {
-  if (typeof AbortSignal?.timeout === "function") {
+  if (typeof AbortSignal !== "undefined" &&
+      typeof AbortSignal.timeout === "function") {
     return fetch(url, { signal: AbortSignal.timeout(ms) });
   }
   const ctrl = new AbortController();
