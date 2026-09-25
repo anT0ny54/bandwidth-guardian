@@ -1,4 +1,4 @@
-import { DEFAULTS } from "./defaults.js";
+import { DEFAULTS, parseDomains } from "./defaults.js";
 
 const $ = id => document.getElementById(id);
 
@@ -20,15 +20,10 @@ let currentHost  = "";
 let currentIsWeb = false;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-
-function parseDomains(text) {
-  return String(text || "")
-    .split(/[,\s]+/)
-    .map(s => s.trim().toLowerCase()).filter(Boolean)
-    .map(s => s.replace(/^https?:\/\//, "").split("/")[0])
-    .map(s => s.replace(/^\*?\./, "").replace(/\.$/, ""))
-    .filter(Boolean);
-}
+// parseDomains lives in defaults.js (options.js only needs the raw
+// excludeDomains string for its textarea, no parsing) so this file no longer
+// keeps its own independently maintained copy of the same normalization
+// shared.js's bhDomainSet already does for content scripts.
 
 function matchingExcludedDomain(host, domains) {
   let match = "";
@@ -185,8 +180,12 @@ settingsBtn.addEventListener("click", () => {
 });
 
 // ── Sync with changes made on the settings page ───────────────────────────────
+// Also refreshes the site card: if the settings page adds/removes an
+// exclusion (or the proxy is toggled) while the popup is still open, the
+// "Excluded" pill and button label need to reflect it too, not just the
+// toggle/quality controls above.
 
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== "sync") return;
-  chrome.storage.sync.get(DEFAULTS, applyUI);
+  chrome.storage.sync.get(DEFAULTS, d => { applyUI(d); loadSiteUI(d); });
 });

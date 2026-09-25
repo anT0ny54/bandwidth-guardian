@@ -21,3 +21,19 @@ export const DEFAULTS = {
   excludeDomains: "google.com gstatic.com challenges.cloudflare.com",
   isWebpSupported: false, // detected at install/startup; used to decide jpeg= param
 };
+
+// Normalizes a space/comma-separated excludeDomains string into a clean
+// array of bare hostnames (lowercased, no scheme/path, no leading "*."/".",
+// no trailing "."). Mirrors shared.js's bhDomainSet, which content scripts
+// use for the same parsing — that file can't be imported here since it's a
+// plain script meant for the content-script world, not an ES module. Used
+// by popup.js (to find/toggle the current site's exclusion); options.js
+// only needs the raw string for its textarea, so it doesn't call this.
+export function parseDomains(text) {
+  return String(text || "")
+    .split(/[,\s]+/)
+    .map(s => s.trim().toLowerCase()).filter(Boolean)
+    .map(s => s.replace(/^https?:\/\//, "").split("/")[0])
+    .map(s => s.replace(/^\*?\./, "").replace(/\.$/, ""))
+    .filter(Boolean);
+}

@@ -72,6 +72,18 @@ const BH_TRACKING_PATTERNS = [
 function bhSafeURL(u) { try { return new URL(u); } catch { return null; } }
 function bhIsHttp(u) { return /^https?:\/\//i.test(u); }
 
+// Captured here, before prehook.js patches HTMLImageElement.prototype.src —
+// shared.js is guaranteed to run first (manifest.json content_scripts order).
+// prehook.js reuses this instead of capturing its own copy, and content.js
+// uses it to write already-decided proxy URLs straight to the DOM. Without
+// a shared reference, a file that queries
+// Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, "src") after
+// prehook.js has run gets prehook's *patched* descriptor back, not the
+// browser's real one, and silently re-enters prehook's setter instead of
+// bypassing it (see content.js's rewriteImg for where this used to happen).
+const BH_NATIVE_IMG_SRC_DESC = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, "src");
+function bhNativeSetImgSrc(el, v) { BH_NATIVE_IMG_SRC_DESC.set.call(el, v); }
+
 function bhDomainSet(text) {
   return new Set(
     String(text || "").split(/[,\s]+/)

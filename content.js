@@ -86,9 +86,12 @@
         const u = bhSafeURL(src);
         if (u && !bhShouldSkip(src, u.hostname, opts, location.hostname)) {
           try {
-            // Use native src setter to avoid triggering prehook's patch again.
-            Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, "src")
-              ?.set?.call(el, bhBuildProxyUrl(src, opts));
+            // bhNativeSetImgSrc (shared.js) is the descriptor captured before
+            // prehook.js patched HTMLImageElement.prototype.src. Querying the
+            // prototype for it here instead would return prehook's *patched*
+            // setter — silently re-entering it with an already-proxied URL —
+            // since prehook.js has already run by the time this file does.
+            bhNativeSetImgSrc(el, bhBuildProxyUrl(src, opts));
             rewrote = true;
           } catch { /* illegal invocation on an unexpected element type */ }
         }

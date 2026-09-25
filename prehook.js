@@ -18,15 +18,18 @@
   bhOnReady(o => { opts = o; ready = true; flushPending(); });
   bhOnOptsChange(o => { opts = o; ready = true; });
 
-  // Capture native property descriptors BEFORE we patch them
+  // Capture native property descriptors BEFORE we patch them.
+  // src's descriptor is BH_NATIVE_IMG_SRC_DESC from shared.js (captured
+  // there, before this file runs, so content.js can also reuse the same
+  // true-native reference — see the comment on it in shared.js).
   const imgProto = HTMLImageElement.prototype;
-  const srcDesc = Object.getOwnPropertyDescriptor(imgProto, "src");
+  const srcDesc = BH_NATIVE_IMG_SRC_DESC;
   const srcsetDesc = Object.getOwnPropertyDescriptor(imgProto, "srcset");
   const setAttr = Element.prototype.setAttribute;
   const sourceProto = typeof HTMLSourceElement !== "undefined" ? HTMLSourceElement.prototype : null;
   const sourceSrcsetDesc = sourceProto ? Object.getOwnPropertyDescriptor(sourceProto, "srcset") : null;
 
-  function nativeSetSrc(el, v) { srcDesc.set.call(el, v); }
+  function nativeSetSrc(el, v) { bhNativeSetImgSrc(el, v); }
   function nativeSetSrcset(el, v) { srcsetDesc?.set?.call(el, v); }
   function nativeSourceSetSrcset(el, v) { sourceSrcsetDesc?.set?.call(el, v); }
 
