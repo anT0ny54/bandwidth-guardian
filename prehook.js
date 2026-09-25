@@ -25,6 +25,7 @@
     maxWidth: 1280,
     excludeDomains: "google.com gstatic.com challenges.cloudflare.com",
     isWebpSupported: false,
+    directFallback: false,
   };
 
   // If an extension/browser edge case prevents the isolated-world settings
@@ -41,11 +42,10 @@
   const pendingSrcset = new WeakMap();
   const pendingLinkHref = new WeakMap();
 
-  // A resource element gets at most one direct-origin retry for the current
-  // page-assigned resource. Error events can be duplicated while currentSrc
-  // still reports the failed proxy candidate, so URL inspection alone is not
-  // sufficient to enforce a true one-retry guarantee.
-  const fallbackRetried = new WeakSet();
+  // Failed proxy loads first get one compatibility-rescue retry that stays on
+  // the proxy. Direct-origin fallback is opt-in because it can expose the
+  // origin request (and its DNS lookup) to the browser.
+  const fallbackState = new WeakMap();
 
   const proxySignatures = new Set();
 
@@ -237,6 +237,10 @@
         source.isWebpSupported === undefined
           ? DEFAULTS.isWebpSupported
           : source.isWebpSupported === true,
+      directFallback:
+        source.directFallback === undefined
+          ? DEFAULTS.directFallback
+          : source.directFallback === true,
     };
   }
 
@@ -281,6 +285,42 @@
     return safeURL(original)?.href || null;
   }
 
+  function recoveryProxyUrl(value) {
+    const proxy = safeURL(value);
+    if (!proxy || !looksLikeGeneratedProxy(proxy.href)) return null;
+
+    const before = proxy.href;
+    // Rescue common format/transform failures without ever contacting the
+    // original host directly: force JPEG, disable grayscale, and remove the
+    // size constraint. The proxy still performs the upstream fetch.
+    proxy.searchParams.set("jpeg", "1");
+    proxy.searchParams.set("bw", "0");
+    proxy.searchParams.delete("max_width");
+
+    return proxy.href !== before ? proxy.href : null;
+  }
+
+  function replaceGeneratedCandidate(raw, currentProxy, replacement) {
+    const value = String(raw || "");
+    if (!value) return { changed: false, value };
+
+    let changed = false;
+    const replaced = value.split(",").map(part => {
+      const m = part.trim().match(/^(\S+)(\s+.+)?$/);
+      if (!m) return part;
+
+      const token = m[1];
+      const u = safeURL(token);
+      if (!u || !looksLikeGeneratedProxy(u.href)) return part;
+      if (u.href !== currentProxy) return part;
+
+      changed = true;
+      return replacement + (m[2] || "");
+    }).join(", ");
+
+    return { changed, value: replaced };
+  }
+
   function restoreProxySrcset(raw) {
     const value = String(raw || "");
     if (!value) return { changed: false, value };
@@ -302,13 +342,74 @@
 
   function restoreFailedImage(img) {
     if (!(img instanceof HTMLImageElement)) return false;
-    if (fallbackRetried.has(img)) return false;
+
+    const state = fallbackState.get(img) || { rescueTried: false, directTried: false };
+    const rawSrc = img.getAttribute("src") || "";
+    const currentProxy = originalUrlFromProxy(rawSrc)
+      ? safeURL(rawSrc)?.href
+      : originalUrlFromProxy(img.currentSrc || "")
+        ? safeURL(img.currentSrc)?.href
+        : null;
+
+    // First failure: stay entirely on the proxy and retry with a compatibility
+    // profile that avoids common image-format/transform failures.
+    if (!state.rescueTried && currentProxy) {
+      const rescue = recoveryProxyUrl(currentProxy);
+      if (rescue) {
+        let changed = false;
+
+        if (safeURL(rawSrc)?.href === currentProxy) {
+          pendingSrc.delete(img);
+          srcDesc.set.call(img, rescue);
+          notifyFallbackMutation(img);
+          changed = true;
+        }
+
+        const rawImgSrcset = img.getAttribute("srcset");
+        if (rawImgSrcset) {
+          const replaced = replaceGeneratedCandidate(rawImgSrcset, currentProxy, rescue);
+          if (replaced.changed) {
+            nativeSetSrcset(img, replaced.value, false);
+            notifyFallbackMutation(img);
+            changed = true;
+          }
+        }
+
+        const picture = img.parentElement?.tagName === "PICTURE"
+          ? img.parentElement
+          : null;
+        if (picture) {
+          for (const source of picture.querySelectorAll("source[srcset]")) {
+            const raw = source.getAttribute("srcset");
+            const replaced = replaceGeneratedCandidate(raw, currentProxy, rescue);
+            if (replaced.changed) {
+              nativeSetSrcset(source, replaced.value, true);
+              notifyFallbackMutation(source);
+              changed = true;
+            }
+          }
+        }
+
+        if (!changed && safeURL(img.currentSrc)?.href === currentProxy) {
+          pendingSrc.delete(img);
+          srcDesc.set.call(img, rescue);
+          notifyFallbackMutation(img);
+          changed = true;
+        }
+
+        state.rescueTried = true;
+        fallbackState.set(img, state);
+        if (changed) return true;
+      } else {
+        state.rescueTried = true;
+        fallbackState.set(img, state);
+      }
+    }
+
+    if (!opts?.directFallback || state.directTried) return false;
 
     let changed = false;
 
-    // Restore <img srcset> and any <picture><source srcset> candidates first.
-    // This matters when currentSrc is the failing proxy candidate rather than
-    // the image's plain `src` attribute.
     const rawImgSrcset = img.getAttribute("srcset");
     if (rawImgSrcset) {
       const restored = restoreProxySrcset(rawImgSrcset);
@@ -334,35 +435,52 @@
       }
     }
 
-    const rawSrc = img.getAttribute("src") || "";
-    const originalSrc = originalUrlFromProxy(rawSrc) ||
+    const originalSrc = originalUrlFromProxy(img.getAttribute("src") || "") ||
       originalUrlFromProxy(img.currentSrc || "");
     if (originalSrc) {
-      // Use the saved native descriptor so the MAIN-world hook cannot wrap the
-      // fallback back through the proxy. The error handler removes the proxy
-      // candidate, so this is a single direct retry.
       pendingSrc.delete(img);
       srcDesc.set.call(img, originalSrc);
       notifyFallbackMutation(img);
       changed = true;
     }
 
-    if (changed) fallbackRetried.add(img);
+    if (changed) {
+      state.directTried = true;
+      fallbackState.set(img, state);
+    }
     return changed;
   }
 
   function restoreFailedPreload(link) {
     if (!link || link.tagName !== "LINK") return false;
-    if (fallbackRetried.has(link)) return false;
+
+    const state = fallbackState.get(link) || { rescueTried: false, directTried: false };
+    const current = link.getAttribute("href") || "";
+
+    if (!state.rescueTried) {
+      const rescue = recoveryProxyUrl(current);
+      state.rescueTried = true;
+      fallbackState.set(link, state);
+      if (rescue) {
+        pendingLinkHref.delete(link);
+        linkHrefDesc?.set?.call(link, rescue);
+        notifyFallbackMutation(link);
+        return true;
+      }
+    }
+
+    if (!opts?.directFallback || state.directTried) return false;
 
     const original = originalUrlFromProxy(link.getAttribute("href") || "");
     if (!original) return false;
     pendingLinkHref.delete(link);
     linkHrefDesc?.set?.call(link, original);
     notifyFallbackMutation(link);
-    fallbackRetried.add(link);
+    state.directTried = true;
+    fallbackState.set(link, state);
     return true;
   }
+
 
   // Catch network failures from parser-created images too. The listener is in
   // the MAIN world and uses capture because `error` does not bubble from images.
@@ -505,7 +623,7 @@
           if (!forcePassthrough && ready && opts?.enabled && opts.proxyBase && target &&
               !shouldSkip(target.href, target.hostname, opts, location.hostname)) {
             srcDesc.set.call(el, buildProxyUrl(raw, opts, target));
-          } else {
+          } else if (forcePassthrough || opts?.directFallback === true || !target) {
             srcDesc.set.call(el, raw);
           }
         }
@@ -514,7 +632,9 @@
           const raw = pendingSrcset.get(el);
           pendingSrcset.delete(el);
           if (forcePassthrough || !ready) {
-            clearAndSetNativeSrcset(el, raw, el.tagName === "SOURCE");
+            if (forcePassthrough || opts?.directFallback === true) {
+              clearAndSetNativeSrcset(el, raw, el.tagName === "SOURCE");
+            }
           } else {
             clearAndSetNativeSrcset(el, rewriteSrcset(raw), el.tagName === "SOURCE");
           }
@@ -524,7 +644,9 @@
           const raw = pendingLinkHref.get(el);
           pendingLinkHref.delete(el);
           if (forcePassthrough || !ready) {
-            nativeSetLinkHref(el, raw);
+            if (forcePassthrough || opts?.directFallback === true) {
+              nativeSetLinkHref(el, raw);
+            }
           } else {
             decideLinkHref(el, raw, false);
           }
@@ -559,7 +681,7 @@
     set(value) {
       try {
         const raw = String(value);
-        fallbackRetried.delete(this);
+        fallbackState.delete(this);
         const decision = decide(raw);
         if (decision.hold) {
           pendingSrc.set(this, raw);
@@ -590,7 +712,7 @@
     set(value) {
       try {
         const raw = String(value);
-        fallbackRetried.delete(this);
+        fallbackState.delete(this);
         if (!ready) {
           pendingSrcset.set(this, raw);
           queueElement(this);
@@ -617,7 +739,7 @@
       set(value) {
         try {
           const raw = String(value);
-          fallbackRetried.delete(this);
+          fallbackState.delete(this);
           if (!ready) {
             pendingSrcset.set(this, raw);
             queueElement(this);
@@ -642,7 +764,7 @@
 
     if (n === "src" && this instanceof HTMLImageElement) {
       const raw = String(value);
-      fallbackRetried.delete(this);
+      fallbackState.delete(this);
       const decision = decide(raw);
       if (decision.hold) {
         pendingSrc.set(this, raw);
@@ -658,7 +780,7 @@
         (this instanceof HTMLImageElement ||
          (sourceProto && sourceProto.isPrototypeOf(this)))) {
       const raw = String(value);
-      fallbackRetried.delete(this);
+      fallbackState.delete(this);
       if (!ready) {
         pendingSrcset.set(this, raw);
         queueElement(this);
@@ -670,7 +792,7 @@
 
     if (n === "href" && linkProto && linkProto.isPrototypeOf(this)) {
       const raw = String(value);
-      fallbackRetried.delete(this);
+      fallbackState.delete(this);
       if (isImagePreload(this)) {
         decideLinkHref(this, raw);
         return;
@@ -680,7 +802,7 @@
     }
 
     if ((n === "rel" || n === "as") && linkProto && linkProto.isPrototypeOf(this)) {
-      fallbackRetried.delete(this);
+      fallbackState.delete(this);
       if (n === "rel") prepareLinkActivation(this, String(value), undefined);
       else prepareLinkActivation(this, undefined, String(value));
       return setAttr.call(this, n, value);
@@ -693,17 +815,17 @@
   Element.prototype.removeAttribute = function(name) {
     const n = String(name).toLowerCase();
     if (n === "src" && this instanceof HTMLImageElement) {
-      fallbackRetried.delete(this);
+      fallbackState.delete(this);
       pendingSrc.delete(this);
       unqueueIfIdle(this);
     } else if (n === "srcset" &&
                (this instanceof HTMLImageElement ||
                 (sourceProto && sourceProto.isPrototypeOf(this)))) {
-      fallbackRetried.delete(this);
+      fallbackState.delete(this);
       pendingSrcset.delete(this);
       unqueueIfIdle(this);
     } else if (n === "href" && linkProto && linkProto.isPrototypeOf(this)) {
-      fallbackRetried.delete(this);
+      fallbackState.delete(this);
       pendingLinkHref.delete(this);
       unqueueIfIdle(this);
     }
@@ -723,7 +845,7 @@
       set(value) {
         try {
           const raw = String(value ?? "");
-          fallbackRetried.delete(this);
+          fallbackState.delete(this);
           if (isImagePreload(this)) {
             decideLinkHref(this, raw);
           } else {
@@ -745,7 +867,7 @@
       get() { return linkRelDesc.get.call(this); },
       set(value) {
         try {
-          fallbackRetried.delete(this);
+          fallbackState.delete(this);
           prepareLinkActivation(this, String(value ?? ""), undefined);
           linkRelDesc.set.call(this, value);
           if (ready && isImagePreload(this)) {
@@ -765,7 +887,7 @@
       get() { return linkAsDesc.get.call(this); },
       set(value) {
         try {
-          fallbackRetried.delete(this);
+          fallbackState.delete(this);
           prepareLinkActivation(this, undefined, String(value ?? ""));
           linkAsDesc.set.call(this, value);
           if (ready && isImagePreload(this)) {
@@ -809,7 +931,9 @@
     if (!ready) {
       ready = true;
       opts = { ...DEFAULTS, excludeDomains: DEFAULTS.excludeDomains };
-      flushPending(true);
+      // Do not release held HTTP URLs directly when privacy mode is active.
+      // A bridge/storage failure must not become a hidden origin request.
+      flushPending(DEFAULTS.directFallback === true);
     }
     fallbackTimer = null;
   }, SETTINGS_TIMEOUT_MS);

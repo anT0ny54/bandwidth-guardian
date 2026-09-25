@@ -35,6 +35,7 @@ const DEFAULTS = {
   maxWidth:        1280,
   excludeDomains:  "google.com gstatic.com challenges.cloudflare.com",
   isWebpSupported: false,
+  directFallback:  false,
 };
 
 function isValidProxyBase(value) {
@@ -65,6 +66,10 @@ function normalizeOptions(raw) {
       d.isWebpSupported === undefined
         ? DEFAULTS.isWebpSupported
         : d.isWebpSupported === true,
+    directFallback:
+      d.directFallback === undefined
+        ? DEFAULTS.directFallback
+        : d.directFallback === true,
   };
 }
 

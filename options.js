@@ -4,6 +4,7 @@ const $ = id => document.getElementById(id);
 
 const enabledEl      = $("enabled");
 const grayscaleEl    = $("grayscale");
+const directFallbackEl = $("directFallback");
 const proxyBaseEl    = $("proxyBase");
 const testProxyBtn   = $("testProxy");
 const excludeEl      = $("excludeDomains");
@@ -99,6 +100,7 @@ async function load() {
     const d = await chrome.storage.sync.get(DEFAULTS);
     enabledEl.checked   = !!d.enabled;
     grayscaleEl.checked = !!d.grayscale;
+    directFallbackEl.checked = !!d.directFallback;
     proxyBaseEl.value   = d.proxyBase     || "";
     excludeEl.value     = d.excludeDomains || "";
     proxyBaseEl.classList.remove("invalid");
@@ -226,6 +228,7 @@ async function save() {
       quality,
       maxWidth,
       excludeDomains: (excludeEl.value || "").trim(),
+      directFallback: !!directFallbackEl.checked,
     });
     showToast("Saved", "ok");
   } catch {

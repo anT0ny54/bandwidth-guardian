@@ -18,6 +18,7 @@ const BH_DEFAULTS = {
   maxWidth:        1280,
   excludeDomains:  "google.com gstatic.com challenges.cloudflare.com",
   isWebpSupported: false,
+  directFallback:  false,
 };
 
 // Tracking-pixel URL patterns (ported from the original bandwidth-hero's
@@ -181,6 +182,10 @@ function bhNormalizeOpts(raw) {
       d.isWebpSupported === undefined
         ? BH_DEFAULTS.isWebpSupported
         : d.isWebpSupported === true,
+    directFallback:
+      d.directFallback === undefined
+        ? BH_DEFAULTS.directFallback
+        : d.directFallback === true,
   };
 }
 

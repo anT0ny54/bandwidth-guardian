@@ -40,6 +40,12 @@
   const doneBg = new WeakSet();
   const donePreload = new WeakSet();
 
+  // Background-image loads do not emit an element-level error event. Probe the
+  // generated proxy URL with an Image() object so failed proxy transforms can
+  // get the same proxy-only rescue used by prehook.js. The probe normally
+  // coalesces with the browser's CSS image request or becomes a cache hit.
+  const bgFallbackState = new WeakMap();
+
   // prehook.js runs in the MAIN world, while this observer runs in the
   // extension's ISOLATED world. A fallback mutation must cross that world
   // boundary so this observer does not immediately proxy the restored URL.
@@ -179,6 +185,111 @@
     if (rewrote) doneLazy.add(el);
   }
 
+  function recoveryProxyUrl(value) {
+    try {
+      const proxy = new URL(String(value || ""));
+      if (!bhLooksLikeGeneratedProxy(proxy.href)) return null;
+
+      const before = proxy.href;
+      proxy.searchParams.set("jpeg", "1");
+      proxy.searchParams.set("bw", "0");
+      proxy.searchParams.delete("max_width");
+
+      return proxy.href !== before ? proxy.href : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function originalUrlFromProxy(value) {
+    try {
+      const proxy = new URL(String(value || ""));
+      if (!bhLooksLikeGeneratedProxy(proxy.href)) return null;
+      return bhResolveHttpURL(proxy.searchParams.get("url"))?.href || null;
+    } catch {
+      return null;
+    }
+  }
+
+  function replaceBackgroundUrl(el, fromUrl, toUrl) {
+    const css = el.style?.backgroundImage;
+    if (!css) return false;
+
+    let changed = false;
+    const replaced = css.replace(
+      /url\(\s*(?:"([^"]*)"|'([^']*)'|([^)]*))\s*\)/gi,
+      (full, doubleQuoted, singleQuoted, unquoted) => {
+        const raw = String(doubleQuoted ?? singleQuoted ?? unquoted ?? "").trim();
+        let current = "";
+        try { current = new URL(raw, document.baseURI || location.href).href; } catch {}
+        if (current !== fromUrl) return full;
+
+        changed = true;
+        return `url("${String(toUrl).replace(/"/g, '\\\\"')}")`;
+      }
+    );
+
+    if (!changed) return false;
+    markInternal(el, "style");
+    el.style.backgroundImage = replaced;
+    return true;
+  }
+
+  function watchBackgroundProxy(el, css) {
+    const urls = [];
+    css.replace(
+      /url\(\s*(?:"([^"]*)"|'([^']*)'|([^)]*))\s*\)/gi,
+      (full, doubleQuoted, singleQuoted, unquoted) => {
+        const raw = String(doubleQuoted ?? singleQuoted ?? unquoted ?? "").trim();
+        try {
+          const u = new URL(raw, document.baseURI || location.href);
+          if (bhLooksLikeGeneratedProxy(u.href)) urls.push(u.href);
+        } catch {}
+        return full;
+      }
+    );
+
+    if (!urls.length) return;
+
+    const state = bgFallbackState.get(el) || { rescued: new Set(), direct: new Set() };
+
+    for (const proxyUrl of urls) {
+      if (state.rescued.has(proxyUrl) || state.direct.has(proxyUrl)) continue;
+
+      const probe = new Image();
+      probe.decoding = "async";
+      probe.onload = () => {};
+      probe.onerror = () => {
+        try {
+          const next = recoveryProxyUrl(proxyUrl);
+          if (next && !state.rescued.has(proxyUrl)) {
+            if (replaceBackgroundUrl(el, proxyUrl, next)) {
+              state.rescued.add(proxyUrl);
+              bgFallbackState.set(el, state);
+              watchBackgroundProxy(el, el.style.backgroundImage || "");
+              return;
+            }
+            state.rescued.add(proxyUrl);
+          }
+
+          if (!opts?.directFallback || state.direct.has(proxyUrl)) {
+            bgFallbackState.set(el, state);
+            return;
+          }
+
+          const original = originalUrlFromProxy(proxyUrl);
+          if (original && replaceBackgroundUrl(el, proxyUrl, original)) {
+            state.direct.add(proxyUrl);
+            bgFallbackState.set(el, state);
+          }
+        } catch {}
+      };
+      probe.src = proxyUrl;
+    }
+
+    bgFallbackState.set(el, state);
+  }
+
   function rewriteBg(el) {
     if (!el || doneBg.has(el)) return;
     if (!opts?.proxyBase || !opts?.enabled) return;
@@ -207,6 +318,7 @@
       markInternal(el, "style");
       el.style.backgroundImage = rewritten;
       doneBg.add(el);
+      watchBackgroundProxy(el, rewritten);
     }
   }
 
