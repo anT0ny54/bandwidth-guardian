@@ -35,7 +35,7 @@ Works on **Chrome**, **Kiwi Browser**, **Cromite**, and any Chromium-based brows
 
 ```bash
 bash build.sh
-# outputs: dist/bandwidth-guardian-<version>.zip, e.g. bandwidth-guardian-0.0.8.zip
+# outputs: dist/bandwidth-guardian-<version>.zip, e.g. bandwidth-guardian-x.x.x.zip
 # (the version always comes from manifest.json, not a hard-coded number)
 ```
 
@@ -90,12 +90,6 @@ bandwidth-guardian/
 ├── CHANGELOG.md                # Version history
 └── .github/workflows/build.yml # CI: build + attach zip to every release tag
 ```
-
----
-
-## Contributing
-
-Pull requests are welcome. Please open an issue first for anything beyond a small bug fix.
 
 ---
 
