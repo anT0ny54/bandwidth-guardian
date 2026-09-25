@@ -18,7 +18,6 @@ Works on **Chrome**, **Kiwi Browser**, **Cromite**, and any Chromium-based brows
 - **Per-site exclusions** — skip domains that shouldn't be proxied
 - **Usage stats** — tracks images processed and bytes saved via proxy response headers
 - **CSP stripping** — removes Content-Security-Policy headers that would block proxy-served images
-- **Proxy-only failure rescue** — when a transformed image fails, the extension first retries through the proxy with a compatibility profile (JPEG, color, no max-width limit). This avoids turning a proxy error into a direct-origin request by default
 
 ---
 
@@ -36,7 +35,7 @@ Works on **Chrome**, **Kiwi Browser**, **Cromite**, and any Chromium-based brows
 
 ```bash
 bash build.sh
-# outputs: bandwidth-guardian-*.zip
+# outputs: bandwidth-guardian-0.0.7.zip
 ```
 
 The build script produces a deterministic zip using a fixed timestamp so the output is byte-for-byte reproducible on any machine.
@@ -58,31 +57,17 @@ The proxy must:
 
 ## Architecture
 
-Image interception uses two execution worlds at `document_start`:
+Image interception uses three content scripts injected at `document_start`, in this order:
 
-| Script | World | Role |
-|---|---|---|
-| `prehook.js` | `MAIN` | Installs synchronous hooks for page JavaScript: `HTMLImageElement.src`, `srcset`, `Element.setAttribute()`, dynamic `<picture><source srcset>`, and image preloads (`<link rel="preload" as="image">`). HTTP URLs are held briefly until settings arrive, so JS-created images do not start as original full-size requests. |
-| `shared.js` | `ISOLATED` | Owns the extension-side URL decision/build logic and storage loader. It bridges the current settings to the MAIN-world prehook without exposing `chrome.*` APIs to page code. |
-| `content.js` | `ISOLATED` | Handles parser-created `<img>` / `<picture>` markup after settings load, lazy `data-*` attributes, inline CSS backgrounds, dynamic DOM additions, and parser-created image preloads. It also warms the proxy connection with `preconnect` / `dns-prefetch`. |
+| Script | Role |
+|---|---|
+| `shared.js` | Single source of truth for default settings, tracking-pixel patterns, the "should this URL be proxied?" decision, and the proxy-URL builder. Loaded first so `prehook.js` and `content.js` — which run in the same per-frame isolated world — see it as ordinary globals instead of each keeping their own copy. |
+| `prehook.js` | Patches `HTMLImageElement.prototype.src`, `srcset`, `setAttribute`, and `Image()` before the HTML parser runs. Catches all JS-set images with zero wasted bytes. |
+| `content.js` | Rewrites HTML-parsed `<img src>`, srcset, lazy `data-*` attributes, and inline `background-image` after settings load. Also injects `<link rel="preconnect">` to warm the proxy connection. |
 
-Chrome documents `ISOLATED` and `MAIN` as separate execution worlds; a prototype patch made in an isolated content-script world does not patch the page's own JavaScript environment. The MAIN-world hook is therefore necessary for true JavaScript-assignment interception. The manifest-level `world: "MAIN"` declaration is supported on Chrome 111+. See the [Chrome content scripts documentation](https://developer.chrome.com/docs/extensions/develop/concepts/content-scripts).
+Settings are mirrored from `storage.sync` to `storage.local` by the service worker so content scripts can read them in ~5 ms instead of ~30–80 ms.
 
-Settings are mirrored from `storage.sync` to `storage.local` by the service worker so the isolated scripts can normally load them quickly, with a sync-storage fallback for startup/compatibility edge cases. If the MAIN-world settings bridge times out, held HTTP image URLs are not released directly by default.
-
-DNR is used only to strip CSP headers — image redirection remains in content scripts because MV3 `regexSubstitution` cannot safely URL-encode the captured source URL.
-
-### Important limitations
-
-Parser-created images and preloads can begin loading before the asynchronous storage callback is available. The extension minimizes this window with `document_start`, the local settings mirror, and the synchronous MAIN-world prehook for JavaScript-created resources. It cannot provide the same zero-byte guarantee for every resource emitted directly by the HTML parser because MV3 does not provide a blocking `webRequest` path for this use case.
-
-Some origins reject server-side image fetches with HTTP 403 or otherwise make the proxy request fail even though the image loads normally in the browser. Bandwidth Guardian first retries the generated proxy URL with a compatibility profile (`jpeg=1`, `bw=0`, and no `max_width`) so common transform/format failures can recover without contacting the original host directly. A final direct-origin retry is available as the **Direct fallback** option, but it is disabled by default because that path can expose the origin DNS lookup and request to the browser.
-
-### Privacy / DNS limitation
-
-The extension no longer creates a direct-origin retry by default, and the settings-timeout path no longer releases held HTTP URLs directly. This closes the extension-controlled direct fallback DNS leak while preserving a proxy-only recovery path.
-
-Manifest V3 still does not provide a general blocking `webRequest` path to synchronously rewrite every parser-created image request. Because of that platform limitation, this extension cannot honestly guarantee zero original-host DNS/network visibility for every HTML/CSS resource without using a broad network block that would also break resources the content script cannot safely rewrite (for example some stylesheet background images). The implementation therefore avoids that web-breaking trade-off.
+DNR is used only to strip CSP headers — image redirection is done in content scripts because Chrome's `regexSubstitution` cannot `encodeURIComponent`, which breaks any image URL containing query parameters.
 
 ---
 
@@ -92,9 +77,9 @@ Manifest V3 still does not provide a general blocking `webRequest` path to synch
 bandwidth-guardian/
 ├── _locales/en/messages.json   # Extension name and description (i18n)
 ├── icons/                      # 16 / 32 / 48 / 128 px, active + disabled
-├── shared.js                   # Isolated-world settings + URL logic
-├── prehook.js                  # MAIN-world synchronous image/preload hook
-├── content.js                  # Isolated-world parser/DOM rewriter
+├── shared.js                   # Shared content-script constants + URL logic
+├── prehook.js                  # Layer 1 prototype patcher
+├── content.js                  # Layer 2 image rewriter
 ├── defaults.js                 # Defaults for popup.js / options.js (ES module)
 ├── manifest.json
 ├── options.html / options.js   # Full settings page
@@ -102,7 +87,7 @@ bandwidth-guardian/
 ├── service-worker.js           # DNR rules, storage mirror, icon, stats
 ├── build.sh                    # Reproducible zip builder
 ├── CHANGELOG.md                # Version history
-└── .github/workflows/build.yml # CI: build on main; publish releases on v* tags
+└── .github/workflows/build.yml # CI: build + attach zip to every release tag
 ```
 
 ---

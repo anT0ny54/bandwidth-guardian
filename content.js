@@ -1,162 +1,124 @@
-// Bandwidth Guardian — isolated-world content script
+// Bandwidth Guardian — content script
 //
-// The MAIN-world prehook handles synchronous JavaScript assignments. This
-// isolated script handles parser-created markup after settings load, lazy
-// attributes, inline backgrounds, dynamic DOM additions, and image preloads.
-// Keeping DOM scans here avoids exposing the extension's chrome.* APIs to page
-// code while still catching the parser path that JavaScript hooks cannot see.
+// ══ ARCHITECTURE ══════════════════════════════════════════════════════════════
+//
+//  Image interception is split across two layers, sharing constants and
+//  URL-decision logic from shared.js (loaded first — see manifest.json):
+//
+//  Layer 1 — prehook.js (document_start, synchronous)
+//    Patches HTMLImageElement.prototype.src, srcset, setAttribute, and Image()
+//    BEFORE the HTML parser runs. Catches all images set via JavaScript.
+//    Zero wasted bytes — proxy URL is set before any network request fires.
+//
+//  Layer 2 — THIS FILE (document_start, async after storage read)
+//    Catches three categories that prehook cannot:
+//
+//    A) HTML-parsed <img src="..."> attributes — the browser's C++ HTML parser
+//       sets src natively, bypassing our JS property-setter patch. By the time
+//       this script's storage callback fires (~5–50ms), the browser may have
+//       already started fetching the original image. Rewriting src here causes
+//       the browser to cancel the in-flight original request and fetch from the
+//       proxy instead. A tiny amount of the original image's bytes may already
+//       be in flight — this is unavoidable in MV3 (webRequestBlocking was
+//       removed). The alternative (DNR redirect) cannot URL-encode the captured
+//       URL, producing malformed proxy requests for any URL with query params.
+//
+//    B) Lazy-load data attributes (data-src, data-lazy-src…) — rewritten so
+//       that when a lazy-loader later does img.src = img.dataset.src, prehook
+//       receives the (already) proxy URL. bhShouldSkip()'s "already proxied"
+//       check (shared.js) means prehook recognizes that and leaves it alone
+//       instead of wrapping it in the proxy a second time.
+//
+//    C) Inline CSS background-image — rewritten via el.style.backgroundImage.
+//       Best-effort: stylesheet-defined backgrounds may already be loading.
+//
+//  The previous approach of using DNR regexSubstitution for image redirects
+//  was removed because DNR cannot call encodeURIComponent. Any image URL
+//  with query params (e.g. tvguide.com/img.jpg?auto=webp&width=1092) would
+//  produce a malformed proxy URL with the original query params orphaned into
+//  the proxy's own query string, silently breaking compression for those images.
+//
+// ══════════════════════════════════════════════════════════════════════════════
 
-(() => {
-  "use strict";
-
-  const FALLBACK_EVENT = "__bandwidth_guardian_fallback__";
-
+(function () {
+  // Lazy-load attributes used by common image libraries
   const LAZY_ATTRS = [
     "data-src", "data-iurl", "data-lazy-src", "data-original",
     "data-url", "data-hi-res", "data-lazy", "data-echo"
   ];
 
-  // Cheap selectors: only inspect nodes that can actually contain our targets.
+  // Elements whose inline style could carry a background-image. Matching on
+  // the attribute directly — instead of every div/section/article/header/
+  // footer/aside/main/figure/li/a/span/td/th on the page — keeps the full-page
+  // scan cheap even on large, image-heavy pages: the broad tag list this used
+  // to include walked thousands of elements that could never have an inline
+  // background. The "i" flag also catches style="Background-Image:...".
   const BG_SELECTOR = "[style*='background' i]";
-  const LAZY_SELECTOR =
-    LAZY_ATTRS.concat(["data-srcset"]).map(a => `[${a}]`).join(",");
-  const PRELOAD_SELECTOR = "link[rel][as][href]";
-
-  const nativeImgSrcDesc =
-    Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, "src");
-  const nativeImgSrcsetDesc =
-    Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, "srcset");
-  const nativeSourceSrcsetDesc =
-    typeof HTMLSourceElement !== "undefined"
-      ? Object.getOwnPropertyDescriptor(HTMLSourceElement.prototype, "srcset")
-      : null;
-  const nativeSetAttr = Element.prototype.setAttribute;
+  const LAZY_SELECTOR = LAZY_ATTRS.concat(["data-srcset"]).map(a => `[${a}]`).join(",");
 
   let opts = null;
-
-  // Independent markers because an element can need several transformations.
+  // Keep independent processing markers: an <img> can legitimately need all
+  // three passes (src/srcset, lazy attrs, and inline background) at once.
   const doneImg = new WeakSet();
   const doneLazy = new WeakSet();
   const doneBg = new WeakSet();
-  const donePreload = new WeakSet();
 
-  // Background-image loads do not emit an element-level error event. Probe the
-  // generated proxy URL with an Image() object so failed proxy transforms can
-  // get the same proxy-only rescue used by prehook.js. The probe normally
-  // coalesces with the browser's CSS image request or becomes a cache hit.
-  const bgFallbackState = new WeakMap();
-
-  // prehook.js runs in the MAIN world, while this observer runs in the
-  // extension's ISOLATED world. A fallback mutation must cross that world
-  // boundary so this observer does not immediately proxy the restored URL.
-  const fallbackElements = new WeakSet();
-  const fallbackMutationCounts = new WeakMap();
-
-  document.addEventListener(FALLBACK_EVENT, event => {
-    const target = event.target;
-    if (!(target instanceof Element)) return;
-
-    fallbackElements.add(target);
-    fallbackMutationCounts.set(
-      target,
-      (fallbackMutationCounts.get(target) || 0) + 1
-    );
-  }, true);
-
-  function consumeFallbackMutation(el) {
-    const count = fallbackMutationCounts.get(el) || 0;
-    if (!count) return false;
-
-    if (count === 1) fallbackMutationCounts.delete(el);
-    else fallbackMutationCounts.set(el, count - 1);
-    return true;
-  }
-
-  // Ignore the next MutationObserver record caused by our own write. This
-  // prevents an unnecessary second URL decision/rewrite pass.
-  const internalWrites = new WeakMap();
-
-  function markInternal(el, attr) {
-    let attrs = internalWrites.get(el);
-    if (!attrs) {
-      attrs = new Set();
-      internalWrites.set(el, attrs);
-    }
-    attrs.add(attr);
-  }
-
-  function consumeInternal(el, attr) {
-    const attrs = internalWrites.get(el);
-    if (!attrs || !attrs.delete(attr)) return false;
-    if (!attrs.size) internalWrites.delete(el);
-    return true;
-  }
-
-  function setNativeAttr(el, name, value) {
-    markInternal(el, name);
-    nativeSetAttr.call(el, name, value);
-  }
-
-  function rewriteSrcsetValue(value) {
-    const ss = String(value || "");
-    if (!ss || !opts?.proxyBase || !opts?.enabled) return ss;
-
-    let touched = false;
-    const rewritten = ss.split(",").map(part => {
-      const m = part.trim().match(/^(\S+)(\s.*)?$/);
-      if (!m) return part;
-
-      const raw = m[1];
-      const desc = m[2] || "";
-      const target = bhResolveHttpURL(raw);
-      if (!target) return part;
-      if (bhShouldSkip(target.href, target.hostname, opts, location.hostname)) {
-        return part;
-      }
-
-      touched = true;
-      return bhBuildProxyUrl(target.href, opts) + desc;
-    }).join(", ");
-
-    return touched ? rewritten : ss;
-  }
-
+  // ── A) <img src> and <source srcset> rewriting ────────────────────────────
+  // Handles images whose src was set by the HTML parser (bypasses prehook).
+  // Also handles srcset entries on both <img> and <source> elements.
   function rewriteImg(el) {
-    if (!el || doneImg.has(el) || fallbackElements.has(el)) return;
+    if (!el || doneImg.has(el)) return;
     if (!opts?.proxyBase || !opts?.enabled) return;
 
     let rewrote = false;
-    const isImg = el.tagName === "IMG";
-    const isPictureSource =
-      el.tagName === "SOURCE" && el.parentElement?.tagName === "PICTURE";
 
-    if (isImg) {
-      const raw = el.getAttribute("src");
-      const target = bhResolveHttpURL(raw);
+    // <source> only carries an image "src" inside <picture>; the same tag is
+    // reused by <audio>/<video> for media files, where "src" is a video/audio
+    // URL, not an image. The MutationObserver scan below uses a broad "img,
+    // source" selector for simplicity, so guard here rather than narrowing
+    // the selector everywhere it's used.
+    const isPictureSource = el.tagName === "SOURCE" && el.parentElement?.tagName === "PICTURE";
 
-      if (target && !bhShouldSkip(target.href, target.hostname, opts, location.hostname)) {
-        try {
-          markInternal(el, "src");
-          nativeImgSrcDesc?.set?.call(el, bhBuildProxyUrl(target.href, opts));
-          rewrote = true;
-        } catch {}
+    if (el.tagName === "IMG") {
+      // src — only real <img> elements have one that means "image URL".
+      const src = el.getAttribute("src");
+      if (src && bhIsHttp(src)) {
+        const u = bhSafeURL(src);
+        if (u && !bhShouldSkip(src, u.hostname, opts, location.hostname)) {
+          try {
+            // Use native src setter to avoid triggering prehook's patch again.
+            Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, "src")
+              ?.set?.call(el, bhBuildProxyUrl(src, opts));
+            rewrote = true;
+          } catch { /* illegal invocation on an unexpected element type */ }
+        }
       }
     }
 
-    if (isImg || isPictureSource) {
-      const rawSrcset = el.getAttribute("srcset");
-      if (rawSrcset) {
-        const rewritten = rewriteSrcsetValue(rawSrcset);
-        if (rewritten !== rawSrcset) {
-          setNativeAttr(el, "srcset", rewritten);
-          rewrote = true;
-        }
+    if (el.tagName === "IMG" || isPictureSource) {
+      // srcset
+      const ss = el.getAttribute("srcset");
+      if (ss) {
+        let touched = false;
+        const rewritten = ss.split(",").map(part => {
+          const m = part.trim().match(/^(\S+)(\s.*)?$/);
+          if (!m) return part;
+          const [, url, desc = ""] = m;
+          if (!bhIsHttp(url)) return part;
+          const u = bhSafeURL(url);
+          if (!u || bhShouldSkip(url, u.hostname, opts, location.hostname)) return part;
+          touched = true;
+          return bhBuildProxyUrl(url, opts) + desc;
+        }).join(", ");
+        if (touched) { el.setAttribute("srcset", rewritten); rewrote = true; }
       }
     }
 
     if (rewrote) doneImg.add(el);
   }
 
+  // ── B) Lazy-attr rewriting ─────────────────────────────────────────────────
+  // Rewrites data-src etc. so lazy-loaders pass proxy URLs to prehook.
   function rewriteLazy(el) {
     if (!el || doneLazy.has(el)) return;
     if (!opts?.proxyBase || !opts?.enabled) return;
@@ -164,323 +126,163 @@
     let rewrote = false;
 
     for (const attr of LAZY_ATTRS) {
-      const raw = el.getAttribute(attr);
-      const target = bhResolveHttpURL(raw);
-      if (!target) continue;
-      if (bhShouldSkip(target.href, target.hostname, opts, location.hostname)) continue;
-
-      setNativeAttr(el, attr, bhBuildProxyUrl(target.href, opts));
+      const val = el.getAttribute(attr);
+      if (!val || !bhIsHttp(val)) continue;
+      const u = bhSafeURL(val);
+      if (!u || bhShouldSkip(val, u.hostname, opts, location.hostname)) continue;
+      el.setAttribute(attr, bhBuildProxyUrl(val, opts));
       rewrote = true;
     }
 
-    const rawSrcset = el.getAttribute("data-srcset");
-    if (rawSrcset) {
-      const rewritten = rewriteSrcsetValue(rawSrcset);
-      if (rewritten !== rawSrcset) {
-        setNativeAttr(el, "data-srcset", rewritten);
-        rewrote = true;
-      }
+    // data-srcset
+    const dss = el.getAttribute("data-srcset");
+    if (dss) {
+      let touched = false;
+      const rewritten = dss.split(",").map(part => {
+        const m = part.trim().match(/^(\S+)(\s.*)?$/);
+        if (!m) return part;
+        const [, url, desc = ""] = m;
+        if (!bhIsHttp(url)) return part;
+        const u = bhSafeURL(url);
+        if (!u || bhShouldSkip(url, u.hostname, opts, location.hostname)) return part;
+        touched = true;
+        return bhBuildProxyUrl(url, opts) + desc;
+      }).join(", ");
+      if (touched) { el.setAttribute("data-srcset", rewritten); rewrote = true; }
     }
 
     if (rewrote) doneLazy.add(el);
   }
 
-  function recoveryProxyUrl(value) {
-    try {
-      const proxy = new URL(String(value || ""));
-      if (!bhLooksLikeGeneratedProxy(proxy.href)) return null;
-
-      const before = proxy.href;
-      proxy.searchParams.set("jpeg", "1");
-      proxy.searchParams.set("bw", "0");
-      proxy.searchParams.delete("max_width");
-
-      return proxy.href !== before ? proxy.href : null;
-    } catch {
-      return null;
-    }
-  }
-
-  function originalUrlFromProxy(value) {
-    try {
-      const proxy = new URL(String(value || ""));
-      if (!bhLooksLikeGeneratedProxy(proxy.href)) return null;
-      return bhResolveHttpURL(proxy.searchParams.get("url"))?.href || null;
-    } catch {
-      return null;
-    }
-  }
-
-  function replaceBackgroundUrl(el, fromUrl, toUrl) {
-    const css = el.style?.backgroundImage;
-    if (!css) return false;
-
-    let changed = false;
-    const replaced = css.replace(
-      /url\(\s*(?:"([^"]*)"|'([^']*)'|([^)]*))\s*\)/gi,
-      (full, doubleQuoted, singleQuoted, unquoted) => {
-        const raw = String(doubleQuoted ?? singleQuoted ?? unquoted ?? "").trim();
-        let current = "";
-        try { current = new URL(raw, document.baseURI || location.href).href; } catch {}
-        if (current !== fromUrl) return full;
-
-        changed = true;
-        return `url("${String(toUrl).replace(/"/g, '\\\\"')}")`;
-      }
-    );
-
-    if (!changed) return false;
-    markInternal(el, "style");
-    el.style.backgroundImage = replaced;
-    return true;
-  }
-
-  function watchBackgroundProxy(el, css) {
-    const urls = [];
-    css.replace(
-      /url\(\s*(?:"([^"]*)"|'([^']*)'|([^)]*))\s*\)/gi,
-      (full, doubleQuoted, singleQuoted, unquoted) => {
-        const raw = String(doubleQuoted ?? singleQuoted ?? unquoted ?? "").trim();
-        try {
-          const u = new URL(raw, document.baseURI || location.href);
-          if (bhLooksLikeGeneratedProxy(u.href)) urls.push(u.href);
-        } catch {}
-        return full;
-      }
-    );
-
-    if (!urls.length) return;
-
-    const state = bgFallbackState.get(el) || { rescued: new Set(), direct: new Set() };
-
-    for (const proxyUrl of urls) {
-      if (state.rescued.has(proxyUrl) || state.direct.has(proxyUrl)) continue;
-
-      const probe = new Image();
-      probe.decoding = "async";
-      probe.onload = () => {};
-      probe.onerror = () => {
-        try {
-          const next = recoveryProxyUrl(proxyUrl);
-          if (next && !state.rescued.has(proxyUrl)) {
-            if (replaceBackgroundUrl(el, proxyUrl, next)) {
-              state.rescued.add(proxyUrl);
-              bgFallbackState.set(el, state);
-              watchBackgroundProxy(el, el.style.backgroundImage || "");
-              return;
-            }
-            state.rescued.add(proxyUrl);
-          }
-
-          if (!opts?.directFallback || state.direct.has(proxyUrl)) {
-            bgFallbackState.set(el, state);
-            return;
-          }
-
-          const original = originalUrlFromProxy(proxyUrl);
-          if (original && replaceBackgroundUrl(el, proxyUrl, original)) {
-            state.direct.add(proxyUrl);
-            bgFallbackState.set(el, state);
-          }
-        } catch {}
-      };
-      probe.src = proxyUrl;
-    }
-
-    bgFallbackState.set(el, state);
-  }
-
+  // ── C) Inline background-image rewriting ──────────────────────────────────
+  // Handles elements with style="background-image: url(...)".
+  // CSS stylesheet backgrounds can't be intercepted without getComputedStyle,
+  // but overriding inline style is enough for most dynamic content.
   function rewriteBg(el) {
     if (!el || doneBg.has(el)) return;
     if (!opts?.proxyBase || !opts?.enabled) return;
-
-    const css = el.style?.backgroundImage;
-    if (!css || !/\burl\(/i.test(css)) return;
-
-    let touched = false;
-    const rewritten = css.replace(
-      /url\(\s*(?:"([^"]*)"|'([^']*)'|([^)]*))\s*\)/gi,
-      (full, doubleQuoted, singleQuoted, unquoted) => {
-        const raw = String(doubleQuoted ?? singleQuoted ?? unquoted ?? "").trim();
-        const target = bhResolveHttpURL(raw);
-        if (!target ||
-            bhShouldSkip(target.href, target.hostname, opts, location.hostname)) {
-          return full;
-        }
-
-        touched = true;
-        const proxy = bhBuildProxyUrl(target.href, opts);
-        return `url("${proxy.replace(/"/g, '\\"')}")`;
-      }
-    );
-
-    if (touched) {
-      markInternal(el, "style");
-      el.style.backgroundImage = rewritten;
-      doneBg.add(el);
-      watchBackgroundProxy(el, rewritten);
-    }
+    const bg = el.style?.backgroundImage;
+    if (!bg || !bg.startsWith("url(")) return;
+    const raw = bg.slice(4, -1).replace(/['"]/g, "").trim();
+    if (!raw || !bhIsHttp(raw)) return;
+    const u = bhSafeURL(raw);
+    if (!u || bhShouldSkip(raw, u.hostname, opts, location.hostname)) return;
+    el.style.backgroundImage = `url("${bhBuildProxyUrl(raw, opts)}")`;
+    doneBg.add(el);
   }
 
-  function isImagePreload(el) {
-    if (!el || el.tagName !== "LINK") return false;
-    const rel = String(el.getAttribute("rel") || "").toLowerCase();
-    const as = String(el.getAttribute("as") || "").toLowerCase();
-    return /\bpreload\b/.test(rel) && as === "image";
-  }
-
-  function rewritePreload(el) {
-    if (!el || donePreload.has(el) || fallbackElements.has(el)) return;
-    if (!opts?.proxyBase || !opts?.enabled || !isImagePreload(el)) return;
-
-    const raw = el.getAttribute("href");
-    const target = bhResolveHttpURL(raw);
-    if (!target ||
-        bhShouldSkip(target.href, target.hostname, opts, location.hostname)) {
-      return;
-    }
-
-    setNativeAttr(el, "href", bhBuildProxyUrl(target.href, opts));
-    donePreload.add(el);
-  }
-
+  // ── Full-page scan ────────────────────────────────────────────────────────
   function rewriteAll() {
+    // Images and picture sources
     document.querySelectorAll("img, picture source").forEach(rewriteImg);
+
+    // Lazy-loaded images
     document.querySelectorAll(LAZY_SELECTOR).forEach(rewriteLazy);
+
+    // Inline backgrounds
     document.querySelectorAll(BG_SELECTOR).forEach(rewriteBg);
-    document.querySelectorAll(PRELOAD_SELECTOR).forEach(rewritePreload);
   }
 
-  function clearPreconnects() {
-    document.querySelectorAll("link[data-bh-preconnect]").forEach(el => el.remove());
-  }
-
-  function injectPreconnect(proxyBase) {
-    try {
-      const origin = new URL(proxyBase).origin;
-      const existing = Array.from(
-        document.querySelectorAll("link[data-bh-preconnect]")
-      );
-      const same = existing.some(el => {
-        try { return new URL(el.href).origin === origin; } catch { return false; }
-      });
-
-      for (const el of existing) {
-        try {
-          if (new URL(el.href).origin !== origin) el.remove();
-        } catch {
-          el.remove();
-        }
-      }
-      if (same) return;
-
-      const root = document.head || document.documentElement;
-      if (!root) return;
-
-      const dns = document.createElement("link");
-      dns.rel = "dns-prefetch";
-      dns.href = origin;
-      dns.setAttribute("data-bh-preconnect", "dns");
-
-      const pc = document.createElement("link");
-      pc.rel = "preconnect";
-      pc.href = origin;
-      pc.crossOrigin = "anonymous";
-      pc.setAttribute("data-bh-preconnect", "preconnect");
-
-      root.prepend(dns);
-      root.prepend(pc);
-    } catch {}
-  }
-
+  // ── MutationObserver ───────────────────────────────────────────────────────
+  // Catches images added or changed after initial load (infinite scroll, SPAs…)
   const mo = new MutationObserver(mutations => {
     for (const m of mutations) {
       if (m.type === "childList") {
-        for (const node of m.addedNodes) {
-          if (node.nodeType !== 1) continue;
-
-          rewriteImg(node);
-          rewriteLazy(node);
-          rewriteBg(node);
-          rewritePreload(node);
-
-          node.querySelectorAll?.("img, picture source").forEach(rewriteImg);
-          node.querySelectorAll?.(LAZY_SELECTOR).forEach(rewriteLazy);
-          node.querySelectorAll?.(BG_SELECTOR).forEach(rewriteBg);
-          node.querySelectorAll?.(PRELOAD_SELECTOR).forEach(rewritePreload);
+        m.addedNodes.forEach(n => {
+          if (n.nodeType !== 1) return;
+          rewriteImg(n);
+          rewriteLazy(n);
+          rewriteBg(n);
+          // "picture source" here (not the broader "img, source" used
+          // elsewhere) skips <audio>/<video><source> elements outright —
+          // matches rewriteAll()'s initial-scan selector; rewriteImg()
+          // already no-ops on them via isPictureSource, so this just
+          // avoids visiting them at all.
+          n.querySelectorAll?.("img, picture source").forEach(rewriteImg);
+          n.querySelectorAll?.(LAZY_SELECTOR).forEach(rewriteLazy);
+          n.querySelectorAll?.(BG_SELECTOR).forEach(rewriteBg);
+        });
+      } else if (m.type === "attributes") {
+        const t = m.target;
+        if (!t) continue;
+        if (m.attributeName === "src" || m.attributeName === "srcset") {
+          if (t.tagName === "IMG" || t.tagName === "SOURCE") {
+            doneImg.delete(t); // allow re-rewrite when src changes
+            rewriteImg(t);
+          }
+        } else if (m.attributeName === "style") {
+          doneBg.delete(t);
+          rewriteBg(t);
+        } else if (LAZY_ATTRS.includes(m.attributeName) || m.attributeName === "data-srcset") {
+          doneLazy.delete(t);
+          rewriteLazy(t);
         }
-        continue;
-      }
-
-      const target = m.target;
-      if (!target) continue;
-      if (consumeFallbackMutation(target)) continue;
-      if (consumeInternal(target, m.attributeName)) continue;
-
-      // A mutation not associated with the MAIN-world fallback is a real page
-      // change. Allow normal proxying again after the page changes the resource.
-      fallbackElements.delete(target);
-
-      if (m.attributeName === "src" || m.attributeName === "srcset") {
-        if (target.tagName === "IMG" || target.tagName === "SOURCE") {
-          doneImg.delete(target);
-          rewriteImg(target);
-        }
-      } else if (m.attributeName === "style") {
-        doneBg.delete(target);
-        rewriteBg(target);
-      } else if (
-        LAZY_ATTRS.includes(m.attributeName) ||
-        m.attributeName === "data-srcset"
-      ) {
-        doneLazy.delete(target);
-        rewriteLazy(target);
-      } else if (
-        (m.attributeName === "href" ||
-         m.attributeName === "rel" ||
-         m.attributeName === "as") &&
-        target.tagName === "LINK"
-      ) {
-        donePreload.delete(target);
-        rewritePreload(target);
       }
     }
   });
 
   const observerConfig = {
-    childList: true,
-    subtree: true,
-    attributes: true,
-    attributeFilter: [
-      "src", "srcset", "style",
-      ...LAZY_ATTRS, "data-srcset",
-      "href", "rel", "as"
-    ]
+    childList:       true,
+    subtree:         true,
+    attributes:      true,
+    attributeFilter: ["src", "srcset", "style", ...LAZY_ATTRS, "data-srcset"]
   };
-
   let observing = false;
 
   function setObserverEnabled(enabled) {
     if (enabled === observing) return;
+    if (enabled) {
+      // Observe the document node so this remains safe even at document_start,
+      // before document.documentElement exists on slower navigations.
+      mo.observe(document, observerConfig);
+    } else {
+      mo.disconnect();
+    }
     observing = enabled;
-    if (enabled) mo.observe(document, observerConfig);
-    else mo.disconnect();
   }
 
-  function applyOptions(o) {
-    opts = o;
-    const active = !!(opts?.enabled && opts?.proxyBase);
-    setObserverEnabled(active);
+  // ── Preconnect to proxy ───────────────────────────────────────────────────
+  // Injecting <link rel="preconnect"> opens the TCP+TLS connection to the proxy
+  // in parallel with HTML parsing, so the first image request doesn't pay the
+  // full handshake cost (~100-300 ms on mobile).
+  // dns-prefetch is a lighter fallback for browsers that ignore preconnect.
+  function injectPreconnect(proxyBase) {
+    try {
+      const origin = new URL(proxyBase).origin;
+      if (document.querySelector(`link[href="${origin}"]`)) return; // already injected
+      const root = document.head || document.documentElement;
+      if (!root) return;
+      const pc = document.createElement("link");
+      pc.rel  = "preconnect";
+      pc.href = origin;
+      pc.crossOrigin = "anonymous";
+      root.prepend(pc);
+      const dns = document.createElement("link");
+      dns.rel  = "dns-prefetch";
+      dns.href = origin;
+      root.prepend(dns);
+    } catch {}
+  }
 
+  // ── Load settings then process page ───────────────────────────────────────
+  // Options are loaded once, in shared.js, and shared with prehook.js via
+  // bhOnReady/bhOnOptsChange — see the v0.0.6 note at the top of shared.js.
+  bhOnReady(o => {
+    opts = o;
+    const active = !!(opts.enabled && opts.proxyBase);
+    setObserverEnabled(active);
     if (active) {
       injectPreconnect(opts.proxyBase);
       rewriteAll();
-    } else {
-      clearPreconnects();
     }
-  }
-
-  bhOnReady(applyOptions);
-  bhOnOptsChange(applyOptions);
+  });
+  bhOnOptsChange(o => {
+    opts = o;
+    const active = !!(opts.enabled && opts.proxyBase);
+    setObserverEnabled(active);
+    if (active) {
+      injectPreconnect(opts.proxyBase);
+      rewriteAll();
+    }
+  });
 })();
-

@@ -20,7 +20,4 @@ export const DEFAULTS = {
   // excluded by default rather than something users have to discover.
   excludeDomains: "google.com gstatic.com challenges.cloudflare.com",
   isWebpSupported: false, // detected at install/startup; used to decide jpeg= param
-  // Keep failed proxy loads proxy-only by default. Enabling this permits a final
-  // direct origin retry, which can expose the origin DNS request to the browser.
-  directFallback:  false,
 };
