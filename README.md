@@ -18,6 +18,7 @@ Works on **Chrome**, **Kiwi Browser**, **Cromite**, and any Chromium-based brows
 - **Per-site exclusions** — skip domains that shouldn't be proxied
 - **Usage stats** — tracks images processed and bytes saved via proxy response headers
 - **CSP stripping** — removes Content-Security-Policy headers that would block proxy-served images
+- **Automatic failure fallback** — if a proxied image fails (for example an upstream 403), the extension retries that image once from its original URL instead of leaving a broken image
 
 ---
 
@@ -71,9 +72,11 @@ Settings are mirrored from `storage.sync` to `storage.local` by the service work
 
 DNR is used only to strip CSP headers — image redirection remains in content scripts because MV3 `regexSubstitution` cannot safely URL-encode the captured source URL.
 
-### Important limitation
+### Important limitations
 
 Parser-created images and preloads can begin loading before the asynchronous storage callback is available. The extension minimizes this window with `document_start`, the local settings mirror, and the synchronous MAIN-world prehook for JavaScript-created resources. It cannot provide the same zero-byte guarantee for every resource emitted directly by the HTML parser because MV3 does not provide a blocking `webRequest` path for this use case.
+
+Some origins reject server-side image fetches with HTTP 403 or otherwise make the proxy request fail even though the image loads normally in the browser. When a generated proxy image fails, Bandwidth Guardian decodes the original URL from the proxy request and retries it directly once. That image is then not bandwidth-saved, but the page can continue displaying it instead of showing a broken image.
 
 ---
 

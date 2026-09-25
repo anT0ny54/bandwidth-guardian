@@ -9,6 +9,8 @@
 (() => {
   "use strict";
 
+  const FALLBACK_EVENT = "__bandwidth_guardian_fallback__";
+
   const LAZY_ATTRS = [
     "data-src", "data-iurl", "data-lazy-src", "data-original",
     "data-url", "data-hi-res", "data-lazy", "data-echo"
@@ -37,6 +39,32 @@
   const doneLazy = new WeakSet();
   const doneBg = new WeakSet();
   const donePreload = new WeakSet();
+
+  // prehook.js runs in the MAIN world, while this observer runs in the
+  // extension's ISOLATED world. A fallback mutation must cross that world
+  // boundary so this observer does not immediately proxy the restored URL.
+  const fallbackElements = new WeakSet();
+  const fallbackMutationCounts = new WeakMap();
+
+  document.addEventListener(FALLBACK_EVENT, event => {
+    const target = event.target;
+    if (!(target instanceof Element)) return;
+
+    fallbackElements.add(target);
+    fallbackMutationCounts.set(
+      target,
+      (fallbackMutationCounts.get(target) || 0) + 1
+    );
+  }, true);
+
+  function consumeFallbackMutation(el) {
+    const count = fallbackMutationCounts.get(el) || 0;
+    if (!count) return false;
+
+    if (count === 1) fallbackMutationCounts.delete(el);
+    else fallbackMutationCounts.set(el, count - 1);
+    return true;
+  }
 
   // Ignore the next MutationObserver record caused by our own write. This
   // prevents an unnecessary second URL decision/rewrite pass.
@@ -88,7 +116,7 @@
   }
 
   function rewriteImg(el) {
-    if (!el || doneImg.has(el)) return;
+    if (!el || doneImg.has(el) || fallbackElements.has(el)) return;
     if (!opts?.proxyBase || !opts?.enabled) return;
 
     let rewrote = false;
@@ -190,7 +218,7 @@
   }
 
   function rewritePreload(el) {
-    if (!el || donePreload.has(el)) return;
+    if (!el || donePreload.has(el) || fallbackElements.has(el)) return;
     if (!opts?.proxyBase || !opts?.enabled || !isImagePreload(el)) return;
 
     const raw = el.getAttribute("href");
@@ -274,7 +302,12 @@
 
       const target = m.target;
       if (!target) continue;
+      if (consumeFallbackMutation(target)) continue;
       if (consumeInternal(target, m.attributeName)) continue;
+
+      // A mutation not associated with the MAIN-world fallback is a real page
+      // change. Allow normal proxying again after the page changes the resource.
+      fallbackElements.delete(target);
 
       if (m.attributeName === "src" || m.attributeName === "srcset") {
         if (target.tagName === "IMG" || target.tagName === "SOURCE") {
