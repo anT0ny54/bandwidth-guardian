@@ -97,13 +97,7 @@ async function load() {
   proxyBaseEl.classList.remove("invalid");
   setQualityUI(d.quality  ?? DEFAULTS.quality);
   setWidthUI(d.maxWidth ?? DEFAULTS.maxWidth);
-  await loadStats();
-}
 
-// Split out of load(): "Reset stats" used to call load(), which re-populated
-// every form field from storage and silently discarded unsaved edits (e.g. a
-// proxy URL typed but not yet saved).
-async function loadStats() {
   const s  = await chrome.storage.local.get({ stats: { filesProcessed: 0, bytesProcessed: 0, bytesSaved: 0 } });
   const st = s.stats || {};
   const pct = st.bytesProcessed > 0
@@ -187,20 +181,6 @@ async function save() {
   }
   proxyBaseEl.classList.remove("invalid");
 
-  // Reject out-of-range custom values instead of silently falling back to a
-  // preset / default.
-  const cq = customQualityEl.value.trim(), cw = customWidthEl.value.trim();
-  if (cq !== "" && !(parseInt(cq, 10) >= 1 && parseInt(cq, 10) <= 100)) {
-    showToast("Custom quality must be 1–100", "err");
-    customQualityEl.focus();
-    return;
-  }
-  if (cw !== "" && !(parseInt(cw, 10) >= 0)) {
-    showToast("Custom width must be 0 or more", "err");
-    customWidthEl.focus();
-    return;
-  }
-
   await chrome.storage.sync.set({
     proxyBase,
     quality:        readQuality(),
@@ -218,18 +198,14 @@ async function resetAll() {
   // bottom action bar, which on a phone-sized screen is an easy mis-tap —
   // and a silent reset wipes the proxy URL along with everything else.
   if (!confirm("Reset all settings to defaults? This clears your proxy URL, quality, and exclusions.")) return;
-  // isWebpSupported is a detected capability, not a user setting — resetting
-  // it to the default `false` made the proxy serve JPEG until the next
-  // browser restart re-ran detection.
-  const { isWebpSupported } = await chrome.storage.sync.get({ isWebpSupported: DEFAULTS.isWebpSupported });
-  await chrome.storage.sync.set({ ...DEFAULTS, isWebpSupported });
+  await chrome.storage.sync.set(DEFAULTS);
   await load();
   showToast("Reset to defaults");
 }
 
 async function resetStats() {
   await chrome.storage.local.set({ stats: { filesProcessed: 0, bytesProcessed: 0, bytesSaved: 0 } });
-  await loadStats();
+  await load();
   showToast("Stats cleared");
 }
 
@@ -290,7 +266,6 @@ testProxyBtn.addEventListener("click", testProxy);
 
 proxyBaseEl.addEventListener("input", () => proxyBaseEl.classList.remove("invalid"));
 
-// excludeEl is a <textarea>: Enter there must insert a newline, not save.
-[proxyBaseEl, customQualityEl, customWidthEl].forEach(el => {
+[proxyBaseEl, excludeEl, customQualityEl, customWidthEl].forEach(el => {
   el.addEventListener("keydown", e => { if (e.key === "Enter") { e.preventDefault(); save(); } });
 });

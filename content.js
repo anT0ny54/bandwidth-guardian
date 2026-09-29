@@ -32,9 +32,6 @@
 //    C) Inline CSS background-image — rewritten via el.style.backgroundImage.
 //       Best-effort: stylesheet-defined backgrounds may already be loading.
 //
-//  Options are loaded once, in this file (see "Options loader" below), and
-//  pushed to prehook.js through bhPrehookSetOpts().
-//
 //  The previous approach of using DNR regexSubstitution for image redirects
 //  was removed because DNR cannot call encodeURIComponent. Any image URL
 //  with query params (e.g. tvguide.com/img.jpg?auto=webp&width=1092) would
@@ -44,35 +41,6 @@
 // ══════════════════════════════════════════════════════════════════════════════
 
 (function () {
-  // ── Options loader ─────────────────────────────────────────────────────────
-  // Try storage.local first (bhOpts mirror written by the service worker,
-  // ~5 ms); fall back to storage.sync when the mirror is missing (fresh
-  // install, worker not yet run) so we never run with empty defaults.
-  // Stored values are merged over BH_DEFAULTS so a mirror written by an older
-  // version (missing newer keys) can't yield `undefined` settings.
-  const withDefaults = o => Object.assign({}, BH_DEFAULTS, o || {});
-  const sameOpts = (a, b) => !!a && !!b && Object.keys(BH_DEFAULTS).every(k => a[k] === b[k]);
-
-  let opts = null;
-  let ready = false;
-
-  function applyOpts(next) {
-    const first = !ready;
-    if (!first && sameOpts(opts, next)) return; // the local + sync listeners both fire for one change
-    opts = next;
-    ready = true;
-    globalThis.bhPrehookSetOpts?.(opts);
-    // Pages whose own host is excluded get no observer, no scan and no
-    // preconnect — every URL on them would be skipped anyway.
-    const active = !!(opts.enabled && opts.proxyBase &&
-      !bhHostMatchesDomain(location.hostname, bhCachedDomainSet(opts)));
-    setObserverEnabled(active);
-    if (active) {
-      injectPreconnect(opts.proxyBase);
-      rewriteAll();
-    }
-  }
-
   // Lazy-load attributes used by common image libraries
   const LAZY_ATTRS = [
     "data-src", "data-iurl", "data-lazy-src", "data-original",
@@ -88,6 +56,7 @@
   const BG_SELECTOR = "[style*='background' i]";
   const LAZY_SELECTOR = LAZY_ATTRS.concat(["data-srcset"]).map(a => `[${a}]`).join(",");
 
+  let opts = null;
   // Keep independent processing markers: an <img> can legitimately need all
   // three passes (src/srcset, lazy attrs, and inline background) at once.
   const doneImg = new WeakSet();
@@ -111,13 +80,21 @@
     const isPictureSource = el.tagName === "SOURCE" && el.parentElement?.tagName === "PICTURE";
 
     if (el.tagName === "IMG") {
-      // Relative / protocol-relative URLs are resolved to absolute first;
-      // previously only URLs literally starting with http(s):// were proxied.
-      const abs = bhAbsUrl(el.getAttribute("src"));
-      const u = abs && bhSafeURL(abs);
-      if (u && !bhShouldSkip(abs, u.hostname, opts, location.hostname)) {
-        el.setAttribute("src", bhBuildProxyUrl(abs, opts));
-        rewrote = true;
+      // src — only real <img> elements have one that means "image URL".
+      const src = el.getAttribute("src");
+      if (src && bhIsHttp(src)) {
+        const u = bhSafeURL(src);
+        if (u && !bhShouldSkip(src, u.hostname, opts, location.hostname)) {
+          try {
+            // bhNativeSetImgSrc (shared.js) is the descriptor captured before
+            // prehook.js patched HTMLImageElement.prototype.src. Querying the
+            // prototype for it here instead would return prehook's *patched*
+            // setter — silently re-entering it with an already-proxied URL —
+            // since prehook.js has already run by the time this file does.
+            bhNativeSetImgSrc(el, bhBuildProxyUrl(src, opts));
+            rewrote = true;
+          } catch { /* illegal invocation on an unexpected element type */ }
+        }
       }
     }
 
@@ -141,26 +118,17 @@
 
     let rewrote = false;
 
-    // <img>/<picture><source> take any image URL. Other elements (divs used for
-    // lazy backgrounds, <video data-src>, <a data-url>…) are only rewritten
-    // when the URL actually looks like an image — data-url / data-lazy often
-    // hold page links or media files, and proxying those breaks them.
-    const imgLike = el.tagName === "IMG" ||
-      (el.tagName === "SOURCE" && el.parentElement?.tagName === "PICTURE");
-
     for (const attr of LAZY_ATTRS) {
       const val = el.getAttribute(attr);
-      if (!val) continue;
-      const abs = bhAbsUrl(val);
-      if (!abs || (!imgLike && !bhLooksLikeImage(abs))) continue;
-      const u = bhSafeURL(abs);
-      if (!u || bhShouldSkip(abs, u.hostname, opts, location.hostname)) continue;
-      el.setAttribute(attr, bhBuildProxyUrl(abs, opts));
+      if (!val || !bhIsHttp(val)) continue;
+      const u = bhSafeURL(val);
+      if (!u || bhShouldSkip(val, u.hostname, opts, location.hostname)) continue;
+      el.setAttribute(attr, bhBuildProxyUrl(val, opts));
       rewrote = true;
     }
 
     // data-srcset
-    const dss = (imgLike || el.hasAttribute("data-srcset")) ? el.getAttribute("data-srcset") : null;
+    const dss = el.getAttribute("data-srcset");
     if (dss) {
       const rewritten = bhRewriteSrcset(dss, opts, location.hostname);
       if (rewritten !== dss) { el.setAttribute("data-srcset", rewritten); rewrote = true; }
@@ -177,19 +145,12 @@
     if (!el || doneBg.has(el)) return;
     if (!opts?.proxyBase || !opts?.enabled) return;
     const bg = el.style?.backgroundImage;
-    if (!bg || !bg.includes("url(")) return;
-    // Rewrite every url(...) in the value. The old slice(4, -1) approach
-    // mangled multi-layer values like `linear-gradient(...), url(a)`.
-    let touched = false;
-    const out = bg.replace(/url\((["']?)(.*?)\1\)/g, (m, _q, raw) => {
-      const abs = bhAbsUrl(raw);
-      const u = abs && bhSafeURL(abs);
-      if (!u || bhShouldSkip(abs, u.hostname, opts, location.hostname)) return m;
-      touched = true;
-      return `url("${bhBuildProxyUrl(abs, opts)}")`;
-    });
-    if (!touched) return;
-    el.style.backgroundImage = out;
+    if (!bg || !bg.startsWith("url(")) return;
+    const raw = bg.slice(4, -1).replace(/['"]/g, "").trim();
+    if (!raw || !bhIsHttp(raw)) return;
+    const u = bhSafeURL(raw);
+    if (!u || bhShouldSkip(raw, u.hostname, opts, location.hostname)) return;
+    el.style.backgroundImage = `url("${bhBuildProxyUrl(raw, opts)}")`;
     doneBg.add(el);
   }
 
@@ -213,7 +174,7 @@
         m.addedNodes.forEach(n => {
           if (n.nodeType !== 1) return;
           rewriteImg(n);
-          if (n.matches?.(LAZY_SELECTOR)) rewriteLazy(n);
+          rewriteLazy(n);
           rewriteBg(n);
           // "picture source" here (not the broader "img, source" used
           // elsewhere) skips <audio>/<video><source> elements outright —
@@ -233,9 +194,6 @@
             rewriteImg(t);
           }
         } else if (m.attributeName === "style") {
-          // Animation-heavy pages mutate `style` constantly; skip cheaply
-          // unless the attribute text mentions a background.
-          if (!/background/i.test(t.getAttribute("style") || "")) continue;
           doneBg.delete(t);
           rewriteBg(t);
         } else if (LAZY_ATTRS.includes(m.attributeName) || m.attributeName === "data-srcset") {
@@ -274,44 +232,40 @@
   function injectPreconnect(proxyBase) {
     try {
       const origin = new URL(proxyBase).origin;
-      if (document.querySelector(`link[rel="preconnect"][href="${origin}"]`)) return;
+      if (document.querySelector(`link[href="${origin}"]`)) return; // already injected
       const root = document.head || document.documentElement;
       if (!root) return;
-      // No crossorigin attribute: <img> requests are credentialed no-cors
-      // fetches, and a crossorigin="anonymous" preconnect opens a *separate*
-      // connection pool that image requests can't reuse. dns-prefetch was
-      // dropped as redundant — preconnect already resolves DNS.
       const pc = document.createElement("link");
       pc.rel  = "preconnect";
       pc.href = origin;
+      pc.crossOrigin = "anonymous";
       root.prepend(pc);
+      const dns = document.createElement("link");
+      dns.rel  = "dns-prefetch";
+      dns.href = origin;
+      root.prepend(dns);
     } catch {}
   }
 
-  // ── Start ─────────────────────────────────────────────────────────────────
-  // Kicked off last so every const/let above is initialized before any
-  // storage callback can run applyOpts().
-  chrome.storage.local.get({ bhOpts: null }, d => {
-    if (d.bhOpts) {
-      applyOpts(withDefaults(d.bhOpts));
-    } else {
-      chrome.storage.sync.get(BH_DEFAULTS, synced => {
-        applyOpts(withDefaults(synced));
-        chrome.storage.local.set({ bhOpts: synced });
-      });
+  // ── Load settings then process page ───────────────────────────────────────
+  // Options are loaded once, in shared.js, and shared with prehook.js via
+  // bhOnReady/bhOnOptsChange — see the v0.0.6 note at the top of shared.js.
+  bhOnReady(o => {
+    opts = o;
+    const active = !!(opts.enabled && opts.proxyBase);
+    setObserverEnabled(active);
+    if (active) {
+      injectPreconnect(opts.proxyBase);
+      rewriteAll();
     }
   });
-
-  // Stay current: local mirror (instant) primary, sync as fallback for
-  // browsers where the service worker may be asleep (Kiwi/Cromite).
-  chrome.storage.onChanged?.addListener((changes, area) => {
-    if (area === "local" && changes.bhOpts) {
-      applyOpts(withDefaults(changes.bhOpts.newValue));
-    } else if (area === "sync") {
-      chrome.storage.sync.get(BH_DEFAULTS, synced => {
-        chrome.storage.local.set({ bhOpts: synced });
-        applyOpts(withDefaults(synced));
-      });
+  bhOnOptsChange(o => {
+    opts = o;
+    const active = !!(opts.enabled && opts.proxyBase);
+    setObserverEnabled(active);
+    if (active) {
+      injectPreconnect(opts.proxyBase);
+      rewriteAll();
     }
   });
 })();

@@ -81,8 +81,7 @@ enabledEl.addEventListener("change", async () => {
   const enabled = enabledEl.checked;
   await chrome.storage.sync.set({ enabled });
   updateEnabledUI(enabled);
-  // No explicit loadSiteUI here: the site card doesn't depend on `enabled`,
-  // and the storage.onChanged listener below refreshes everything anyway.
+  loadSiteUI(await chrome.storage.sync.get(DEFAULTS));
 });
 
 // ── Grayscale ─────────────────────────────────────────────────────────────────
@@ -167,8 +166,8 @@ excludeBtn.addEventListener("click", async () => {
   const matched = matchingExcludedDomain(currentHost, list);
   if (matched) list.delete(matched);
   else list.add(currentHost);
-  // The storage.onChanged listener below refreshes the site card.
   await chrome.storage.sync.set({ excludeDomains: Array.from(list).join(" ") });
+  loadSiteUI(await chrome.storage.sync.get(DEFAULTS));
 });
 
 // ── Open settings page ────────────────────────────────────────────────────────

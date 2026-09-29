@@ -86,26 +86,28 @@ function mirrorToLocal() {
 
 // ── Lifecycle ─────────────────────────────────────────────────────────────────
 
-// One init path for install + startup (they were two identical copies).
-function initAfterWebpCheck() {
-  checkWebpSupport(function(isWebpSupported) {
-    chrome.storage.sync.set({ isWebpSupported: isWebpSupported });
-    mirrorToLocal();
-    refreshRules();
-    updateIcon();
-  });
-}
-
 chrome.runtime.onInstalled.addListener(function() {
   chrome.storage.sync.get(DEFAULTS, function(d) { chrome.storage.sync.set(d); });
   chrome.storage.local.get(
     { stats: { filesProcessed: 0, bytesProcessed: 0, bytesSaved: 0 } },
     function(d) { chrome.storage.local.set(d); }
   );
-  initAfterWebpCheck();
+  checkWebpSupport(function(isWebpSupported) {
+    chrome.storage.sync.set({ isWebpSupported: isWebpSupported });
+    mirrorToLocal();
+    refreshRules();
+    updateIcon();
+  });
 });
 
-chrome.runtime.onStartup.addListener(initAfterWebpCheck);
+chrome.runtime.onStartup.addListener(function() {
+  checkWebpSupport(function(isWebpSupported) {
+    chrome.storage.sync.set({ isWebpSupported: isWebpSupported });
+    mirrorToLocal();
+    refreshRules();
+    updateIcon();
+  });
+});
 
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== "sync") return;
@@ -141,13 +143,14 @@ function updateIcon() {
 // Reads x-bytes-saved and x-original-size from proxy responses.
 // Non-blocking — only observes, never delays requests.
 function getHeaderInt(headers, name) {
-  if (!Array.isArray(headers)) return null;
-  const h = headers.find(h => h.name.toLowerCase() === name);
-  const n = h ? parseInt(h.value, 10) : NaN;
-  return isNaN(n) ? null : n;
+  if (!Array.isArray(headers)) return false;
+  const h = headers.find(h => h.name.toLowerCase() === name.toLowerCase());
+  if (!h) return false;
+  const n = parseInt(h.value, 10);
+  return isNaN(n) ? false : n;
 }
 
-if (chrome.webRequest && chrome.webRequest.onCompleted) {
+if (chrome.webRequest && !chrome.webRequest.onCompleted.hasListener(onProxyCompleted)) {
   chrome.webRequest.onCompleted.addListener(
     onProxyCompleted,
     { urls: ["<all_urls>"], types: ["image"] },
@@ -170,14 +173,11 @@ function flushStats() {
   chrome.storage.local.get(
     { stats: { filesProcessed: 0, bytesProcessed: 0, bytesSaved: 0 } },
     function(d) {
-      // d can be undefined if the read failed; without this guard the throw
-      // left statsWriteBusy stuck true and stats stopped recording for good.
-      const s = (d && d.stats) || { filesProcessed: 0, bytesProcessed: 0, bytesSaved: 0 };
+      const s = d.stats || { filesProcessed: 0, bytesProcessed: 0, bytesSaved: 0 };
       s.filesProcessed += delta.filesProcessed;
       s.bytesProcessed += delta.bytesProcessed;
       s.bytesSaved     += delta.bytesSaved;
       chrome.storage.local.set({ stats: s }, function() {
-        void chrome.runtime.lastError;
         statsWriteBusy = false;
         flushStats();
       });
@@ -189,7 +189,7 @@ function onProxyCompleted({ responseHeaders, fromCache }) {
   if (fromCache) return;
   const bytesSaved    = getHeaderInt(responseHeaders, "x-bytes-saved");
   const bytesOriginal = getHeaderInt(responseHeaders, "x-original-size");
-  if (bytesSaved === null || bytesOriginal === null) return;
+  if (bytesSaved === false || bytesOriginal === false) return;
 
   pendingStats.filesProcessed += 1;
   pendingStats.bytesProcessed += bytesOriginal;
@@ -206,65 +206,35 @@ function onProxyCompleted({ responseHeaders, fromCache }) {
 // (e.g. await chrome.storage.sync.get()) is not available in classic
 // (non-module) service workers on Kiwi/Cromite and causes Status code: 2.
 
-// Bare hostnames from the excludeDomains setting (mirrors parseDomains in
-// defaults.js — this classic worker can't import it).
-function parseExcluded(text) {
-  return String(text || "")
-    .split(/[,\s]+/)
-    .map(function(x) { return x.trim().toLowerCase(); })
-    .map(function(x) { return x.replace(/^https?:\/\//, "").split("/")[0]; })
-    .map(function(x) { return x.replace(/^\*?\./, "").replace(/\.$/, ""); })
-    .filter(Boolean);
-}
-
 function doRefreshRules() {
   return new Promise(function(resolve) {
     // Content-script rewriting still works without DNR. Some older Chromium
     // forks expose the namespace only partially, so fail soft instead of
     // rejecting every queued refresh.
-    var dnr = chrome.declarativeNetRequest;
-    if (!dnr || !dnr.updateDynamicRules) { resolve(); return; }
+    if (!chrome.declarativeNetRequest?.updateDynamicRules) { resolve(); return; }
     chrome.storage.sync.get(DEFAULTS, function(opts) {
-      var addRules = [];
+      var removeRuleIds = ALL_RULE_IDS;
 
-      if (opts.enabled && opts.proxyBase) {
-        // Rule 2: strip CSP headers so proxy-domain images aren't blocked.
-        // Excluded domains are left alone: nothing is proxied there, so
-        // there's no reason to weaken their CSP (previously it was stripped
-        // from every site, including ones the user excluded).
-        var rule = {
-          id: RULE_ID_CSP,
-          priority: 1,
-          action: {
-            type: "modifyHeaders",
-            responseHeaders: [
-              { header: "content-security-policy",             operation: "remove" },
-              { header: "content-security-policy-report-only", operation: "remove" }
-            ]
-          },
-          condition: { resourceTypes: ["main_frame", "sub_frame"] }
-        };
-        var excluded = parseExcluded(opts.excludeDomains);
-        if (excluded.length) rule.condition.excludedRequestDomains = excluded;
-        addRules.push(rule);
+      if (!opts.enabled || !opts.proxyBase) {
+        chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: removeRuleIds }, resolve);
+        return;
       }
 
-      function apply() {
-        dnr.updateDynamicRules({ removeRuleIds: ALL_RULE_IDS, addRules: addRules }, resolve);
-      }
+      // Rule 2: Strip CSP headers so proxy-domain images aren't blocked by the page.
+      var addRules = [{
+        id: RULE_ID_CSP,
+        priority: 1,
+        action: {
+          type: "modifyHeaders",
+          responseHeaders: [
+            { header: "content-security-policy",             operation: "remove" },
+            { header: "content-security-policy-report-only", operation: "remove" }
+          ]
+        },
+        condition: { resourceTypes: ["main_frame", "sub_frame"] }
+      }];
 
-      // The worker re-runs its top-level init on every wake-up (it is woken
-      // by each image request via webRequest), so skip the rules update when
-      // the installed rules already match. A false mismatch merely costs one
-      // redundant update, i.e. the old behaviour.
-      if (!dnr.getDynamicRules) { apply(); return; }
-      dnr.getDynamicRules(function(existing) {
-        try {
-          var same = JSON.stringify(existing || []) === JSON.stringify(addRules);
-          if (same) { resolve(); return; }
-        } catch (e) {}
-        apply();
-      });
+      chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: removeRuleIds, addRules: addRules }, resolve);
     });
   });
 }
