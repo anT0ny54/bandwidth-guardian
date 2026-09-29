@@ -43,8 +43,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build release ZIP
-        run: bash ./build.sh --out ./dist
+      - name: Read manifest version
+        id: version
+        shell: bash
+        run: echo "version=$(python3 -c 'import json; print(json.load(open("manifest.json"))["version"])')" >> "$GITHUB_OUTPUT"
+
+      # Reuse the zip the build job already produced (the build is
+      # reproducible) instead of building a second time.
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: bandwidth-guardian-${{ steps.version.outputs.version }}
+          path: dist
 
       - name: Publish manifest version release
         env:
