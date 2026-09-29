@@ -81,7 +81,8 @@ enabledEl.addEventListener("change", async () => {
   const enabled = enabledEl.checked;
   await chrome.storage.sync.set({ enabled });
   updateEnabledUI(enabled);
-  loadSiteUI(await chrome.storage.sync.get(DEFAULTS));
+  // No explicit loadSiteUI here: the site card doesn't depend on `enabled`,
+  // and the storage.onChanged listener below refreshes everything anyway.
 });
 
 // ── Grayscale ─────────────────────────────────────────────────────────────────
@@ -166,8 +167,8 @@ excludeBtn.addEventListener("click", async () => {
   const matched = matchingExcludedDomain(currentHost, list);
   if (matched) list.delete(matched);
   else list.add(currentHost);
+  // The storage.onChanged listener below refreshes the site card.
   await chrome.storage.sync.set({ excludeDomains: Array.from(list).join(" ") });
-  loadSiteUI(await chrome.storage.sync.get(DEFAULTS));
 });
 
 // ── Open settings page ────────────────────────────────────────────────────────
@@ -175,8 +176,17 @@ excludeBtn.addEventListener("click", async () => {
 // tabs.create() works everywhere.
 
 settingsBtn.addEventListener("click", () => {
-  chrome.tabs.create({ url: chrome.runtime.getURL("options.html") })
-    .catch(() => chrome.runtime.openOptionsPage?.());
+  const openFallback = () => {
+    try { chrome.runtime.openOptionsPage?.(); } catch { /* best-effort fallback */ }
+  };
+  try {
+    const created = chrome.tabs.create({ url: chrome.runtime.getURL("options.html") });
+    // Older Chromium forks may implement only the callback API and return
+    // undefined; guard before chaining so that path does not throw.
+    if (created && typeof created.catch === "function") created.catch(openFallback);
+  } catch {
+    openFallback();
+  }
 });
 
 // ── Sync with changes made on the settings page ───────────────────────────────

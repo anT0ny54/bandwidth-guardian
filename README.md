@@ -62,13 +62,13 @@ Image interception uses three content scripts injected at `document_start`, in t
 
 | Script | Role |
 |---|---|
-| `shared.js` | Single source of truth for default settings, tracking-pixel patterns, the "should this URL be proxied?" decision, and the proxy-URL builder. Loaded first so `prehook.js` and `content.js` — which run in the same per-frame isolated world — see it as ordinary globals instead of each keeping their own copy. |
-| `prehook.js` | Patches `HTMLImageElement.prototype.src`, `srcset`, `setAttribute`, and `Image()` before the HTML parser runs. Catches all JS-set images with zero wasted bytes. |
-| `content.js` | Rewrites HTML-parsed `<img src>`, srcset, lazy `data-*` attributes, and inline `background-image` after settings load. Also injects `<link rel="preconnect">` to warm the proxy connection. |
+| `shared.js` | Pure helpers: default settings, tracking-pixel patterns, the "should this URL be proxied?" decision, relative-URL resolution, a spec-style `srcset` parser/rewriter, and the proxy-URL builder. Loaded first so `prehook.js` and `content.js` see it as ordinary globals. |
+| `prehook.js` | Patches `HTMLImageElement.prototype.src`, `srcset` and `setAttribute` and queues assignments made before settings load. Options are pushed in by `content.js` (`bhPrehookSetOpts`). Note: content scripts run in an isolated world, so these patches only see calls made from that world unless the script is registered with `"world": "MAIN"`. |
+| `content.js` | Loads settings (once), then rewrites `<img src>`, `srcset`, lazy `data-*` attributes and inline `background-image`, and watches the DOM for later changes. Pages on excluded domains get no observer at all. Also injects `<link rel="preconnect">` to warm the proxy connection. |
 
 Settings are mirrored from `storage.sync` to `storage.local` by the service worker so content scripts can read them in ~5 ms instead of ~30–80 ms.
 
-DNR is used only to strip CSP headers — image redirection is done in content scripts because Chrome's `regexSubstitution` cannot `encodeURIComponent`, which breaks any image URL containing query parameters.
+DNR is used only to strip CSP headers (skipping your excluded domains) — image redirection is done in content scripts because Chrome's `regexSubstitution` cannot `encodeURIComponent`, which breaks any image URL containing query parameters.
 
 ---
 
@@ -78,7 +78,7 @@ DNR is used only to strip CSP headers — image redirection is done in content s
 bandwidth-guardian/
 ├── _locales/en/messages.json   # Extension name and description (i18n)
 ├── icons/                      # 16 / 32 / 48 / 128 px, active + disabled
-├── shared.js                   # Shared content-script constants + URL logic
+├── shared.js                   # Shared content-script helpers (URL logic, srcset)
 ├── prehook.js                  # Layer 1 prototype patcher
 ├── content.js                  # Layer 2 image rewriter
 ├── defaults.js                 # Defaults for popup.js / options.js (ES module)

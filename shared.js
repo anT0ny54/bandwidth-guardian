@@ -1,43 +1,19 @@
 // Bandwidth Guardian — shared content-script constants & helpers
 //
 // Loaded first — see manifest.json's single `content_scripts` entry:
-// "js": ["shared.js", "prehook.js", "content.js"]. All three run in the
-// same per-frame isolated world for this extension, so the top-level
-// `const`/`function` declarations below are ordinary globals to both
-// prehook.js and content.js.
+// "js": ["shared.js", "prehook.js", "content.js"]. All three run in the same
+// per-frame isolated world, so the top-level declarations below are ordinary
+// globals to prehook.js and content.js.
 //
-// This used to be two independently maintained ("KEEP IN SYNC") copies of
-// the same DEFAULTS / TRACKING_PATTERNS / skip-URL / build-proxy-URL logic,
-// one in each file. That duplication had already drifted apart in two
-// ways that are now fixed by having exactly one copy:
-//   1. prehook.js's skip check only compared the *image's* hostname
-//      against excludeDomains, never the current *page's* hostname the
-//      way content.js already did. So "Exclude this site" (popup.js)
-//      silently only worked for HTML-parsed images — any image assigned
-//      via JavaScript (lazy-loaders, SPA frameworks, `new Image()`) on an
-//      excluded page still went through the proxy.
-//   2. prehook.js had no "already proxied" guard. content.js rewrites lazy
-//      attributes (data-src, etc.) to the *proxy* URL so that when a
-//      lazy-loader later runs `img.src = img.dataset.src`, prehook.js
-//      would see an already-correct URL. Lacking the guard, prehook.js
-//      wrapped that URL in the proxy a second time — `proxy?url=<proxy
-//      URL>` — breaking every lazy-loaded image on any site using the
-//      common data-src pattern.
+// This file holds the pure logic (defaults, tracking patterns, the "leave this
+// URL alone?" decision, proxy-URL builder, srcset parsing/rewriting). The
+// storage-backed options loader now lives in content.js, its only consumer
+// left; prehook.js is handed options through the small hook it exposes (see
+// prehook.js).
 //
-// service-worker.js still inlines its own copy of DEFAULTS — classic
-// (non-module) service workers on Kiwi/Cromite run in a separate context
-// that can't load this file the way content scripts do. defaults.js (an
-// ES module) is the copy used by popup.js/options.js for the same reason.
-// Three "sources of truth" still exist, but each is now used by exactly
-// one context instead of two files silently doing the same job.
-//
-// v0.0.6: the "load bhOpts from storage.local, fall back to storage.sync,
-// then listen for changes" sequence below used to be duplicated almost
-// verbatim in both prehook.js and content.js (~15 lines each, two separate
-// chrome.storage.local.get calls per page load). It now lives once, here,
-// as a tiny ready/subscribe API (bhOnReady / bhOnOptsChange) that both
-// files call into. Same behavior and timing, one storage read instead of
-// two, and one place to fix if the load sequence ever needs to change.
+// service-worker.js and defaults.js (ES module for popup/options) keep their
+// own copies of DEFAULTS because they run in contexts that cannot load this
+// file. Keep the three in sync.
 
 const BH_DEFAULTS = {
   enabled:         true,
@@ -69,20 +45,33 @@ const BH_TRACKING_PATTERNS = [
   /ad\.doubleclick\.net/i
 ];
 
+// One combined regex is a single pass per URL instead of 13 separate tests.
+const BH_TRACKING_RE = new RegExp(BH_TRACKING_PATTERNS.map(p => p.source).join("|"), "i");
+
 function bhSafeURL(u) { try { return new URL(u); } catch { return null; } }
 function bhIsHttp(u) { return /^https?:\/\//i.test(u); }
 
-// Captured here, before prehook.js patches HTMLImageElement.prototype.src —
-// shared.js is guaranteed to run first (manifest.json content_scripts order).
-// prehook.js reuses this instead of capturing its own copy, and content.js
-// uses it to write already-decided proxy URLs straight to the DOM. Without
-// a shared reference, a file that queries
-// Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, "src") after
-// prehook.js has run gets prehook's *patched* descriptor back, not the
-// browser's real one, and silently re-enters prehook's setter instead of
-// bypassing it (see content.js's rewriteImg for where this used to happen).
-const BH_NATIVE_IMG_SRC_DESC = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, "src");
-function bhNativeSetImgSrc(el, v) { BH_NATIVE_IMG_SRC_DESC.set.call(el, v); }
+// Resolves relative ("/img/a.jpg"), protocol-relative ("//cdn.x/a.jpg") and
+// absolute URLs against the document base. Returns an absolute http(s) URL
+// string, or null for data:/blob:/about:/javascript: and unparsable input.
+// Previously only URLs already starting with http(s):// were ever proxied, so
+// every relative or protocol-relative image was silently left uncompressed.
+function bhAbsUrl(raw) {
+  const s = String(raw || "").trim();
+  if (!s) return null;
+  if (bhIsHttp(s)) return s;
+  if (/^[a-z][a-z0-9+.-]*:/i.test(s)) return null; // data:, blob:, about:, ...
+  try {
+    const u = new URL(s, document.baseURI);
+    return (u.protocol === "http:" || u.protocol === "https:") ? u.href : null;
+  } catch { return null; }
+}
+
+const BH_IMG_EXT_RE = /\.(jpe?g|png|gif|webp|avif|bmp)$/i;
+function bhLooksLikeImage(url) {
+  const u = bhSafeURL(url);
+  return !!u && BH_IMG_EXT_RE.test(u.pathname);
+}
 
 function bhDomainSet(text) {
   return new Set(
@@ -92,6 +81,20 @@ function bhDomainSet(text) {
       .map(s => s.replace(/^\*?\./, "").replace(/\.$/, ""))
       .filter(Boolean)
   );
+}
+
+// Image-heavy pages can evaluate this helper thousands of times. Rebuild the
+// parsed Set only when the options object or its excludeDomains text changes.
+const BH_DOMAIN_SET_CACHE = new WeakMap();
+function bhCachedDomainSet(opts) {
+  const key  = (opts && typeof opts === "object") ? opts : BH_DEFAULTS;
+  const text = String(opts?.excludeDomains || "");
+  let cached = BH_DOMAIN_SET_CACHE.get(key);
+  if (!cached || cached.text !== text) {
+    cached = { text, set: bhDomainSet(text) };
+    BH_DOMAIN_SET_CACHE.set(key, cached);
+  }
+  return cached.set;
 }
 
 function bhHostMatchesDomain(hostname, domainSet) {
@@ -112,15 +115,16 @@ function bhShouldSkip(url, hostname, opts, pageHostname) {
   if (!opts) return false;
   if (opts.enabled === false) return true;
   const host = String(hostname || "").toLowerCase();
-  const ex = bhDomainSet(opts.excludeDomains);
+  const ex = bhCachedDomainSet(opts);
   if (bhHostMatchesDomain(host, ex)) return true;
   if (pageHostname && bhHostMatchesDomain(pageHostname, ex)) return true;
   const proxyHost = opts.proxyBase ? bhSafeURL(opts.proxyBase)?.hostname?.toLowerCase() : null;
   if (proxyHost && host === proxyHost) return true;
-  const path = String(url || "").toLowerCase();
+  const parsed = bhSafeURL(String(url || ""));
+  const path = (parsed ? parsed.pathname : String(url || "").split(/[?#]/)[0]).toLowerCase();
   if (path.endsWith(".ico") || path.endsWith(".svg")) return true;
   if (path.includes("favicon")) return true;
-  if (BH_TRACKING_PATTERNS.some(p => p.test(String(url || "")))) return true;
+  if (BH_TRACKING_RE.test(String(url || ""))) return true;
   return false;
 }
 
@@ -131,7 +135,15 @@ function bhBuildProxyUrl(orig, opts) {
   if (!opts || opts.enabled === false || !opts.proxyBase || !bhIsHttp(orig)) return orig;
   const base = String(opts.proxyBase).trim();
   if (!base) return orig;
-  const sep  = base.includes("?") ? "&" : "?";
+
+  // Keep any fragment after the generated query string. Appending directly to
+  // a proxyBase such as "https://proxy.example/path#section" would otherwise
+  // place every parameter inside the fragment where the proxy never sees it.
+  const hashAt = base.indexOf("#");
+  const hash = hashAt === -1 ? "" : base.slice(hashAt);
+  const baseNoHash = hashAt === -1 ? base : base.slice(0, hashAt);
+  const sep = baseNoHash.includes("?") ? "&" : "?";
+
   const jpeg = opts.isWebpSupported ? "0" : "1"; // jpeg=1 when WebP unsupported
   const bw   = opts.grayscale ? "1" : "0";
   const parts = [
@@ -141,73 +153,57 @@ function bhBuildProxyUrl(orig, opts) {
     "quality=" + encodeURIComponent(String(opts.quality ?? 40)),
   ];
   if (opts.maxWidth) parts.push("max_width=" + encodeURIComponent(String(opts.maxWidth)));
-  return base + sep + parts.join("&");
+  return baseNoHash + sep + parts.join("&") + hash;
 }
 
-// ── Shared options loader / subscription ────────────────────────────────────
-// Single storage.local (falling back to storage.sync) load, shared by
-// prehook.js and content.js instead of each running its own. See the v0.0.6
-// note above.
-let BH_OPTS  = null;   // latest known options, or null until the first load resolves
-let BH_READY = false;  // true once the first load has resolved at least once
-
-const BH_READY_CBS  = [];  // one-shot callbacks waiting on the first load
-const BH_CHANGE_CBS = [];  // persistent callbacks for every later change
-
-// Calls cb(opts) once options are available — immediately if already loaded,
-// otherwise as soon as the first load resolves. Safe to call from either
-// prehook.js or content.js regardless of which one happens to run first.
-function bhOnReady(cb) {
-  if (BH_READY) cb(BH_OPTS);
-  else BH_READY_CBS.push(cb);
-}
-
-// Calls cb(opts) every time options change after the first load (settings
-// page edits, popup toggles, sync from another device). Does NOT fire for
-// the initial load — use bhOnReady for that.
-function bhOnOptsChange(cb) { BH_CHANGE_CBS.push(cb); }
-
-function bhResolveReady() {
-  BH_READY = true;
-  const cbs = BH_READY_CBS.splice(0);
-  cbs.forEach(cb => { try { cb(BH_OPTS); } catch {} });
-}
-
-function bhNotifyChange() {
-  BH_CHANGE_CBS.forEach(cb => { try { cb(BH_OPTS); } catch {} });
-}
-
-// Try storage.local first (bhOpts mirror written by the service worker, ~5 ms).
-// If bhOpts is missing — fresh install, service worker not yet run, or browser
-// restart before onStartup fired — fall back to storage.sync so we never
-// silently use empty defaults and let original images through.
-chrome.storage.local.get({ bhOpts: null }, d => {
-  if (d.bhOpts) {
-    BH_OPTS = d.bhOpts;
-    bhResolveReady();
-  } else {
-    chrome.storage.sync.get(BH_DEFAULTS, synced => {
-      BH_OPTS = synced;
-      bhResolveReady();
-      // Write the mirror so subsequent pages load fast.
-      chrome.storage.local.set({ bhOpts: synced });
-    });
+// Spec-style srcset parser. Commas only separate candidates when they are not
+// part of the URL token, so Cloudinary/imgix-style URLs such as
+// ".../w_300,h_200/a.jpg 1x" and data: URLs are kept intact. The old
+// split(",") approach cut those URLs in half and proxied the broken fragment.
+function bhParseSrcset(str) {
+  const s = String(str || "");
+  const out = [];
+  let i = 0;
+  const n = s.length;
+  while (i < n) {
+    while (i < n && /[\s,]/.test(s[i])) i++;
+    if (i >= n) break;
+    const start = i;
+    while (i < n && !/\s/.test(s[i])) i++;
+    let url = s.slice(start, i);
+    let desc = "";
+    if (/,+$/.test(url)) {
+      url = url.replace(/,+$/, "");
+    } else {
+      const dStart = i;
+      let depth = 0;
+      while (i < n) {
+        const c = s[i];
+        if (c === "(") depth++;
+        else if (c === ")") depth = Math.max(0, depth - 1);
+        else if (c === "," && depth === 0) break;
+        i++;
+      }
+      desc = s.slice(dStart, i).trim();
+    }
+    if (url) out.push({ url, desc });
   }
-});
+  return out;
+}
 
-// Stay current when settings change.
-// Primary: local area (bhOpts mirror, instant).
-// Fallback: sync area — catches changes when the service worker is inactive
-// or not supported (Kiwi/Cromite).
-chrome.storage.onChanged?.addListener((changes, area) => {
-  if (area === "local" && changes.bhOpts) {
-    BH_OPTS = changes.bhOpts.newValue || BH_DEFAULTS;
-    if (!BH_READY) bhResolveReady(); else bhNotifyChange();
-  } else if (area === "sync") {
-    chrome.storage.sync.get(BH_DEFAULTS, synced => {
-      BH_OPTS = synced;
-      chrome.storage.local.set({ bhOpts: synced });
-      if (!BH_READY) bhResolveReady(); else bhNotifyChange();
-    });
-  }
-});
+// Single srcset rewriter shared by prehook.js and content.js. Relative URLs
+// are resolved to absolute; anything non-http(s) is left as-is.
+function bhRewriteSrcset(srcset, opts, pageHostname = location.hostname) {
+  if (!srcset || !opts || opts.enabled === false || !opts.proxyBase) return srcset;
+
+  let touched = false;
+  const parts = bhParseSrcset(srcset).map(({ url, desc }) => {
+    const abs = bhAbsUrl(url);
+    const u = abs && bhSafeURL(abs);
+    if (!u || bhShouldSkip(abs, u.hostname, opts, pageHostname)) return url + (desc ? " " + desc : "");
+    touched = true;
+    return bhBuildProxyUrl(abs, opts) + (desc ? " " + desc : "");
+  });
+
+  return touched ? parts.join(", ") : srcset;
+}
