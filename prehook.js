@@ -184,61 +184,28 @@
     }
   }
 
-  // Try storage.local first (bhOpts mirror written by the service worker, ~5 ms).
-  // If bhOpts is missing — fresh install, service worker not yet run, or browser
-  // restart before onStartup fired — fall back to storage.sync so we never
-  // silently use empty defaults and let original images through.
-  // Everything lives in bindSettings() with a try/catch: this script runs in
-  // the page's MAIN world, and a chrome.* gap there must degrade to defaults
-  // (empty proxyBase = pass-through) instead of dying mid-interception.
-  function bindSettings() {
+  // Settings arrive from content.js through a JSON-serialized DOM event.
+  // This script runs in the page MAIN world, so it must not access extension
+  // APIs such as chrome.storage. content.js owns storage access and publishes
+  // only the small, non-secret settings object needed by this interceptor.
+  const SETTINGS_EVENT = "bh-settings-update";
+  document.addEventListener(SETTINGS_EVENT, event => {
+    if (destroyed) return;
     try {
-      chrome.storage.local.get({ bhOpts: null }, d => {
-        if (destroyed) return;
-        if (d.bhOpts) {
-          applyOpts(d.bhOpts);
-          flushPending();
-        } else {
-          chrome.storage.sync.get(defaults, synced => {
-            if (destroyed) return;
-            applyOpts(synced);
-            flushPending();
-            // Write the mirror so subsequent pages load fast
-            try { chrome.storage.local.set({ bhOpts: synced }); } catch {}
-          });
-        }
+      const raw = event?.detail;
+      const next = typeof raw === "string" ? JSON.parse(raw) : null;
+      if (!next || typeof next !== "object") return;
+      applyOpts({
+        enabled: next.enabled !== false,
+        proxyBase: typeof next.proxyBase === "string" ? next.proxyBase : "",
+        quality: next.quality,
+        grayscale: next.grayscale,
+        maxWidth: next.maxWidth,
+        excludeDomains: typeof next.excludeDomains === "string" ? next.excludeDomains : ""
       });
-
-      // Stay current when settings change.
-      // Primary: local area (bhOpts mirror, instant).
-      // Fallback: sync area — catches changes when the service worker is inactive
-      // or not supported (Kiwi/Cromite).
-      chrome.storage.onChanged.addListener((changes, area) => {
-        if (destroyed) return;
-            if (area === "local" && changes.bhOpts) {
-          const next = changes.bhOpts.newValue || defaults;
-          if (sameOpts(next, opts)) return; // already applied via the sync path
-          applyOpts(next);
-          flushPending();
-        } else if (area === "sync") {
-          const apply = next => {
-            if (destroyed || sameOpts(next, opts)) return;
-            applyOpts(next);
-            flushPending();
-            // The service worker normally refreshes the mirror; harmless if it already did.
-            try { chrome.storage.local.set({ bhOpts: next }); } catch {}
-          };
-          if (!opts) { chrome.storage.sync.get(defaults, apply); return; } // initial load still pending
-          const next = { ...opts };
-          for (const [k, c] of Object.entries(changes)) if (k in defaults) next[k] = c.newValue ?? defaults[k];
-          apply(next);
-        }
-      });
-    } catch {
-      setTimeout(() => { if (!destroyed) { applyOpts(defaults); flushPending(); } }, 0);
-    }
-  }
-  bindSettings();
+      flushPending();
+    } catch {}
+  });
 
   // Capture native property descriptors BEFORE we patch them
   const imgProto = HTMLImageElement.prototype;
@@ -254,9 +221,8 @@
   function nativeSetSrc(el, v) { srcDesc.set.call(el, v); }
   function nativeSetSrcset(el, v) { srcsetDesc?.set?.call(el, v); }
 
-  // (The old __bhShared handoff was removed when prehook moved to the page's
-  // MAIN world: JS objects cannot cross worlds. content.js reads failed state
-  // via the data-bh-failed attribute and captures its own native setters.)
+  // Native setters are captured independently in this world. Failed elements
+  // are shared through the data-bh-failed DOM attribute instead of JS objects.
   function nativeSourceSetSrcset(el, v) { sourceSrcsetDesc?.set?.call(el, v); }
 
   // Spec-style srcset parser: a comma inside a URL (e.g. Cloudinary "w_400,h_300")

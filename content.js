@@ -54,6 +54,25 @@
   };
   // ──────────────────────────────────────────────────────────────────────────
 
+  // prehook.js runs in the page MAIN world and cannot use extension APIs.
+  // Publish only the serializable settings it needs through a DOM event.
+  // JSON avoids passing extension-world object wrappers across worlds.
+  const SETTINGS_EVENT = "bh-settings-update";
+  function publishPrehookSettings(next) {
+    try {
+      document.dispatchEvent(new CustomEvent(SETTINGS_EVENT, {
+        detail: JSON.stringify({
+          enabled: next?.enabled !== false,
+          proxyBase: typeof next?.proxyBase === "string" ? next.proxyBase : "",
+          quality: next?.quality,
+          grayscale: !!next?.grayscale,
+          maxWidth: next?.maxWidth,
+          excludeDomains: typeof next?.excludeDomains === "string" ? next.excludeDomains : ""
+        })
+      }));
+    } catch {}
+  }
+
   // Lazy-load attributes used by common image libraries
   const LAZY_ATTRS = [
     "data-src", "data-iurl", "data-lazy-src", "data-original",
@@ -214,6 +233,7 @@
   }
 
   function applyOpts(next) {
+    publishPrehookSettings(next);
     updateProxyConfig(next);
     srcsetCache = new WeakMap();
     dataSrcsetCache = new WeakMap();

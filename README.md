@@ -1,157 +1,390 @@
 # 🛡️ Bandwidth Guardian
 
-> Save bandwidth by compressing images through your own image proxy before they load.
+> Reduce image bandwidth by routing supported image requests through a configurable image-compression proxy.
 
+**Bandwidth Guardian** is a Manifest V3 browser extension for Chromium-based browsers. It rewrites eligible image URLs to a proxy you control, while preserving the original URL as a fallback if the proxied image fails.
 
-Bandwidth Guardian is a Manifest V3 Chromium extension that rewrites image URLs so images are fetched through a configurable, self-hosted compression proxy before the browser downloads them. It supports WebP output, grayscale mode, quality presets, maximum image width, per-site exclusions, and usage statistics.
+The extension is intentionally **proxy-agnostic**: it does not require a built-in third-party image service. You provide the proxy endpoint in Settings.
 
-Works with **Chrome**, **Kiwi Browser**, **Cromite**, and other Chromium-based browsers that support Manifest V3. Firefox support is declared in the manifest (`browser_specific_settings.gecko`, minimum version 128).
+## Extension at a glance
+
+- Early page-JavaScript interception in the **MAIN world**.
+- Extension storage access stays in the **isolated world**.
+- A small JSON/DOM-event bridge passes settings from `content.js` to `prehook.js`.
+- Page-created images are safely parked until settings are available, then processed.
+- No JavaScript objects or `chrome.*` APIs are shared across execution worlds.
+- Supports normal images, `srcset`, `<picture>` sources, lazy-loading attributes, image preloads, inline background images, and dynamically inserted elements.
+- Automatic per-image fallback to the original URL when a proxy request fails.
+- Configurable quality, grayscale, maximum width, and excluded domains.
+- Local settings mirror for fast content-script startup.
+- Usage statistics collected from proxy response headers by the service worker.
+- CSP response-header handling through Declarative Net Request.
+- Reproducible deterministic build.
+
+## Important extension architecture fix
+
+Extension fixes the execution-world boundary used by the early interception layer.
+
+`prehook.js` runs in the page's **MAIN world** so page JavaScript can hit its native DOM property hooks. MAIN-world code must not depend on extension APIs such as `chrome.storage` in this design.
+
+The current flow is:
+
+```text
+Page JavaScript / HTML parser
+          │
+          ▼
+   prehook.js — MAIN world
+   synchronous DOM hooks
+          │
+          │ settings event (JSON)
+          ▼
+   content.js — ISOLATED world
+   chrome.storage + DOM processing
+          │
+          ▼
+   service-worker.js
+   settings mirror / CSP / stats / icon
+```
+
+At `document_start`, `prehook.js` installs its hooks synchronously. If settings have not arrived yet, eligible page-created URLs are temporarily parked instead of being allowed to download unprocessed. `content.js` reads the settings and publishes a JSON-serialized settings event; `prehook.js` then applies the configuration and flushes pending work.
+
+The two worlds do **not** exchange JavaScript objects. Proxy-failure state is communicated with the `data-bh-failed` DOM attribute.
 
 ## Features
 
-- **Custom image proxy** — use your own compatible proxy; Guardian does not depend on a fixed third-party image service.
-- **WebP output** — proxy requests are always sent with `jpeg=0`; every supported browser handles WebP.
-- **Grayscale mode** — optionally request black-and-white images from the proxy (`bw=1`). **On by default.**
-- **Quality presets** — **Small** (45, Most saving), **Normal** (60, Balanced), and **Sharp** (80, More detail), plus custom quality from 1–100. Default is **60**.
-- **Maximum image width** — **HD** (768 px, default), **Full HD** (1024 px), or **No limit** (original size). Larger images are resized before compression. A custom width is also accepted; `0` means no limit.
-- **Per-site exclusions** — skip domains that should not be proxied (none excluded by default); the toolbar popup can exclude or re-include the current site with one click.
-- **Usage stats** — tracks processed images, bytes received from the configured image proxy, and estimated bytes saved.
-- **Proxy connection test** — the settings page verifies the configured proxy endpoint responds with `bandwidth-hero-proxy`.
-- **CSP handling** — removes restrictive CSP response headers that can prevent proxy-served images from loading.
-- **Early image interception** — a `document_start` prehook injected into the page's **MAIN world** patches image property setters before the HTML parser runs, so JavaScript-created images (including `new Image()`) are proxied before the original bytes download.
-- **Dynamic image handling** — covers normal `src`, `srcset`, lazy-loading attributes, preload images, inline background images, and dynamically inserted content.
-- **Automatic fallback** — if a proxied image fails to load, Guardian restores the original image URL so pages do not stay broken.
-- **Local settings mirror** — keeps a fast `storage.local` copy of synchronized settings so interception can happen with minimal delay.
+### Image interception
 
-## Installation
+Guardian handles eligible image URLs from multiple paths:
 
-### From source (sideload)
+- `<img src>`
+- `<img srcset>`
+- `<source srcset>` inside responsive images
+- JavaScript assignments such as `image.src = ...`
+- `new Image().src`
+- `HTMLImageElement.srcset`
+- `HTMLImageElement.loading`
+- image-related `setAttribute()` calls
+- lazy-loading attributes used by common sites
+- `data-srcset`
+- `<link rel="preload" as="image">`
+- inline CSS `background-image` URLs
+- dynamically inserted DOM content
 
-1. Clone or download this repository.
-2. Open `chrome://extensions` (or `kiwi://extensions`).
-3. Enable **Developer mode**.
-4. Click **Load unpacked** and select the repository folder.
-5. Open Bandwidth Guardian settings and enter your image proxy URL.
+A batched `MutationObserver` handles dynamic changes without continuously scanning the entire document. The general content observer is deliberately not watching `href`, `rel`, or `as`; preload-specific handling is performed by the early MAIN-world prehook where required.
 
-### Reproducible build
+### Automatic fallback
 
-```bash
-bash build.sh
-# outputs: bandwidth-guardian-<version>.zip (version is read from manifest.json)
-```
+When a proxied image fails, Guardian restores the original URL. The failure is marked with `data-bh-failed` so the isolated and MAIN-world handlers can coordinate without sharing JavaScript objects.
 
-The build script reads the version from `manifest.json`, stages only extension runtime files, validates every shipped JavaScript file with Node, checks that every file referenced by the manifest is present, applies a fixed timestamp, sorts the archive entries, and creates a deterministic ZIP.
+### Requests that are intentionally skipped
 
-## Recommended proxy
+Guardian does not proxy URLs that are not appropriate image candidates, including:
 
-Need a proxy? → **[bandwidth-hero-proxy2](https://github.com/anT0ny54/bhp2)**
+- already-proxied URLs
+- configured excluded domains and their subdomains
+- favicons
+- `.ico` and `.svg` resources
+- known advertising/tracking/pixel URL patterns
+- invalid or unsupported URLs
 
-Bandwidth Guardian is designed around a configurable proxy rather than a hard-coded proxy service. The configured endpoint should accept the source image URL and compression parameters in its query string.
+This reduces unnecessary proxy traffic and avoids interfering with common browser/site infrastructure.
 
-Guardian sends parameters equivalent to:
+## Proxy URL format
+
+Set **Proxy URL** in the Options page to an `http://` or `https://` endpoint.
+
+Guardian appends parameters equivalent to:
 
 ```text
-?url=<encoded-image-url>&quality=<1-100>&bw=<0|1>&jpeg=<0|1>&max_width=<pixels>
+?url=<encoded-image-url>&jpeg=0&bw=<0|1>&quality=<1-100>&max_width=<pixels>
 ```
 
-The proxy should return `bandwidth-hero-proxy` when called without a `url` parameter; Guardian uses that response for the proxy connection test in the settings page.
+If the proxy URL already contains a query string, Guardian uses `&` instead of `?`.
+
+The source image URL is encoded with `encodeURIComponent()` before being placed in the proxy request.
+
+### Parameter meanings
+
+| Parameter | Meaning |
+|---|---|
+| `url` | Original image URL, URL-encoded by Guardian |
+| `jpeg` | Sent as `0`; the configured proxy can use this to select its non-JPEG/WebP-oriented output path |
+| `bw` | `1` when grayscale is enabled, otherwise `0` |
+| `quality` | Compression quality from `1` to `100` |
+| `max_width` | Maximum requested image width; omitted when unlimited |
+
+The proxy is responsible for interpreting these parameters and returning the compressed image. Guardian does not perform image compression inside the browser.
+
+### Proxy connection test
+
+The Options page can test the configured endpoint. A compatible proxy should respond with the text:
+
+```text
+bandwidth-hero-proxy
+```
+
+when called without a `url` parameter.
 
 ## Settings
 
-Defaults on a fresh install:
+Fresh-install defaults are:
 
 | Setting | Default |
-|---|---|
+|---|---:|
 | Enabled | `true` |
-| Proxy URL | *(empty — must be set)* |
-| Quality | `60` (Normal) |
+| Proxy URL | empty — must be configured |
+| Quality | `60` |
 | Grayscale | `true` |
-| Max width | `768` (HD) |
-| Excluded domains | *(empty)* |
+| Maximum width | `768` px |
+| Excluded domains | empty |
 
-### Quality
+### Quality presets
 
-| Preset | Quality | Meaning |
-|---|---:|---|
-| Small | 45 | Most saving |
-| Normal | 60 | Balanced |
-| Sharp | 80 | More detail |
+| Preset | Quality |
+|---|---:|
+| Small | `45` |
+| Normal | `60` |
+| Sharp | `80` |
 
-Changing a quality preset in the toolbar popup reloads the current tab so already-loaded images are processed with the new setting. A custom quality value from **1–100** can be entered under Advanced settings.
+A custom quality from `1` to `100` is also supported.
 
-### Maximum image width
+### Maximum width presets
 
 | Preset | Width |
 |---|---:|
-| HD | 768 px |
-| Full HD | 1024 px |
-| No limit | Original size |
+| HD | `768` px |
+| Full HD | `1024` px |
+| No limit | `0` / original size |
 
-Larger images are resized before compression. A custom maximum width can also be entered; `0` means no limit.
+A custom positive width can also be entered. `0` means no width limit.
+
+### Excluded domains
+
+Enter domains separated by spaces or commas. Exclusions apply to the configured domain and its subdomains.
+
+The toolbar popup can also exclude or re-include the current website.
 
 ## Usage statistics
 
-The Usage section on the settings page reports three counters:
+The Options page reports:
 
-- **Images** — completed requests to the configured proxy. Counted by the service worker via `chrome.webRequest.onCompleted` (filtered to `image` types), matching the configured proxy origin with an encoded `url=` parameter. Only successful (HTTP 2xx) responses count; cached responses are excluded.
-- **Proxy bytes** — bytes received from the proxy for those images. The worker reads response headers, preferring `x-bh-compressed-size` (or legacy `x-compressed-size`), then derives the delivered size from `x-bh-original-size` / `x-bytes-saved` (or legacy `x-original-size` / `x-bytes-saved`), and finally falls back to `Content-Length`. MV3 does not expose response bodies, so a proxy that returns none of these headers reports `0 B`.
-- **Data saved** — estimated bytes saved versus fetching the original images directly, from the proxy's `x-bh-bytes-saved` / `x-bh-original-size` headers (or legacy `x-bytes-saved` / `x-original-size`, or original-minus-received when only the original size is reported).
+- **Images** — completed successful proxy image responses counted by the service worker.
+- **Proxy bytes** — estimated bytes delivered by the configured proxy.
+- **Data saved** — estimated bytes saved compared with the original image size when the proxy supplies the required size information.
 
-Initial values are **0**, **0 B** and **0 B**. Statistics are stored locally on the device and can be reset from Settings.
+Statistics are collected from `webRequest.onCompleted` response headers. Cached responses are excluded, and only successful HTTP 2xx image responses matching the configured proxy origin are counted.
 
-The service worker accumulates deltas and flushes them to `storage.local` in batches (750 ms) instead of writing once per image. Page-side Resource Timing is intentionally **not** used for accounting — the service worker's response-header data is authoritative.
+The service worker understands these header families, preferring the `x-bh-*` names and supporting legacy names:
 
-These counters are not a full bandwidth-savings calculation. They describe the data delivered by the configured proxy.
+```text
+x-bh-compressed-size   / x-compressed-size
+x-bh-original-size     / x-original-size
+x-bh-bytes-saved       / x-bytes-saved
+```
 
-## Architecture
+If compressed size is not provided, `Content-Length` can be used as a fallback. If the proxy does not provide usable size headers, the corresponding statistics may remain `0` or be less complete.
 
-Image interception uses two content scripts injected at `document_start` in separate manifest entries so `prehook.js` always runs before `content.js`. Failed proxy image loads automatically fall back to the original image URL so pages do not remain broken:
+Statistics are stored in `storage.local` and written in batches (750 ms) rather than once for every image response.
 
-| Script | Role |
-|---|---|
-| `prehook.js` | Runs synchronously before the HTML parser, in the page's **MAIN world** (`"world": "MAIN"` in the manifest) so page JavaScript actually hits the patches. Patches `HTMLImageElement.prototype.src`, `srcset`, and `loading`, `HTMLSourceElement.prototype.srcset`, `HTMLLinkElement.prototype.href` (for image preloads), and `Element.prototype.setAttribute`. JavaScript-assigned URLs — including `new Image().src` — go through these prototype setters, so no `Image()` constructor patch is needed. Stashes work that arrives before settings load (preloads are parked on `about:blank` meanwhile), and arms the per-image error fallback. |
-| `content.js` | Runs in the extension's isolated world, after the storage read. Handles parser-created `<img src>`, `srcset`, lazy `data-*` attributes, preload `<link>` elements, inline `background-image` values, dynamic DOM changes via a batched MutationObserver, per-element rewrite caching, and navigation cleanup. Because JS objects cannot cross worlds, `content.js` captures its own native setters and reads failed-element state from the `data-bh-failed` attribute that `prehook.js` writes. |
+### Resetting statistics
 
-The service worker mirrors `storage.sync` settings to `storage.local` so content scripts can read the current configuration quickly. It also manages CSP response-header rules, the extension icon state, and batched usage-stat updates collected from proxy response headers.
+Use **Reset statistics** in the Options page. This clears the local counters without changing your extension settings.
 
-DNR is used for CSP handling only. Image URL rewriting stays in the content scripts because the proxy source URL must be safely `encodeURIComponent`-encoded; DNR regex substitution cannot perform that encoding.
+## Installation
 
-`prehook.js` must run in the MAIN world for its prototype patches to intercept page JavaScript; the trade-off is that it cannot share JS objects with `content.js`, hence the `data-bh-failed` attribute channel and the duplicated (KEEP IN SYNC) constants.
+### Chromium / Kiwi / Cromite
+
+1. Download or clone the project.
+2. Open the browser's extensions page:
+   - Chrome: `chrome://extensions`
+   - Kiwi: `kiwi://extensions`
+   - Chromium-based equivalents may use their normal extensions URL.
+3. Enable **Developer mode**.
+4. Choose **Load unpacked**.
+5. Select the project directory containing `manifest.json`.
+6. Open Bandwidth Guardian settings.
+7. Enter a compatible image proxy URL.
+8. Reload the target page after changing URL-shaping settings if necessary.
+
+### Firefox
+
+The manifest declares Firefox metadata with a minimum Gecko version of 128. The project has not been certified here as a full Firefox release; browser-specific smoke testing should be performed before treating Firefox as a supported production target.
+
+## Build from source
+
+Requirements:
+
+- Bash
+- Node.js
+- standard ZIP tooling
+
+Run:
+
+```bash
+bash build.sh
+```
+
+The build script:
+
+1. reads the version from `manifest.json`;
+2. stages only runtime extension files;
+3. validates shipped JavaScript with Node syntax checks;
+4. checks manifest-referenced files;
+5. uses fixed timestamps and deterministic ordering; and
+6. produces a deterministic ZIP in `dist/`.
+
+For extension, the validated reproducible artifact is:
+
+```text
+bandwidth-guardian-*.zip
+```
+
+## Runtime architecture
+
+### `prehook.js`
+
+Runs at `document_start` in the **MAIN world**. It installs synchronous native DOM hooks for:
+
+- `HTMLImageElement.prototype.src`
+- `HTMLImageElement.prototype.srcset`
+- `HTMLImageElement.prototype.loading`
+- `HTMLSourceElement.prototype.srcset`
+- `HTMLLinkElement.prototype.href`
+- `Element.prototype.setAttribute`
+
+It also handles image preloads, pending work, proxy-failure fallback, exclusion checks, and already-proxied detection.
+
+It contains **no executable `chrome.*` extension API dependency**.
+
+### `content.js`
+
+Runs at `document_start` in the extension's **isolated world**. It owns extension storage access and the broader DOM processing layer.
+
+Responsibilities include:
+
+- loading settings from the local mirror with sync fallback;
+- publishing settings to `prehook.js` through the JSON event bridge;
+- reacting to settings changes;
+- parser-created image processing;
+- lazy attributes and `data-srcset`;
+- responsive `<source>` handling;
+- preload handling;
+- inline background images;
+- dynamic DOM processing;
+- rewrite caching and mutation batching;
+- navigation cleanup; and
+- reading the `data-bh-failed` fallback state.
+
+### `service-worker.js`
+
+Handles:
+
+- `storage.sync` → `storage.local` settings mirroring;
+- missing-setting initialization;
+- CSP response-header rules through Declarative Net Request;
+- enabled/disabled extension icon state;
+- proxy response-header statistics; and
+- batched local statistics writes.
+
+Image URL rewriting itself is **not** performed with a DNR redirect rule. The content scripts need normal JavaScript URL handling so the original image URL can be safely encoded.
+
+### `popup.js`
+
+Provides quick controls for:
+
+- enabling/disabling Guardian;
+- grayscale;
+- quality presets; and
+- excluding/re-including the current site.
+
+The popup listens for storage changes so its state stays synchronized with the Options page.
+
+### `options.js`
+
+Provides full configuration, proxy connection testing, custom quality/width controls, excluded domains, statistics, and statistics reset.
+
+Proxy URL validation parses the complete URL and accepts only `http:` or `https:` URLs.
 
 ## Project structure
 
 ```text
 bandwidth-guardian/
-├── CHANGELOG.md                # Release history
-├── _locales/en/messages.json   # Extension name and description
-├── icons/                      # Active + disabled extension icons
-├── content.js                  # Main image rewriter
-├── defaults.js                 # Shared default settings (KEEP IN SYNC with inlined copies)
-├── manifest.json               # MV3 extension manifest
-├── options.html / options.js   # Full settings page
-├── popup.html / popup.js       # Toolbar popup
-├── prehook.js                  # Early image interception
-├── service-worker.js           # DNR, settings mirror, icon, usage stats
-├── build.sh                    # Reproducible ZIP builder
+├── manifest.json
+├── defaults.js
+├── prehook.js
+├── content.js
+├── service-worker.js
+├── popup.html
+├── popup.js
+├── options.html
+├── options.js
+├── icons/
+│   ├── icon-16.png
+│   ├── icon-32.png
+│   ├── icon-48.png
+│   ├── icon-128.png
+│   └── disabled variants
+├── _locales/en/messages.json
+├── build.sh
+├── CHANGELOG.md
 ├── LICENSE
 └── README.md
 ```
 
-## Repository
-
-**Source:** [github.com/himshim/bandwidth-guardian](https://github.com/himshim/bandwidth-guardian)
-
-**Proxy:** [github.com/anT0ny54/bhp2](https://github.com/anT0ny54/bhp2)
-
 ## Permissions
 
-| Permission | Why it is needed |
-|------------|------------------|
-| `storage` | Persist settings and statistics |
-| `tabs` | Reload the correct content tab after settings change |
-| `declarativeNetRequestWithHostAccess` | Strip CSP headers on proxied pages |
-| `webRequest` | Read proxy response headers for stats |
-| `<all_urls>` | Intercept images on every website |
+| Permission | Purpose |
+|---|---|
+| `storage` | Store settings and local usage statistics |
+| `tabs` | Reload tabs after relevant settings changes |
+| `declarativeNetRequestWithHostAccess` | Manage CSP response-header handling |
+| `webRequest` | Read proxy response headers for usage statistics |
+| `<all_urls>` host access | Process eligible images on web pages |
+
+These permissions are required by the current implementation. The extension does not use a remote web service for its own settings or statistics.
+
+## Privacy and data flow
+
+Bandwidth Guardian does not need a central account or analytics server for its core operation.
+
+When an image is proxied, the configured proxy receives the image URL and the compression parameters described above. Therefore, **the proxy operator can see the URLs that are sent through the proxy** and should be trusted accordingly.
+
+Settings are stored through browser extension storage. Usage statistics are stored locally with the extension.
+
+Do not configure a proxy you do not trust for private or sensitive image URLs.
+
+## Compatible proxy
+
+A compatible Bandwidth Hero-style proxy implementation can be used. One example is:
+
+- https://github.com/anT0ny54/bhp2
+
+The proxy must support the request format and response behavior expected by this extension, including the optional statistics headers if accurate usage statistics are desired.
+
+## Validation status — extension 
+
+The extension source/build has been validated with:
+
+- JavaScript syntax checks for shipped scripts;
+- ZIP integrity validation;
+- reproducible build verification;
+- static feature/architecture assertions;
+- service-worker statistics unit tests; and
+- manifest/runtime-file consistency checks.
+
+The validation confirms the extension code/build paths described above.
+
+**Real-browser smoke testing remains a separate qualification step.** A full Chrome + Kiwi/Cromite device test should verify actual page JavaScript interception, proxy requests, failed-image fallback, CSP behavior, statistics, and browser-specific behavior before calling the release fully field-tested.
+
+## Repository
+
+Source repository:
+
+https://github.com/himshim/bandwidth-guardian
+
+Proxy example:
+
+https://github.com/anT0ny54/bhp2
 
 ## 🌐 Free DNS Services
 
