@@ -45,7 +45,6 @@ INCLUDE=(
   manifest.json
   defaults.js
   service-worker.js
-  shared.js
   prehook.js
   content.js
   popup.html
