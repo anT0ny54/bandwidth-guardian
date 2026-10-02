@@ -76,7 +76,15 @@ chrome.runtime.onInstalled.addListener(function() {
   // Top-level mirrorToLocal()/refreshRules()/updateIcon() already ran on this
   // same worker start; only seed missing sync keys here. Any resulting change
   // fires storage.onChanged, which refreshes the local mirror.
-  chrome.storage.sync.get(DEFAULTS, function(d) { chrome.storage.sync.set(d); });
+  // NOTE: get(null), not get(DEFAULTS, ...) — the latter merges defaults into
+  // the result, making every key "present" and the follow-up set unconditional
+  // (a redundant write + mirror/rules/icon refresh cascade on every install).
+  chrome.storage.sync.get(null, function(all) {
+    all = all || {};
+    var missing = {};
+    for (var k in DEFAULTS) if (!(k in all)) missing[k] = DEFAULTS[k];
+    if (Object.keys(missing).length) chrome.storage.sync.set(missing);
+  });
 });
 
 chrome.storage.onChanged.addListener((changes, area) => {

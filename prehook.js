@@ -1,4 +1,5 @@
-// Bandwidth Guardian — prehook (runs at document_start)
+// Bandwidth Guardian — prehook (runs at document_start, in the page's MAIN world
+// via manifest "world": "MAIN", so page JavaScript actually hits these patches)
 // Intercepts <img src>, srcset, and new Image() assignments to prevent the
 // original full-resolution images from ever being downloaded.
 (() => {
@@ -22,7 +23,7 @@
   const fallbackMeta = new WeakMap();
 
   function armProxyFallback(el, originalSrc, originalSrcset) {
-    if (!el || !(el instanceof HTMLImageElement) || shared.failed.has(el)) return;
+    if (!el || !(el instanceof HTMLImageElement) || isFailed(el)) return;
     // Merge: src and srcset are armed by separate calls; one must not erase the other.
     const prev = fallbackMeta.get(el) || {};
     fallbackMeta.set(el, {
@@ -37,7 +38,7 @@
       fallbackMeta.delete(el);
       // Never proxy this element again, otherwise content.js re-proxies the
       // restored original and a failing proxy is hammered in an endless loop.
-      shared.failed.add(el);
+      markFailed(el);
       try {
         if (meta.originalSrcset) nativeSetSrcset(el, meta.originalSrcset);
       } catch {}
@@ -65,9 +66,15 @@
       .map(s => s.replace(/^https?:\/\//, "").split("/")[0].replace(/\.$/, ""))
   );
   const isHttp = u => /^https?:\/\//i.test(u);
-  const SVG_URL_RE = /\.svg(?:[?#]|$)/i;
-  // Parity with content.js (KEEP IN SYNC): favicons/icons and known ad/tracking URLs.
-  const ICON_URL_RE = /favicon|\.ico(?:[?#]|$)/i;
+  // Parity with content.js (KEEP IN SYNC): favicons/.ico/.svg and known ad/tracking URLs.
+  const SKIP_URL_RE = /favicon|\.(?:ico|svg)(?:[?#]|$)/i;
+  // prehook.js runs in the page's MAIN world while content.js runs in the
+  // extension's isolated world, so JS objects cannot be shared between them.
+  // Elements whose proxy load failed are flagged with a DOM attribute that
+  // both worlds can read (and neither MutationObserver watches it).
+  const FAILED_ATTR = "data-bh-failed";
+  const isFailed = el => !!el && el.nodeType === 1 && el.hasAttribute(FAILED_ATTR);
+  const markFailed = el => { try { el.setAttribute(FAILED_ATTR, ""); } catch {} };
   const TRACKING_RE = /pagead|(?:pixel|cleardot)\.*\.(?:gif|jpg|jpeg)|google\.(?:[a-z.]+)\/(?:ads|generate_204|.*\/log204)+|google-analytics\.(?:[a-z.]+)\/(?:r|collect)+|youtube\.(?:[a-z.]+)\/(?:api|ptracking|player_204|live_204)+|doubleclick\.(?:[a-z.]+)\/(?:pcs|pixel|r)+|googlesyndication\.(?:[a-z.]+)\/ddm|pixel\.facebook\.(?:[a-z.]+)|facebook\.(?:[a-z.]+)\/(?:impression\.php|tr)+|ad\.bitmedia\.io|yahoo\.(?:[a-z.]+)\/pixel|criteo\.net\/img|ad\.doubleclick\.net/i;
   let proxyHost = "";
   const isConfiguredProxyUrl = u => {
@@ -181,47 +188,57 @@
   // If bhOpts is missing — fresh install, service worker not yet run, or browser
   // restart before onStartup fired — fall back to storage.sync so we never
   // silently use empty defaults and let original images through.
-  chrome.storage.local.get({ bhOpts: null }, d => {
-    if (destroyed) return;
-    if (d.bhOpts) {
-      applyOpts(d.bhOpts);
-      flushPending();
-    } else {
-      chrome.storage.sync.get(defaults, synced => {
+  // Everything lives in bindSettings() with a try/catch: this script runs in
+  // the page's MAIN world, and a chrome.* gap there must degrade to defaults
+  // (empty proxyBase = pass-through) instead of dying mid-interception.
+  function bindSettings() {
+    try {
+      chrome.storage.local.get({ bhOpts: null }, d => {
         if (destroyed) return;
-        applyOpts(synced);
-        flushPending();
-        // Write the mirror so subsequent pages load fast
-        chrome.storage.local.set({ bhOpts: synced });
+        if (d.bhOpts) {
+          applyOpts(d.bhOpts);
+          flushPending();
+        } else {
+          chrome.storage.sync.get(defaults, synced => {
+            if (destroyed) return;
+            applyOpts(synced);
+            flushPending();
+            // Write the mirror so subsequent pages load fast
+            try { chrome.storage.local.set({ bhOpts: synced }); } catch {}
+          });
+        }
       });
-    }
-  });
 
-  // Stay current when settings change.
-  // Primary: local area (bhOpts mirror, instant).
-  // Fallback: sync area — catches changes when the service worker is inactive
-  // or not supported (Kiwi/Cromite).
-  chrome.storage.onChanged.addListener((changes, area) => {
-    if (destroyed) return;
-    if (area === "local" && changes.bhOpts) {
-      const next = changes.bhOpts.newValue || defaults;
-      if (sameOpts(next, opts)) return; // already applied via the sync path
-      applyOpts(next);
-      flushPending();
-    } else if (area === "sync") {
-      const apply = next => {
-        if (destroyed || sameOpts(next, opts)) return;
-        applyOpts(next);
-        flushPending();
-        // The service worker normally refreshes the mirror; harmless if it already did.
-        chrome.storage.local.set({ bhOpts: next });
-      };
-      if (!opts) { chrome.storage.sync.get(defaults, apply); return; } // initial load still pending
-      const next = { ...opts };
-      for (const [k, c] of Object.entries(changes)) if (k in defaults) next[k] = c.newValue ?? defaults[k];
-      apply(next);
+      // Stay current when settings change.
+      // Primary: local area (bhOpts mirror, instant).
+      // Fallback: sync area — catches changes when the service worker is inactive
+      // or not supported (Kiwi/Cromite).
+      chrome.storage.onChanged.addListener((changes, area) => {
+        if (destroyed) return;
+            if (area === "local" && changes.bhOpts) {
+          const next = changes.bhOpts.newValue || defaults;
+          if (sameOpts(next, opts)) return; // already applied via the sync path
+          applyOpts(next);
+          flushPending();
+        } else if (area === "sync") {
+          const apply = next => {
+            if (destroyed || sameOpts(next, opts)) return;
+            applyOpts(next);
+            flushPending();
+            // The service worker normally refreshes the mirror; harmless if it already did.
+            try { chrome.storage.local.set({ bhOpts: next }); } catch {}
+          };
+          if (!opts) { chrome.storage.sync.get(defaults, apply); return; } // initial load still pending
+          const next = { ...opts };
+          for (const [k, c] of Object.entries(changes)) if (k in defaults) next[k] = c.newValue ?? defaults[k];
+          apply(next);
+        }
+      });
+    } catch {
+      setTimeout(() => { if (!destroyed) { applyOpts(defaults); flushPending(); } }, 0);
     }
-  });
+  }
+  bindSettings();
 
   // Capture native property descriptors BEFORE we patch them
   const imgProto = HTMLImageElement.prototype;
@@ -237,14 +254,9 @@
   function nativeSetSrc(el, v) { srcDesc.set.call(el, v); }
   function nativeSetSrcset(el, v) { srcsetDesc?.set?.call(el, v); }
 
-  // prehook.js and content.js share one isolated world, so by the time content.js
-  // reads HTMLImageElement.prototype it only sees our PATCHED setters. Hand it the
-  // untouched ones (plus the set of images whose proxy load failed) explicitly.
-  const shared = globalThis.__bhShared = {
-    setSrc: srcDesc.set,
-    setSrcset: srcsetDesc?.set,
-    failed: new WeakSet()
-  };
+  // (The old __bhShared handoff was removed when prehook moved to the page's
+  // MAIN world: JS objects cannot cross worlds. content.js reads failed state
+  // via the data-bh-failed attribute and captures its own native setters.)
   function nativeSourceSetSrcset(el, v) { sourceSrcsetDesc?.set?.call(el, v); }
 
   // Spec-style srcset parser: a comma inside a URL (e.g. Cloudinary "w_400,h_300")
@@ -274,7 +286,7 @@
 
   // Shared skip decision for a resolved absolute http(s) URL (srcset + src).
   function skipAbsolute(absolute) {
-    if (isConfiguredProxyUrl(absolute) || SVG_URL_RE.test(absolute) || ICON_URL_RE.test(absolute) ||
+    if (isConfiguredProxyUrl(absolute) || SKIP_URL_RE.test(absolute) ||
         TRACKING_RE.test(absolute)) return true;
     const u = safeURL(absolute);
     return !u || excludedHost(u.hostname);
@@ -328,9 +340,6 @@
     (String(el.getAttribute("as") || "").toLowerCase() === "image" ||
      /^image\//i.test(el.getAttribute("type") || ""));
 
-  // Identical decision logic to <img src>.
-  const decidePreloadHref = decideSrc;
-
   // Called from the setAttribute patch, the link.href property patch, the
   // MutationObserver, and flushPending. Idempotent: re-running it on a link
   // whose href is already a proxy URL is a no-op.
@@ -340,10 +349,10 @@
       if (!isImagePreloadLink(el)) return;
       const stashed = el.dataset.bhPreloadHref;
       const current = el.getAttribute("href");
-      // decidePreloadHref must see the ORIGINAL url, never "about:blank".
+      // decideSrc must see the ORIGINAL url, never "about:blank".
       const original = stashed || current;
       if (!original || original === "about:blank") return;
-      const decided = decidePreloadHref(original);
+      const decided = decideSrc(original);
       if (decided === null) {
         // Settings not loaded yet: stash the original and drop href so the
         // browser cannot start downloading the full-resolution image.
@@ -366,7 +375,7 @@
     get: srcDesc.get,
     set(value) {
       try {
-        const decided = shared.failed.has(this) ? String(value) : decideSrc(String(value));
+        const decided = isFailed(this) ? String(value) : decideSrc(String(value));
         if (decided === null) {
           this.dataset.bhPendingSrc = String(value);
           pending.add(this);
@@ -471,7 +480,7 @@
       set(value) {
         try {
           if (isImagePreloadLink(this)) {
-            const decided = decidePreloadHref(String(value));
+            const decided = decideSrc(String(value));
             if (decided === null) {
               this.dataset.bhPreloadHref = String(value);
               pending.add(this);
@@ -518,7 +527,7 @@
       if (n !== "src" && n !== "srcset") return setAttr.call(this, name, value);
       if (this instanceof HTMLImageElement && (n === "src" || n === "srcset")) {
         if (n === "src") {
-          const decided = shared.failed.has(this) ? String(value) : decideSrc(String(value));
+          const decided = isFailed(this) ? String(value) : decideSrc(String(value));
           if (decided === null) {
             this.dataset.bhPendingSrc = String(value);
             pending.add(this);

@@ -4,9 +4,12 @@
 //
 //  Image interception is now split across two layers:
 //
-//  Layer 1 — prehook.js (document_start, synchronous)
-//    Patches HTMLImageElement.prototype.src, srcset, setAttribute, and Image()
-//    BEFORE the HTML parser runs. Catches all images set via JavaScript.
+//  Layer 1 — prehook.js (document_start, synchronous, page MAIN world)
+//    Patches HTMLImageElement.prototype.src/srcset/loading,
+//    HTMLSourceElement.prototype.srcset, HTMLLinkElement.prototype.href and
+//    Element.prototype.setAttribute BEFORE the HTML parser runs — inside the
+//    page's MAIN world so page JavaScript actually hits these setters.
+//    Catches all images set via JavaScript (including new Image().src).
 //    Zero wasted bytes — proxy URL is set before any network request fires.
 //
 //  Layer 2 — THIS FILE (document_start, async after storage read)
@@ -92,10 +95,16 @@
   const doneBg = new WeakSet();
   const fallbackHandlers = new WeakSet();
   const fallbackMeta = new WeakMap();
-  // prehook.js (same isolated world, runs first) exports the UNPATCHED img
-  // setters and the set of images whose proxy load already failed.
-  const shared = globalThis.__bhShared || {};
-  const failedEls = shared.failed || new WeakSet();
+  // prehook.js runs in the page's MAIN world (see manifest) while this script
+  // runs in the extension's isolated world — JS objects cannot cross. Failed
+  // elements are flagged with a DOM attribute both worlds can read; this
+  // duck-typed set mirrors WeakSet's has/add surface. The attribute is in
+  // neither script's MutationObserver filter, so marking cannot loop back.
+  const FAILED_ATTR = "data-bh-failed";
+  const failedEls = {
+    has: el => !!el && el.nodeType === 1 && el.hasAttribute(FAILED_ATTR),
+    add(el) { try { el.setAttribute(FAILED_ATTR, ""); } catch {} }
+  };
 
   // If the custom proxy cannot fetch/transform a particular image, restore the
   // original URL once. This preserves page rendering instead of leaving a
@@ -281,11 +290,12 @@
   // ── A) <img src> and <source srcset> rewriting ────────────────────────────
   // Handles images whose src was set by the HTML parser (bypasses prehook).
   // Also handles srcset entries on both <img> and <source> elements.
-  // Prefer prehook's untouched setters: reading the prototype here would return
-  // prehook's patched ones, which re-proxy the original on fallback.
-  const nativeImgSrcSetter = shared.setSrc ||
+  // In this isolated world these descriptors ARE the untouched native setters
+  // (prehook's patches live in the page's MAIN world, not here) — exactly what
+  // the fallback restore needs to bypass re-proxying.
+  const nativeImgSrcSetter =
     Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, "src")?.set;
-  const nativeImgSrcsetSetter = shared.setSrcset ||
+  const nativeImgSrcsetSetter =
     Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, "srcset")?.set;
 
   function rewriteImg(el) {
@@ -447,7 +457,6 @@
     const imageTargets = new Set();
     const lazyTargets = new Set();
     const bgTargets = new Set();
-    const preloadTargets = new Set();
 
     for (const m of mutations) {
       if (m.type === "childList") {
@@ -481,9 +490,6 @@
         } else if (lazyAttrSet.has(m.attributeName) || m.attributeName === "data-srcset") {
           doneLazy.delete(t);
           lazyTargets.add(t);
-        } else if (m.target.tagName === "LINK" &&
-                   (m.attributeName === "href" || m.attributeName === "rel" || m.attributeName === "as")) {
-          preloadTargets.add(t);
         }
       }
     }
@@ -495,7 +501,6 @@
     imageTargets.forEach(rewriteImg);
     lazyTargets.forEach(rewriteLazy);
     bgTargets.forEach(rewriteBg);
-    preloadTargets.forEach(rewritePreload);
   }
 
   const MUTATION_RECORD_LIMIT = 2000;
@@ -536,7 +541,12 @@
     childList:       true,
     subtree:         true,
     attributes:      true,
-    attributeFilter: ["src", "srcset", "style", ...LAZY_ATTRS, "data-srcset", "href", "rel", "as"]
+    // href/rel/as intentionally omitted: document-wide watching enqueued a
+    // record for every <a href> change on dynamic pages, almost all discarded
+    // here. MAIN-world prehook intercepts page-driven preload-link changes
+    // before they reach the network, and added <link> nodes still arrive via
+    // childList (processCandidate → rewritePreload).
+    attributeFilter: ["src", "srcset", "style", ...LAZY_ATTRS, "data-srcset"]
   });
 
   // Usage statistics are authoritative in service-worker.js. The worker reads

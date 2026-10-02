@@ -14,10 +14,11 @@ Works with **Chrome**, **Kiwi Browser**, **Cromite**, and other Chromium-based b
 - **Grayscale mode** — optionally request black-and-white images from the proxy (`bw=1`). **On by default.**
 - **Quality presets** — **Small** (45, Most saving), **Normal** (60, Balanced), and **Sharp** (80, More detail), plus custom quality from 1–100. Default is **60**.
 - **Maximum image width** — **HD** (768 px, default), **Full HD** (1024 px), or **No limit** (original size). Larger images are resized before compression. A custom width is also accepted; `0` means no limit.
-- **Per-site exclusions** — skip domains that should not be proxied (none excluded by default).
+- **Per-site exclusions** — skip domains that should not be proxied (none excluded by default); the toolbar popup can exclude or re-include the current site with one click.
 - **Usage stats** — tracks processed images, bytes received from the configured image proxy, and estimated bytes saved.
+- **Proxy connection test** — the settings page verifies the configured proxy endpoint responds with `bandwidth-hero-proxy`.
 - **CSP handling** — removes restrictive CSP response headers that can prevent proxy-served images from loading.
-- **Early image interception** — a `document_start` prehook catches JavaScript-created images before the browser downloads the original image.
+- **Early image interception** — a `document_start` prehook injected into the page's **MAIN world** patches image property setters before the HTML parser runs, so JavaScript-created images (including `new Image()`) are proxied before the original bytes download.
 - **Dynamic image handling** — covers normal `src`, `srcset`, lazy-loading attributes, preload images, inline background images, and dynamically inserted content.
 - **Automatic fallback** — if a proxied image fails to load, Guardian restores the original image URL so pages do not stay broken.
 - **Local settings mirror** — keeps a fast `storage.local` copy of synchronized settings so interception can happen with minimal delay.
@@ -53,7 +54,7 @@ Guardian sends parameters equivalent to:
 ?url=<encoded-image-url>&quality=<1-100>&bw=<0|1>&jpeg=<0|1>&max_width=<pixels>
 ```
 
-The proxy should return `bandwidth-hero-proxy` when called without a `url` parameter; Guardian uses that response for the proxy connection test.
+The proxy should return `bandwidth-hero-proxy` when called without a `url` parameter; Guardian uses that response for the proxy connection test in the settings page.
 
 ## Settings
 
@@ -93,8 +94,8 @@ Larger images are resized before compression. A custom maximum width can also be
 The Usage section on the settings page reports three counters:
 
 - **Images** — completed requests to the configured proxy. Counted by the service worker via `chrome.webRequest.onCompleted` (filtered to `image` types), matching the configured proxy origin with an encoded `url=` parameter. Only successful (HTTP 2xx) responses count; cached responses are excluded.
-- **Proxy bytes** — bytes received from the proxy for those images. The worker reads response headers, preferring `x-bh-compressed-size` (or legacy `x-compressed-size`), then derives the delivered size from `x-original-size` / `x-bytes-saved`, and finally falls back to `Content-Length`. MV3 does not expose response bodies, so a proxy that returns none of these headers reports `0 B`.
-- **Data saved** — estimated bytes saved versus fetching the original images directly, from the proxy's `x-bytes-saved` / `x-original-size` headers (or original-minus-received when only the original size is reported).
+- **Proxy bytes** — bytes received from the proxy for those images. The worker reads response headers, preferring `x-bh-compressed-size` (or legacy `x-compressed-size`), then derives the delivered size from `x-bh-original-size` / `x-bytes-saved` (or legacy `x-original-size` / `x-bytes-saved`), and finally falls back to `Content-Length`. MV3 does not expose response bodies, so a proxy that returns none of these headers reports `0 B`.
+- **Data saved** — estimated bytes saved versus fetching the original images directly, from the proxy's `x-bh-bytes-saved` / `x-bh-original-size` headers (or legacy `x-bytes-saved` / `x-original-size`, or original-minus-received when only the original size is reported).
 
 Initial values are **0**, **0 B** and **0 B**. Statistics are stored locally on the device and can be reset from Settings.
 
@@ -104,16 +105,18 @@ These counters are not a full bandwidth-savings calculation. They describe the d
 
 ## Architecture
 
-Image interception uses two content scripts injected at `document_start` in separate entries so `prehook.js` always runs before `content.js`. Failed proxy image loads automatically fall back to the original image URL so pages do not remain broken:
+Image interception uses two content scripts injected at `document_start` in separate manifest entries so `prehook.js` always runs before `content.js`. Failed proxy image loads automatically fall back to the original image URL so pages do not remain broken:
 
 | Script | Role |
 |---|---|
-| `prehook.js` | Patches `HTMLImageElement.prototype.src`, `srcset`, `setAttribute`, and `Image()` before the HTML parser runs. This catches JavaScript-created images as early as possible. Also arms the per-image error fallback. |
-| `content.js` | Handles parser-created images, `srcset`, lazy `data-*` attributes, preload images, inline `background-image` values, dynamic DOM changes, caching, and navigation cleanup. |
+| `prehook.js` | Runs synchronously before the HTML parser, in the page's **MAIN world** (`"world": "MAIN"` in the manifest) so page JavaScript actually hits the patches. Patches `HTMLImageElement.prototype.src`, `srcset`, and `loading`, `HTMLSourceElement.prototype.srcset`, `HTMLLinkElement.prototype.href` (for image preloads), and `Element.prototype.setAttribute`. JavaScript-assigned URLs — including `new Image().src` — go through these prototype setters, so no `Image()` constructor patch is needed. Stashes work that arrives before settings load (preloads are parked on `about:blank` meanwhile), and arms the per-image error fallback. |
+| `content.js` | Runs in the extension's isolated world, after the storage read. Handles parser-created `<img src>`, `srcset`, lazy `data-*` attributes, preload `<link>` elements, inline `background-image` values, dynamic DOM changes via a batched MutationObserver, per-element rewrite caching, and navigation cleanup. Because JS objects cannot cross worlds, `content.js` captures its own native setters and reads failed-element state from the `data-bh-failed` attribute that `prehook.js` writes. |
 
 The service worker mirrors `storage.sync` settings to `storage.local` so content scripts can read the current configuration quickly. It also manages CSP response-header rules, the extension icon state, and batched usage-stat updates collected from proxy response headers.
 
 DNR is used for CSP handling only. Image URL rewriting stays in the content scripts because the proxy source URL must be safely `encodeURIComponent`-encoded; DNR regex substitution cannot perform that encoding.
+
+`prehook.js` must run in the MAIN world for its prototype patches to intercept page JavaScript; the trade-off is that it cannot share JS objects with `content.js`, hence the `data-bh-failed` attribute channel and the duplicated (KEEP IN SYNC) constants.
 
 ## Project structure
 
@@ -140,6 +143,16 @@ bandwidth-guardian/
 
 **Proxy:** [github.com/anT0ny54/bhp2](https://github.com/anT0ny54/bhp2)
 
+## Permissions
+
+| Permission | Why it is needed |
+|------------|------------------|
+| `storage` | Persist settings and statistics |
+| `tabs` | Reload the correct content tab after settings change |
+| `declarativeNetRequestWithHostAccess` | Strip CSP headers on proxied pages |
+| `webRequest` | Read proxy response headers for stats |
+| `<all_urls>` | Intercept images on every website |
+
 ## 🌐 Free DNS Services
 
 High-performance DNS utilizing HaGeZi Blocklists (Multi Pro + TIF).
@@ -165,16 +178,6 @@ Bandwidth Hero Server fetches remote images, compresses them on the fly, and del
 If you find this project useful, donations are appreciated:
 
 - **Bitcoin**: `1HntwKxyqGCfnSGvGLMUTRAqLnTvLarAQP`
-
-## Permissions
-
-| Permission | Why it is needed |
-|------------|------------------|
-| `storage` | Persist settings and statistics |
-| `tabs` | Reload the correct content tab after settings change |
-| `declarativeNetRequestWithHostAccess` | Strip CSP headers on proxied pages |
-| `webRequest` | Read proxy response headers for stats |
-| `<all_urls>` | Intercept images on every website |
 
 ## License
 

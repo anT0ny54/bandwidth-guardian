@@ -211,9 +211,15 @@ async function save() {
     return;
   }
   const proxyBase = (proxyBaseEl.value || "").trim();
-  if (!/^https?:\/\//i.test(proxyBase)) {
+  // Fully parse the URL — a scheme-prefix check let values like "https://not a url"
+  // through, which every downstream consumer then choked on (empty derived proxy
+  // host, never-matching already-proxied guard, broken image URLs).
+  try {
+    const parsedProxy = new URL(proxyBase);
+    if (parsedProxy.protocol !== "http:" && parsedProxy.protocol !== "https:") throw new Error("bad protocol");
+  } catch {
     proxyBaseEl.classList.add("invalid");
-    showToast("Proxy URL must be http:// or https://", "err");
+    showToast("Proxy URL must be a valid http:// or https:// URL", "err");
     proxyBaseEl.focus();
     return;
   }
@@ -246,7 +252,10 @@ async function save() {
 
 async function testProxy() {
   const url = (proxyBaseEl.value || "").trim();
-  if (!/^https?:\/\//i.test(url)) { showToast("Enter a valid proxy URL first", "err"); return; }
+  try {
+    const parsedTest = new URL(url);
+    if (parsedTest.protocol !== "http:" && parsedTest.protocol !== "https:") throw new Error("bad protocol");
+  } catch { showToast("Enter a valid proxy URL first", "err"); return; }
   const orig = testProxyBtn.textContent;
   testProxyBtn.textContent = "Testing…"; testProxyBtn.disabled = true;
   try {
