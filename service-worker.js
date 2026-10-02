@@ -37,18 +37,9 @@ const ALL_RULE_IDS     = [RULE_ID_REDIRECT, RULE_ID_CSP];
 let refreshing     = false;
 let pendingRefresh = false;
 let configuredProxyOrigin = "";
-// Until the proxy origin is known, completed requests are parked here instead of
-// hitting storage once per request (which happened on every request when no
-// proxy was configured).
-let proxyOriginReady   = false;
-let proxyOriginWaiters = [];
 
 function setProxyOrigin(base) {
   try { configuredProxyOrigin = new URL(String(base || "").trim()).origin; } catch { configuredProxyOrigin = ""; }
-  proxyOriginReady = true;
-  const waiters = proxyOriginWaiters;
-  proxyOriginWaiters = [];
-  waiters.forEach(fn => fn());
 }
 
 function refreshRules() {
@@ -187,7 +178,7 @@ function scheduleStatsFlush() {
   statsFlushTimer = setTimeout(() => {
     statsFlushTimer = null;
     flushStats();
-  }, 250);
+  }, 750);
 }
 
 function recordStats(bytes, saved) {
@@ -197,25 +188,22 @@ function recordStats(bytes, saved) {
   scheduleStatsFlush();
 }
 
-// This intentionally mirrors the proven upstream Guardian approach: observe
-// completed image/proxy requests and read the response headers. We additionally
-// match the configured proxy URL itself so browsers that classify the response
-// as fetch/other still work. `extraHeaders` makes the response-header event
-// available consistently on Chromium implementations that gate response headers.
+// Observe completed image requests and read the response headers.
+// `types: ["image"]` limits listener overhead to image responses only.
+// `extraHeaders` makes the response-header event available consistently on
+// Chromium implementations that gate response headers.
 if (chrome.webRequest) {
   chrome.webRequest.onCompleted.addListener(
     onProxyCompleted,
-    { urls: ["<all_urls>"] },
+    { urls: ["<all_urls>"], types: ["image"] },
     ["responseHeaders", "extraHeaders"]
   );
 }
 
 function onProxyCompleted(details) {
-  const { requestId, url, responseHeaders, fromCache, statusCode } = details || {};
-  if (!requestId || !url || fromCache) return;
+  const { url, responseHeaders, fromCache, statusCode } = details || {};
+  if (!url || fromCache) return;
   if (typeof statusCode === "number" && (statusCode < 200 || statusCode >= 300)) return;
-
-  if (!proxyOriginReady) { proxyOriginWaiters.push(() => onProxyCompleted(details)); return; }
   if (!configuredProxyOrigin || !isGuardianProxyUrl(url)) return;
 
   // A successful Guardian proxy response is one processed image. The proxy's

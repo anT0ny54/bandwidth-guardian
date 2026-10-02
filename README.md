@@ -36,10 +36,10 @@ Works with **Chrome**, **Kiwi Browser**, **Cromite**, and other Chromium-based b
 
 ```bash
 bash build.sh
-# outputs: bandwidth-guardian-0.0.11.zip
+# outputs: bandwidth-guardian-<version>.zip (version is read from manifest.json)
 ```
 
-The build script reads the version from `manifest.json`, stages only extension runtime files (no README/LICENSE), applies a fixed timestamp, sorts the archive entries, and creates a deterministic ZIP.
+The build script reads the version from `manifest.json`, stages only extension runtime files, validates every shipped JavaScript file with Node, checks that every file referenced by the manifest is present, applies a fixed timestamp, sorts the archive entries, and creates a deterministic ZIP.
 
 ## Recommended proxy
 
@@ -92,19 +92,19 @@ Larger images are resized before compression. A custom maximum width can also be
 
 The Usage section on the settings page reports three counters:
 
-- **Images** — completed requests to the configured proxy. Counted by the service worker via `chrome.webRequest.onCompleted`, matching the configured proxy origin with an encoded `url=` parameter. Only successful (HTTP 2xx) responses count; cached responses are excluded.
+- **Images** — completed requests to the configured proxy. Counted by the service worker via `chrome.webRequest.onCompleted` (filtered to `image` types), matching the configured proxy origin with an encoded `url=` parameter. Only successful (HTTP 2xx) responses count; cached responses are excluded.
 - **Proxy bytes** — bytes received from the proxy for those images. The worker reads response headers, preferring `x-bh-compressed-size` (or legacy `x-compressed-size`), then derives the delivered size from `x-original-size` / `x-bytes-saved`, and finally falls back to `Content-Length`. MV3 does not expose response bodies, so a proxy that returns none of these headers reports `0 B`.
 - **Data saved** — estimated bytes saved versus fetching the original images directly, from the proxy's `x-bytes-saved` / `x-original-size` headers (or original-minus-received when only the original size is reported).
 
 Initial values are **0**, **0 B** and **0 B**. Statistics are stored locally on the device and can be reset from Settings.
 
-The service worker accumulates deltas and flushes them to `storage.local` in batches (250 ms) instead of writing once per image. Page-side Resource Timing is intentionally **not** used for accounting — the service worker's response-header data is authoritative.
+The service worker accumulates deltas and flushes them to `storage.local` in batches (750 ms) instead of writing once per image. Page-side Resource Timing is intentionally **not** used for accounting — the service worker's response-header data is authoritative.
 
 These counters are not a full bandwidth-savings calculation. They describe the data delivered by the configured proxy.
 
 ## Architecture
 
-Image interception uses two content scripts injected at `document_start`. Failed proxy image loads automatically fall back to the original image URL so pages do not remain broken:
+Image interception uses two content scripts injected at `document_start` in separate entries so `prehook.js` always runs before `content.js`. Failed proxy image loads automatically fall back to the original image URL so pages do not remain broken:
 
 | Script | Role |
 |---|---|
@@ -119,6 +119,7 @@ DNR is used for CSP handling only. Image URL rewriting stays in the content scri
 
 ```text
 bandwidth-guardian/
+├── CHANGELOG.md                # Release history
 ├── _locales/en/messages.json   # Extension name and description
 ├── icons/                      # Active + disabled extension icons
 ├── content.js                  # Main image rewriter
@@ -164,6 +165,16 @@ Bandwidth Hero Server fetches remote images, compresses them on the fly, and del
 If you find this project useful, donations are appreciated:
 
 - **Bitcoin**: `1HntwKxyqGCfnSGvGLMUTRAqLnTvLarAQP`
+
+## Permissions
+
+| Permission | Why it is needed |
+|------------|------------------|
+| `storage` | Persist settings and statistics |
+| `tabs` | Reload the correct content tab after settings change |
+| `declarativeNetRequestWithHostAccess` | Strip CSP headers on proxied pages |
+| `webRequest` | Read proxy response headers for stats |
+| `<all_urls>` | Intercept images on every website |
 
 ## License
 
