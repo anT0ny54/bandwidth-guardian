@@ -1,4 +1,4 @@
-import { DEFAULTS, parseDomains } from "./defaults.js";
+import { DEFAULTS } from "./defaults.js";
 
 const $ = id => document.getElementById(id);
 
@@ -6,6 +6,8 @@ const enabledEl   = $("enabled");
 const grayscaleEl = $("grayscale");
 const ctrlCard    = $("ctrlCard");
 const headerSub   = $("headerSub");
+const statusState = $("statusState");
+const statusText  = $("statusText");
 const nudge       = $("nudge");
 const reloadBtn   = $("reloadBtn");
 const siteNameEl  = $("siteName");
@@ -14,26 +16,26 @@ const excludeBtn  = $("excludeBtn");
 const settingsBtn = $("settingsBtn");
 const presetBtns  = Array.from(document.querySelectorAll("#qualityPresets .preset"));
 
-const PRESETS = [20, 40, 80];
+const PRESETS = [45, 60, 80];
 
+// Full settings state. Storage change events only carry the changed keys, so they
+// must be merged into this — merging into DEFAULTS reset unchanged keys (e.g. a
+// disabled extension appeared enabled after toggling grayscale).
+let state = { ...DEFAULTS };
 let currentHost  = "";
 let currentIsWeb = false;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-// parseDomains lives in defaults.js (options.js only needs the raw
-// excludeDomains string for its textarea, no parsing) so this file no longer
-// keeps its own independently maintained copy of the same normalization
-// shared.js's bhDomainSet already does for content scripts.
 
-function matchingExcludedDomain(host, domains) {
-  let match = "";
-  for (const domain of domains) {
-    if (host === domain || host.endsWith("." + domain)) {
-      // Prefer the most-specific match when exclusions overlap.
-      if (domain.length > match.length) match = domain;
-    }
-  }
-  return match;
+function parseDomains(text) {
+  return String(text || "")
+    .split(/[,\s]+/)
+    .map(s => s.trim().toLowerCase()).filter(Boolean)
+    .map(s => s.replace(/^https?:\/\//, "").split("/")[0].replace(/\.$/, ""));
+}
+
+function findExcludedDomain(host, domains) {
+  return domains.find(domain => host === domain || host.endsWith(`.${domain}`)) || "";
 }
 
 function nearestPreset(q) {
@@ -64,14 +66,16 @@ function updateEnabledUI(enabled) {
   // separate card above and stays fully interactive at all times.
   ctrlCard.classList.toggle("card-dim", !enabled);
   headerSub.textContent = enabled ? "Active" : "Disabled";
+  statusState.classList.toggle("active", enabled);
+  statusText.textContent = enabled ? "Compression active" : "Compression disabled";
 }
 
 // ── Load ──────────────────────────────────────────────────────────────────────
 
 async function load() {
-  const d = await chrome.storage.sync.get(DEFAULTS);
-  applyUI(d);
-  loadSiteUI(d);
+  state = await chrome.storage.sync.get(DEFAULTS);
+  applyUI(state);
+  loadSiteUI(state);
 }
 load();
 
@@ -81,12 +85,11 @@ enabledEl.addEventListener("change", async () => {
   const enabled = enabledEl.checked;
   await chrome.storage.sync.set({ enabled });
   updateEnabledUI(enabled);
-  loadSiteUI(await chrome.storage.sync.get(DEFAULTS));
 });
 
 // ── Grayscale ─────────────────────────────────────────────────────────────────
-// Grayscale is applied server-side by the proxy (bw param). Images already on
-// the page can't change without a reload.
+// Grayscale is applied server-side by the proxy (bw=1 query param). Images already
+// on the page can't change without a reload.
 
 grayscaleEl.addEventListener("change", async () => {
   await chrome.storage.sync.set({ grayscale: grayscaleEl.checked });
@@ -97,10 +100,15 @@ grayscaleEl.addEventListener("change", async () => {
 
 presetBtns.forEach(btn => {
   btn.addEventListener("click", async () => {
+    const quality = Number(btn.dataset.q);
     presetBtns.forEach(b => b.classList.remove("active"));
     btn.classList.add("active");
-    await chrome.storage.sync.set({ quality: Number(btn.dataset.q) });
-    showNudge();
+    await chrome.storage.sync.set({ quality });
+    try {
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (tab?.id) await chrome.tabs.reload(tab.id);
+    } catch {}
+    window.close();
   });
 });
 
@@ -146,7 +154,7 @@ async function loadSiteUI(d) {
   excludeBtn.disabled = false;
 
   const excluded = parseDomains(d.excludeDomains);
-  if (matchingExcludedDomain(currentHost, excluded)) {
+  if (findExcludedDomain(currentHost, excluded)) {
     sitePillEl.textContent = "Excluded";
     sitePillEl.className   = "site-pill excluded";
     sitePillEl.style.display = "";
@@ -163,11 +171,11 @@ excludeBtn.addEventListener("click", async () => {
   if (!currentIsWeb || !currentHost) return;
   const d    = await chrome.storage.sync.get(DEFAULTS);
   const list = new Set(parseDomains(d.excludeDomains));
-  const matched = matchingExcludedDomain(currentHost, list);
-  if (matched) list.delete(matched);
+  const excludedDomain = findExcludedDomain(currentHost, Array.from(list));
+  if (excludedDomain) list.delete(excludedDomain);
   else list.add(currentHost);
   await chrome.storage.sync.set({ excludeDomains: Array.from(list).join(" ") });
-  loadSiteUI(await chrome.storage.sync.get(DEFAULTS));
+  showNudge(); // page must reload for the change to take effect
 });
 
 // ── Open settings page ────────────────────────────────────────────────────────
@@ -175,26 +183,16 @@ excludeBtn.addEventListener("click", async () => {
 // tabs.create() works everywhere.
 
 settingsBtn.addEventListener("click", () => {
-  const openFallback = () => {
-    try { chrome.runtime.openOptionsPage?.(); } catch { /* best-effort fallback */ }
-  };
-  try {
-    const created = chrome.tabs.create({ url: chrome.runtime.getURL("options.html") });
-    // Older Chromium forks may implement only the callback API and return
-    // undefined; guard before chaining so that path does not throw.
-    if (created && typeof created.catch === "function") created.catch(openFallback);
-  } catch {
-    openFallback();
-  }
+  chrome.tabs.create({ url: chrome.runtime.getURL("options.html") })
+    .catch(() => chrome.runtime.openOptionsPage?.());
 });
 
 // ── Sync with changes made on the settings page ───────────────────────────────
-// Also refreshes the site card: if the settings page adds/removes an
-// exclusion (or the proxy is toggled) while the popup is still open, the
-// "Excluded" pill and button label need to reflect it too, not just the
-// toggle/quality controls above.
 
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== "sync") return;
-  chrome.storage.sync.get(DEFAULTS, d => { applyUI(d); loadSiteUI(d); });
+  // Apply directly from the change payload — no redundant storage re-read.
+  for (const [k, v] of Object.entries(changes)) state[k] = v.newValue ?? DEFAULTS[k];
+  applyUI(state);
+  if ("excludeDomains" in changes || "enabled" in changes) loadSiteUI(state);
 });

@@ -1,103 +1,143 @@
-# 🛡️ Bandwidth Guardian Extension
+# 🛡️ Bandwidth Guardian
 
-> Save mobile data by compressing images through a self-hosted proxy before they load.
+> Save bandwidth by compressing images through your own image proxy before they load.
 
 
-Bandwidth Guardian is a Manifest V3 Chrome extension that routes every image through a compression proxy before the browser downloads it. It supports WebP output, grayscale mode, per-site exclusions, and configurable quality and max-width.
+Bandwidth Guardian is a Manifest V3 Chromium extension that rewrites image URLs so images are fetched through a configurable, self-hosted compression proxy before the browser downloads them. It supports WebP output, grayscale mode, quality presets, maximum image width, per-site exclusions, and usage statistics.
 
-Works on **Chrome**, **Kiwi Browser**, **Cromite**, and any Chromium-based browser that supports MV3.
-
----
+Works with **Chrome**, **Kiwi Browser**, **Cromite**, and other Chromium-based browsers that support Manifest V3. Firefox support is declared in the manifest (`browser_specific_settings.gecko`, minimum version 128).
 
 ## Features
 
-- **WebP / JPEG output** — automatically uses WebP when the browser supports it
-- **Grayscale mode** — black-and-white images use significantly less bandwidth
-- **Quality presets** — Small / Normal / Sharp, plus a custom 1–100 input
-- **Max image width** — downscale oversized images before compressing (HD / Full HD / No limit)
-- **Per-site exclusions** — skip domains that shouldn't be proxied
-- **Usage stats** — tracks images processed and bytes saved via proxy response headers
-- **CSP stripping** — removes Content-Security-Policy headers that would block proxy-served images
-
----
+- **Custom image proxy** — use your own compatible proxy; Guardian does not depend on a fixed third-party image service.
+- **WebP output** — proxy requests are always sent with `jpeg=0`; every supported browser handles WebP.
+- **Grayscale mode** — optionally request black-and-white images from the proxy (`bw=1`). **On by default.**
+- **Quality presets** — **Small** (45, Most saving), **Normal** (60, Balanced), and **Sharp** (80, More detail), plus custom quality from 1–100. Default is **60**.
+- **Maximum image width** — **HD** (768 px, default), **Full HD** (1024 px), or **No limit** (original size). Larger images are resized before compression. A custom width is also accepted; `0` means no limit.
+- **Per-site exclusions** — skip domains that should not be proxied (none excluded by default).
+- **Usage stats** — tracks processed images, bytes received from the configured image proxy, and estimated bytes saved.
+- **CSP handling** — removes restrictive CSP response headers that can prevent proxy-served images from loading.
+- **Early image interception** — a `document_start` prehook catches JavaScript-created images before the browser downloads the original image.
+- **Dynamic image handling** — covers normal `src`, `srcset`, lazy-loading attributes, preload images, inline background images, and dynamically inserted content.
+- **Automatic fallback** — if a proxied image fails to load, Guardian restores the original image URL so pages do not stay broken.
+- **Local settings mirror** — keeps a fast `storage.local` copy of synchronized settings so interception can happen with minimal delay.
 
 ## Installation
 
 ### From source (sideload)
 
-1. Clone or download this repository
-2. Open `chrome://extensions` (or `kiwi://extensions`)
-3. Enable **Developer mode**
-4. Click **Load unpacked** and select the repo folder
-5. Open the extension settings and set your proxy URL
+1. Clone or download this repository.
+2. Open `chrome://extensions` (or `kiwi://extensions`).
+3. Enable **Developer mode**.
+4. Click **Load unpacked** and select the repository folder.
+5. Open Bandwidth Guardian settings and enter your image proxy URL.
 
-### Reproducible build (zip for Chrome Web Store)
+### Reproducible build
 
 ```bash
 bash build.sh
-# outputs: dist/bandwidth-guardian-<version>.zip, e.g. bandwidth-guardian-x.x.x.zip
-# (the version always comes from manifest.json, not a hard-coded number)
+# outputs: bandwidth-guardian-0.0.11.zip
 ```
 
-The build script produces a deterministic zip using a fixed timestamp so the output is byte-for-byte reproducible on any machine.
+The build script reads the version from `manifest.json`, stages only extension runtime files (no README/LICENSE), applies a fixed timestamp, sorts the archive entries, and creates a deterministic ZIP.
 
----
+## Recommended proxy
 
-## Proxy setup
+Need a proxy? → **[bandwidth-hero-proxy2](https://github.com/anT0ny54/bhp2)**
 
-Bandwidth Guardian requires a compatible compression proxy. The recommended proxy is:
+Bandwidth Guardian is designed around a configurable proxy rather than a hard-coded proxy service. The configured endpoint should accept the source image URL and compression parameters in its query string.
 
-**[bhp2](https://github.com/anT0ny54/bhp2)** — a hardened fork of [bandwidth-hero-proxy2](https://github.com/himshim/bandwidth-hero-proxy2) (private-IP blocking, DNS-rebinding protection, a health-check endpoint). Deploy free on Netlify in one click.
+Guardian sends parameters equivalent to:
 
-The proxy must:
-- Accept `?url=<encoded>&quality=<n>&bw=0or1&jpeg=0or1&max_width=<n>`
-- Return `bandwidth-hero-proxy` when called with no `url` parameter (used for URL validation)
-- Return `x-bytes-saved` and `x-original-size` response headers for stats tracking
+```text
+?url=<encoded-image-url>&quality=<1-100>&bw=<0|1>&jpeg=<0|1>&max_width=<pixels>
+```
 
----
+The proxy should return `bandwidth-hero-proxy` when called without a `url` parameter; Guardian uses that response for the proxy connection test.
+
+## Settings
+
+Defaults on a fresh install:
+
+| Setting | Default |
+|---|---|
+| Enabled | `true` |
+| Proxy URL | *(empty — must be set)* |
+| Quality | `60` (Normal) |
+| Grayscale | `true` |
+| Max width | `768` (HD) |
+| Excluded domains | *(empty)* |
+
+### Quality
+
+| Preset | Quality | Meaning |
+|---|---:|---|
+| Small | 45 | Most saving |
+| Normal | 60 | Balanced |
+| Sharp | 80 | More detail |
+
+Changing a quality preset in the toolbar popup reloads the current tab so already-loaded images are processed with the new setting. A custom quality value from **1–100** can be entered under Advanced settings.
+
+### Maximum image width
+
+| Preset | Width |
+|---|---:|
+| HD | 768 px |
+| Full HD | 1024 px |
+| No limit | Original size |
+
+Larger images are resized before compression. A custom maximum width can also be entered; `0` means no limit.
+
+## Usage statistics
+
+The Usage section on the settings page reports three counters:
+
+- **Images** — completed requests to the configured proxy. Counted by the service worker via `chrome.webRequest.onCompleted`, matching the configured proxy origin with an encoded `url=` parameter. Only successful (HTTP 2xx) responses count; cached responses are excluded.
+- **Proxy bytes** — bytes received from the proxy for those images. The worker reads response headers, preferring `x-bh-compressed-size` (or legacy `x-compressed-size`), then derives the delivered size from `x-original-size` / `x-bytes-saved`, and finally falls back to `Content-Length`. MV3 does not expose response bodies, so a proxy that returns none of these headers reports `0 B`.
+- **Data saved** — estimated bytes saved versus fetching the original images directly, from the proxy's `x-bytes-saved` / `x-original-size` headers (or original-minus-received when only the original size is reported).
+
+Initial values are **0**, **0 B** and **0 B**. Statistics are stored locally on the device and can be reset from Settings.
+
+The service worker accumulates deltas and flushes them to `storage.local` in batches (250 ms) instead of writing once per image. Page-side Resource Timing is intentionally **not** used for accounting — the service worker's response-header data is authoritative.
+
+These counters are not a full bandwidth-savings calculation. They describe the data delivered by the configured proxy.
 
 ## Architecture
 
-Image interception uses three content scripts injected at `document_start`, in this order:
+Image interception uses two content scripts injected at `document_start`. Failed proxy image loads automatically fall back to the original image URL so pages do not remain broken:
 
 | Script | Role |
 |---|---|
-| `shared.js` | Pure helpers: default settings, tracking-pixel patterns, the "should this URL be proxied?" decision, relative-URL resolution, a spec-style `srcset` parser/rewriter, and the proxy-URL builder. Loaded first so `prehook.js` and `content.js` see it as ordinary globals. |
-| `prehook.js` | Patches `HTMLImageElement.prototype.src`, `srcset` and `setAttribute` and queues assignments made before settings load. Options are pushed in by `content.js` (`bhPrehookSetOpts`). Note: content scripts run in an isolated world, so these patches only see calls made from that world unless the script is registered with `"world": "MAIN"`. |
-| `content.js` | Loads settings (once), then rewrites `<img src>`, `srcset`, lazy `data-*` attributes and inline `background-image`, and watches the DOM for later changes. Pages on excluded domains get no observer at all. Also injects `<link rel="preconnect">` to warm the proxy connection. |
+| `prehook.js` | Patches `HTMLImageElement.prototype.src`, `srcset`, `setAttribute`, and `Image()` before the HTML parser runs. This catches JavaScript-created images as early as possible. Also arms the per-image error fallback. |
+| `content.js` | Handles parser-created images, `srcset`, lazy `data-*` attributes, preload images, inline `background-image` values, dynamic DOM changes, caching, and navigation cleanup. |
 
-Settings are mirrored from `storage.sync` to `storage.local` by the service worker so content scripts can read them in ~5 ms instead of ~30–80 ms.
+The service worker mirrors `storage.sync` settings to `storage.local` so content scripts can read the current configuration quickly. It also manages CSP response-header rules, the extension icon state, and batched usage-stat updates collected from proxy response headers.
 
-DNR is used only to strip CSP headers (skipping your excluded domains) — image redirection is done in content scripts because Chrome's `regexSubstitution` cannot `encodeURIComponent`, which breaks any image URL containing query parameters.
-
----
+DNR is used for CSP handling only. Image URL rewriting stays in the content scripts because the proxy source URL must be safely `encodeURIComponent`-encoded; DNR regex substitution cannot perform that encoding.
 
 ## Project structure
 
-```
+```text
 bandwidth-guardian/
-├── _locales/en/messages.json   # Extension name and description (i18n)
-├── icons/                      # 16 / 32 / 48 / 128 px, active + disabled
-├── shared.js                   # Shared content-script helpers (URL logic, srcset)
-├── prehook.js                  # Layer 1 prototype patcher
-├── content.js                  # Layer 2 image rewriter
-├── defaults.js                 # Defaults for popup.js / options.js (ES module)
-├── manifest.json
+├── _locales/en/messages.json   # Extension name and description
+├── icons/                      # Active + disabled extension icons
+├── content.js                  # Main image rewriter
+├── defaults.js                 # Shared default settings (KEEP IN SYNC with inlined copies)
+├── manifest.json               # MV3 extension manifest
 ├── options.html / options.js   # Full settings page
 ├── popup.html / popup.js       # Toolbar popup
-├── service-worker.js           # DNR rules, storage mirror, icon, stats
-├── build.sh                    # Reproducible zip builder
-├── CHANGELOG.md                # Version history
-└── .github/workflows/build.yml # CI: build + attach zip to every release tag
+├── prehook.js                  # Early image interception
+├── service-worker.js           # DNR, settings mirror, icon, usage stats
+├── build.sh                    # Reproducible ZIP builder
+├── LICENSE
+└── README.md
 ```
 
----
+## Repository
 
-## Credits
+**Source:** [github.com/himshim/bandwidth-guardian](https://github.com/himshim/bandwidth-guardian)
 
-Based on [bandwidth-hero](https://github.com/ayastreb/bandwidth-hero) by Anatoliy Yastreb (MIT) and the serverless proxy port [bandwidth-hero-proxy2](https://github.com/himshim/bandwidth-hero-proxy2).
-
----
+**Proxy:** [github.com/anT0ny54/bhp2](https://github.com/anT0ny54/bhp2)
 
 ## 🌐 Free DNS Services
 
@@ -108,12 +148,10 @@ High-performance DNS utilizing HaGeZi Blocklists (Multi Pro + TIF).
 | Multi Pro + TIF | `https://freedns.koyeb.app/dns-query` (Recommended) |
 | Multi Pro + TIF | `https://dns-pi.vercel.app/api/doh/dns-query` (Recommended) |
 | Multi Pro + TIF | `https://dnssix.netlify.app/api/doh/dns-query` |
-| Multi Pro + TIF | `https://dns-93aca.containers.snapdeploy.app/dns-query` (Recommended, but will sleep if not use in 15 minute) |
-| Multi Pro + TIF | `https://doh-93aca.containers.snapdeploy.app/dns-query` (Recommended, but will sleep if not use in 15 minute) |
+| Multi Pro + TIF | `https://dns-93aca.containers.snapdeploy.app/dns-query` (Recommended, but will sleep if not used in 15 minutes) |
+| Multi Pro + TIF | `https://doh-93aca.containers.snapdeploy.app/dns-query` (Recommended, but will sleep if not used in 15 minutes) |
 
----
-
-# ⚡ Bandwidth Hero Server
+## ⚡ Bandwidth Hero Server
 
 A lightweight image optimization proxy designed to slash bandwidth usage and accelerate web browsing.
 
@@ -124,9 +162,9 @@ Bandwidth Hero Server fetches remote images, compresses them on the fly, and del
 ## Supporting the Project
 
 If you find this project useful, donations are appreciated:
+
 - **Bitcoin**: `1HntwKxyqGCfnSGvGLMUTRAqLnTvLarAQP`
-- 
 
 ## License
 
-MIT — see [LICENSE](LICENSE)
+See [`LICENSE`](LICENSE).

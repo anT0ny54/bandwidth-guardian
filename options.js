@@ -12,20 +12,25 @@ const resetAllBtn    = $("resetAll");
 const resetStatsBtn  = $("resetStats");
 const statImagesEl   = $("statImages");
 const statBytesEl    = $("statBytes");
+const statSavedEl    = $("statSaved");
 const toastEl        = $("toast");
+const versionEl       = $("extensionVersion");
 const customQualityEl = $("customQuality");
 const customWidthEl   = $("customWidth");
-const extVersionEl    = $("extVersion");
 
 const qualityPresets = Array.from(document.querySelectorAll("#qualityPresets .preset"));
 const widthPresets   = Array.from(document.querySelectorAll("#widthPresets  .preset"));
 
-// Version footer: read from manifest.json (single source of truth) instead
-// of a hardcoded string in options.html that has to be bumped by hand.
-extVersionEl.textContent = "v" + (chrome.runtime.getManifest().version || "?");
+const QUALITY_PRESETS = [45, 60, 80];
+const WIDTH_PRESETS   = [768, 1024, 0];
+// Last values loaded from storage, used to restore preset highlights when a
+// custom input is cleared (previously this wrongly restored DEFAULTS).
+let savedQuality = DEFAULTS.quality;
+let savedWidth   = DEFAULTS.maxWidth;
 
-const QUALITY_PRESETS = [20, 40, 80];
-const WIDTH_PRESETS   = [1280, 1920, 0];
+if (versionEl) {
+  versionEl.textContent = `v${chrome.runtime.getManifest().version}`;
+}
 
 // ── Toast ─────────────────────────────────────────────────────────────────────
 
@@ -45,6 +50,25 @@ function fmtBytes(n) {
   if (n >= 1 << 20) return (n / (1 << 20)).toFixed(2) + " MB";
   if (n >= 1 << 10) return (n / (1 << 10)).toFixed(2) + " KB";
   return n + " B";
+}
+
+async function reloadCurrentPage() {
+  const isHttpUrl = url => /^https?:\/\//i.test(String(url || ""));
+  try {
+    const [active] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (active?.id && isHttpUrl(active.url)) {
+      await chrome.tabs.reload(active.id);
+      return;
+    }
+
+    // When settings are opened in a new tab, the settings tab itself is active.
+    // Prefer the most recently accessed HTTP(S) tab in the same window.
+    const tabs = await chrome.tabs.query({ currentWindow: true });
+    const page = tabs
+      .filter(tab => tab.id != null && isHttpUrl(tab.url))
+      .sort((a, b) => Number(b.lastAccessed || 0) - Number(a.lastAccessed || 0))[0];
+    if (page?.id) await chrome.tabs.reload(page.id);
+  } catch {}
 }
 
 // ── Preset helpers ────────────────────────────────────────────────────────────
@@ -89,23 +113,35 @@ function readWidth() {
 // ── Load ──────────────────────────────────────────────────────────────────────
 
 async function load() {
-  const d = await chrome.storage.sync.get(DEFAULTS);
+  const [d, s] = await Promise.all([
+    chrome.storage.sync.get(DEFAULTS),
+    chrome.storage.local.get({ stats: { filesProcessed: 0, bytesProcessed: 0, bytesSaved: 0 } })
+  ]);
   enabledEl.checked   = !!d.enabled;
   grayscaleEl.checked = !!d.grayscale;
-  proxyBaseEl.value   = d.proxyBase     || "";
-  excludeEl.value     = d.excludeDomains || "";
+  proxyBaseEl.value   = d.proxyBase || "";
   proxyBaseEl.classList.remove("invalid");
-  setQualityUI(d.quality  ?? DEFAULTS.quality);
-  setWidthUI(d.maxWidth ?? DEFAULTS.maxWidth);
+  excludeEl.value     = d.excludeDomains || "";
+  savedQuality = d.quality  ?? DEFAULTS.quality;
+  savedWidth   = d.maxWidth ?? DEFAULTS.maxWidth;
+  setQualityUI(savedQuality);
+  setWidthUI(savedWidth);
 
-  const s  = await chrome.storage.local.get({ stats: { filesProcessed: 0, bytesProcessed: 0, bytesSaved: 0 } });
-  const st = s.stats || {};
-  const pct = st.bytesProcessed > 0
-    ? Math.round(st.bytesSaved / st.bytesProcessed * 100) : 0;
-  statImagesEl.textContent = (st.filesProcessed || 0).toLocaleString();
-  statBytesEl.textContent  = fmtBytes(st.bytesSaved) + (pct > 0 ? ` (${pct}%)` : "");
+  renderStats(s.stats);
 }
 load();
+
+function renderStats(st) {
+  st = st || {};
+  statImagesEl.textContent = Number(st.filesProcessed || 0).toLocaleString();
+  statBytesEl.textContent  = fmtBytes(Number(st.bytesProcessed || 0));
+  statSavedEl.textContent  = fmtBytes(Number(st.bytesSaved || 0));
+}
+
+// Keep the counters live while this page is open (the service worker flushes in batches).
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === "local" && changes.stats) renderStats(changes.stats.newValue);
+});
 
 // ── Quality preset buttons ────────────────────────────────────────────────────
 
@@ -123,8 +159,8 @@ customQualityEl.addEventListener("input", () => {
   if (!isNaN(v) && v >= 1 && v <= 100) {
     qualityPresets.forEach(b => b.classList.remove("active"));
   } else if (customQualityEl.value === "") {
-    // Restore nearest preset highlight when field is cleared
-    setQualityUI(DEFAULTS.quality);
+    // Restore the saved value's highlight when field is cleared
+    setQualityUI(savedQuality);
   }
 });
 
@@ -143,7 +179,7 @@ customWidthEl.addEventListener("input", () => {
   if (!isNaN(v) && v >= 0) {
     widthPresets.forEach(b => b.classList.remove("active"));
   } else if (customWidthEl.value === "") {
-    setWidthUI(DEFAULTS.maxWidth);
+    setWidthUI(savedWidth);
   }
 });
 
@@ -162,99 +198,89 @@ grayscaleEl.addEventListener("change", async () => {
 
 // ── Save ──────────────────────────────────────────────────────────────────────
 
-function isValidUrl(str) {
-  if (!str) return true;
-  try {
-    const u = new URL(str);
-    return u.protocol === "http:" || u.protocol === "https:";
-  } catch { return false; }
-}
-
 async function save() {
+  // Reject invalid custom values instead of silently falling back to a preset.
+  const cq = customQualityEl.value.trim();
+  const cw = customWidthEl.value.trim();
+  if (cq !== "" && !(/^\d+$/.test(cq) && +cq >= 1 && +cq <= 100)) {
+    showToast("Quality must be 1–100", "err");
+    return;
+  }
+  if (cw !== "" && !/^\d+$/.test(cw)) {
+    showToast("Width must be 0 or a positive number", "err");
+    return;
+  }
   const proxyBase = (proxyBaseEl.value || "").trim();
-
-  if (!isValidUrl(proxyBase)) {
+  if (!/^https?:\/\//i.test(proxyBase)) {
     proxyBaseEl.classList.add("invalid");
     showToast("Proxy URL must be http:// or https://", "err");
     proxyBaseEl.focus();
     return;
   }
-  proxyBaseEl.classList.remove("invalid");
+  const quality = readQuality();
+  const maxWidth = readWidth();
+  const excludeDomains = (excludeEl.value || "").trim();
+  const current = await chrome.storage.sync.get(DEFAULTS);
 
   await chrome.storage.sync.set({
     proxyBase,
-    quality:        readQuality(),
-    maxWidth:       readWidth(),
-    excludeDomains: (excludeEl.value || "").trim(),
+    quality,
+    maxWidth,
+    excludeDomains,
   });
 
+  // Reload whenever a URL-shaping setting changed, not just quality.
+  if (proxyBase !== String(current.proxyBase || "") ||
+      quality  !== Number(current.quality  ?? DEFAULTS.quality) ||
+      maxWidth !== Number(current.maxWidth ?? DEFAULTS.maxWidth)) {
+    await reloadCurrentPage();
+  }
+
+  // Keep the "restore on clear" values and preset highlights in step with storage.
+  savedQuality = quality;
+  savedWidth   = maxWidth;
+  setQualityUI(quality);
+  setWidthUI(maxWidth);
   showToast("Saved", "ok");
 }
+
+async function testProxy() {
+  const url = (proxyBaseEl.value || "").trim();
+  if (!/^https?:\/\//i.test(url)) { showToast("Enter a valid proxy URL first", "err"); return; }
+  const orig = testProxyBtn.textContent;
+  testProxyBtn.textContent = "Testing…"; testProxyBtn.disabled = true;
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 8000);
+    const res = await fetch(url, { signal: ctrl.signal });
+    clearTimeout(timer);
+    const body = await res.text();
+    if (res.ok && body.trim() === "bandwidth-hero-proxy") showToast("Proxy is working ✓", "ok");
+    else if (res.ok) showToast(`Proxy responded (${res.status})`, "warn");
+    else showToast(`Proxy returned HTTP ${res.status}`, "err");
+  } catch (e) {
+    showToast(e?.name === "AbortError" ? "Timed out — proxy not reachable" : "Connection failed — check URL and CORS", "err");
+  } finally {
+    testProxyBtn.textContent = orig; testProxyBtn.disabled = false;
+  }
+}
+
+testProxyBtn.addEventListener("click", testProxy);
+proxyBaseEl.addEventListener("input", () => proxyBaseEl.classList.remove("invalid"));
 
 // ── Reset ─────────────────────────────────────────────────────────────────────
 
 async function resetAll() {
-  // Confirm first: this button sits right next to Save in the sticky
-  // bottom action bar, which on a phone-sized screen is an easy mis-tap —
-  // and a silent reset wipes the proxy URL along with everything else.
-  if (!confirm("Reset all settings to defaults? This clears your proxy URL, quality, and exclusions.")) return;
   await chrome.storage.sync.set(DEFAULTS);
   await load();
   showToast("Reset to defaults");
 }
 
 async function resetStats() {
+  // Only touch the stats: load() would also overwrite unsaved edits in the form.
   await chrome.storage.local.set({ stats: { filesProcessed: 0, bytesProcessed: 0, bytesSaved: 0 } });
-  await load();
+  renderStats(null);
   showToast("Stats cleared");
-}
-
-// ── Test proxy ────────────────────────────────────────────────────────────────
-// AbortSignal.timeout() requires Chromium 103+. Kiwi/Cromite may be older.
-
-function fetchWithTimeout(url, ms) {
-  if (typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function") {
-    return fetch(url, { signal: AbortSignal.timeout(ms) });
-  }
-  const ctrl = new AbortController();
-  const t    = setTimeout(() => ctrl.abort(), ms);
-  return fetch(url, { signal: ctrl.signal }).finally(() => clearTimeout(t));
-}
-
-async function testProxy() {
-  const url = (proxyBaseEl.value || "").trim();
-  if (!url)              { showToast("Enter a proxy URL first", "err"); return; }
-  if (!isValidUrl(url))  {
-    proxyBaseEl.classList.add("invalid");
-    showToast("URL must be http:// or https://", "err");
-    return;
-  }
-  proxyBaseEl.classList.remove("invalid");
-
-  const orig = testProxyBtn.textContent;
-  testProxyBtn.textContent = "Testing…";
-  testProxyBtn.disabled    = true;
-
-  try {
-    const res  = await fetchWithTimeout(url, 8000);
-    const body = await res.text();
-    if (res.ok && body.trim() === "bandwidth-hero-proxy") {
-      showToast("Proxy is working ✓", "ok");
-    } else if (res.ok) {
-      showToast(`Proxy responded (${res.status}) — identity string not found`, "");
-    } else {
-      showToast(`Proxy returned HTTP ${res.status}`, "err");
-    }
-  } catch (e) {
-    if (e.name === "AbortError" || e.name === "TimeoutError") {
-      showToast("Timed out — proxy not reachable", "err");
-    } else {
-      showToast("Connection failed — check URL and CORS", "err");
-    }
-  } finally {
-    testProxyBtn.textContent = orig;
-    testProxyBtn.disabled    = false;
-  }
 }
 
 // ── Event wiring ──────────────────────────────────────────────────────────────
@@ -262,9 +288,7 @@ async function testProxy() {
 saveBtn.addEventListener("click", save);
 resetAllBtn.addEventListener("click", resetAll);
 resetStatsBtn.addEventListener("click", resetStats);
-testProxyBtn.addEventListener("click", testProxy);
 
-proxyBaseEl.addEventListener("input", () => proxyBaseEl.classList.remove("invalid"));
 
 [proxyBaseEl, excludeEl, customQualityEl, customWidthEl].forEach(el => {
   el.addEventListener("keydown", e => { if (e.key === "Enter") { e.preventDefault(); save(); } });
