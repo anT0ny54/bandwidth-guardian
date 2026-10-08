@@ -105,11 +105,15 @@ updateIcon();
 // ── Extension icon ────────────────────────────────────────────────────────────
 function updateIcon() {
   chrome.storage.sync.get({ enabled: DEFAULTS.enabled }, d => {
+    if (!chrome.action || typeof chrome.action.setIcon !== "function") return;
     const on = d.enabled;
     const path = on
       ? { 16: "icons/icon-16.png", 32: "icons/icon-32.png", 48: "icons/icon-48.png", 128: "icons/icon-128.png" }
       : { 16: "icons/icon-16-disabled.png", 32: "icons/icon-32-disabled.png", 48: "icons/icon-48-disabled.png", 128: "icons/icon-128-disabled.png" };
-    Promise.resolve(chrome.action.setIcon({ path })).catch(() => {});
+    try {
+      const maybePromise = chrome.action.setIcon({ path });
+      if (maybePromise && typeof maybePromise.catch === "function") maybePromise.catch(() => {});
+    } catch {}
   });
 }
 
@@ -234,6 +238,12 @@ function onProxyCompleted(details) {
 // (non-module) service workers on Kiwi/Cromite and causes Status code: 2.
 
 function doRefreshRules(done) {
+  // Cromite/Kiwi-class Chromium builds can lag desktop API surface. DNR is the
+  // only optional dependency here; image URL encoding still happens in content/prehook.
+  if (!chrome.declarativeNetRequest || typeof chrome.declarativeNetRequest.updateDynamicRules !== "function") {
+    if (typeof done === "function") done();
+    return;
+  }
   chrome.storage.sync.get(DEFAULTS, function(opts) {
     var removeRuleIds = ALL_RULE_IDS;
 

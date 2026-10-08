@@ -105,6 +105,10 @@
   // the original image just to inspect it).
   const SKIP_URL_RE = /favicon|\.(?:ico|svg)(?:[?#]|$)/i;
 
+  // Generic lazy attributes can point at video/audio/fonts/scripts/documents.
+  // Never send those URLs to an image proxy. KEEP IN SYNC with bandwidth-saver.
+  const NON_IMAGE_EXT_RE = /\.(?:mp4|webm|m3u8|mpd|mp3|ogg|wav|js|mjs|css|json|html?|php|pdf|zip|woff2?|ttf)(?:[?#]|$)/i;
+
   let opts = null;
   let proxyConfig = null;
   let destroyed = false;      // set on real navigation away from this document
