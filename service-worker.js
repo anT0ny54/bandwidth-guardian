@@ -1,4 +1,6 @@
 // Bandwidth Guardian — service worker
+// Save-Data request-header behavior adapted from Daniel Aleksandersen's
+// Save-Data WebExtension (GPL-3.0). See LICENSE-GPL-3.0.
 //
 // ══ WHY DNR RULE 1 (image redirect) WAS REMOVED ══════════════════════════════
 //
@@ -19,6 +21,7 @@
 // KEEP IN SYNC with defaults.js, prehook.js and content.js.
 const DEFAULTS = {
   enabled:         true,
+  saveData:        true,
   proxyBase:       "",
   quality:         60,
   grayscale:       true,
@@ -31,7 +34,8 @@ const sameOpts = (a, b) => !!a && !!b && Object.keys(DEFAULTS).every(k => a[k] =
 // leftover rule from a previous version of the extension is cleaned up.
 const RULE_ID_REDIRECT = 1;  // legacy — removed, never re-added
 const RULE_ID_CSP      = 2;  // strips CSP headers so proxy images can load
-const ALL_RULE_IDS     = [RULE_ID_REDIRECT, RULE_ID_CSP];
+const RULE_ID_SAVE_DATA = 3; // adds Save-Data: on to requests
+const ALL_RULE_IDS     = [RULE_ID_REDIRECT, RULE_ID_CSP, RULE_ID_SAVE_DATA];
 
 // ── Concurrency guard ─────────────────────────────────────────────────────────
 let refreshing     = false;
@@ -90,7 +94,7 @@ chrome.runtime.onInstalled.addListener(function() {
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== "sync") return;
   mirrorToLocal();
-  if ("enabled" in changes || "excludeDomains" in changes) refreshRules();
+  if ("enabled" in changes || "saveData" in changes || "excludeDomains" in changes) refreshRules();
   if ("enabled" in changes) updateIcon();
 });
 
@@ -233,7 +237,7 @@ function doRefreshRules(done) {
   chrome.storage.sync.get(DEFAULTS, function(opts) {
     var removeRuleIds = ALL_RULE_IDS;
 
-    if (!opts.enabled) {
+    if (!opts.enabled && !opts.saveData) {
       chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: removeRuleIds }, done);
       return;
     }
@@ -243,22 +247,51 @@ function doRefreshRules(done) {
     var excluded = String(opts.excludeDomains || "").split(/[,\s]+/)
       .map(function(s) { return s.trim().toLowerCase().replace(/^https?:\/\//, "").split("/")[0].replace(/\.$/, ""); })
       .filter(function(s) { return /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$/.test(s); });
-    var condition = { resourceTypes: ["main_frame", "sub_frame"] };
-    if (excluded.length) condition.excludedRequestDomains = Array.from(new Set(excluded));
+    var excludedDomains = Array.from(new Set(excluded));
+    var addRules = [];
 
     // Rule 2: Strip CSP headers so proxy-domain images aren't blocked by the page.
-    var addRules = [{
-      id: RULE_ID_CSP,
-      priority: 1,
-      action: {
-        type: "modifyHeaders",
-        responseHeaders: [
-          { header: "content-security-policy",             operation: "remove" },
-          { header: "content-security-policy-report-only", operation: "remove" }
-        ]
-      },
-      condition: condition
-    }];
+    // CSP only matters for top-level/frame documents, so keep this rule narrow.
+    if (opts.enabled) {
+      var cspCondition = { resourceTypes: ["main_frame", "sub_frame"] };
+      if (excludedDomains.length) cspCondition.excludedRequestDomains = excludedDomains;
+      addRules.push({
+        id: RULE_ID_CSP,
+        priority: 1,
+        action: {
+          type: "modifyHeaders",
+          responseHeaders: [
+            { header: "content-security-policy",             operation: "remove" },
+            { header: "content-security-policy-report-only", operation: "remove" }
+          ]
+        },
+        condition: cspCondition
+      });
+    }
+
+    // Save-Data: on — migrated from the original MV2 extension. DNR is used
+    // because MV3 cannot use webRequestBlocking for normal extensions. No
+    // resourceTypes filter is used, matching the original all-requests behavior.
+    if (opts.saveData) {
+      var saveDataCondition = {};
+      if (excludedDomains.length) {
+        // Exclude both the destination itself and subresources initiated by an
+        // excluded site (for example, its CDN/image host).
+        saveDataCondition.excludedRequestDomains = excludedDomains;
+        saveDataCondition.excludedInitiatorDomains = excludedDomains;
+      }
+      addRules.push({
+        id: RULE_ID_SAVE_DATA,
+        priority: 1,
+        action: {
+          type: "modifyHeaders",
+          requestHeaders: [
+            { header: "save-data", operation: "set", value: "on" }
+          ]
+        },
+        condition: saveDataCondition
+      });
+    }
 
     chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: removeRuleIds, addRules: addRules }, done);
   });

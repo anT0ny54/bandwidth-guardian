@@ -46,6 +46,7 @@
   // protocol (url/quality/bw/jpeg/max_width), not a third-party fixed proxy.
   const DEFAULTS = {
     enabled:         true,
+    saveData:        true,
     proxyBase:       "",
     quality:         60,
     grayscale:       true,
@@ -360,17 +361,19 @@
   }
 
   // ── B) Lazy-attr rewriting ─────────────────────────────────────────────────
-  // Rewrites data-src etc. so lazy-loaders pass proxy URLs to prehook.
-  // data-src / data-url are also used for iframes, videos, scripts and share links.
-  // Proxying those through an image CDN would break them.
-  const NON_IMAGE_TAGS = new Set(["IFRAME", "SCRIPT", "A", "LINK", "VIDEO", "AUDIO", "EMBED",
-    "OBJECT", "BUTTON", "INPUT", "FORM", "META"]);
-  const NON_IMAGE_EXT_RE = /\.(?:mp4|webm|m3u8|mpd|mp3|ogg|wav|js|mjs|css|json|html?|php|pdf|zip|woff2?|ttf)(?:[?#]|$)/i;
+  // STRICT IMAGE-ONLY: lazy attributes are rewritten only on actual image
+  // elements. Generic data-src/data-url attributes are also used by iframes,
+  // videos, scripts, links, downloads and other non-image content; an image
+  // proxy must never receive those URLs.
+  //
+  // Background images are handled separately by rewriteBg(), so keeping this
+  // strict does not lose CSS background-image support.
+  const IMAGE_LAZY_TAGS = new Set(["IMG", "SOURCE"]);
 
   function rewriteLazy(el) {
     if (!el || doneLazy.has(el)) return;
     if (!opts?.proxyBase || !opts?.enabled) return;
-    if (NON_IMAGE_TAGS.has(el.tagName)) return;
+    if (!IMAGE_LAZY_TAGS.has(el.tagName)) return;
 
     let rewrote = false;
 

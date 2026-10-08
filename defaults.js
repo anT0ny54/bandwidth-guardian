@@ -9,6 +9,7 @@
 
 export const DEFAULTS = {
   enabled:        true,
+  saveData:       true,
   proxyBase:      "",
   quality:        60,    // matches original compressionLevel default
   grayscale:      true,  // matches original convertBw: true — grayscale ON by default

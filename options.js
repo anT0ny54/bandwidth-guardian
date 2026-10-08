@@ -4,6 +4,7 @@ const $ = id => document.getElementById(id);
 
 const enabledEl      = $("enabled");
 const grayscaleEl    = $("grayscale");
+const saveDataEl     = $("saveData");
 const proxyBaseEl    = $("proxyBase");
 const testProxyBtn   = $("testProxy");
 const excludeEl      = $("excludeDomains");
@@ -119,6 +120,7 @@ async function load() {
   ]);
   enabledEl.checked   = !!d.enabled;
   grayscaleEl.checked = !!d.grayscale;
+  saveDataEl.checked   = !!d.saveData;
   proxyBaseEl.value   = d.proxyBase || "";
   proxyBaseEl.classList.remove("invalid");
   excludeEl.value     = d.excludeDomains || "";
@@ -194,6 +196,11 @@ enabledEl.addEventListener("change", async () => {
 grayscaleEl.addEventListener("change", async () => {
   await chrome.storage.sync.set({ grayscale: !!grayscaleEl.checked });
   showToast("Reload the page to apply", "warn");
+});
+
+saveDataEl.addEventListener("change", async () => {
+  await chrome.storage.sync.set({ saveData: !!saveDataEl.checked });
+  showToast(saveDataEl.checked ? "Save-Data header enabled" : "Save-Data header disabled", "ok");
 });
 
 // ── Save ──────────────────────────────────────────────────────────────────────

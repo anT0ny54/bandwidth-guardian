@@ -6,7 +6,7 @@
   // KEEP IN SYNC WITH defaults.js, content.js and service-worker.js.
   // Bandwidth Guardian uses its configurable custom image-proxy contract.
   const defaults = {
-    enabled: true, proxyBase: "", quality: 60, grayscale: true,
+    enabled: true, saveData: true, proxyBase: "", quality: 60, grayscale: true,
     maxWidth: 768, excludeDomains: ""
   };
 
