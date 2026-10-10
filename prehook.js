@@ -19,6 +19,14 @@
   const pageHost = location.hostname.toLowerCase();
   let pageExcluded = false;   // cached excludedHost(pageHost), rebuilt on settings change
   const pending = new Set(); // <img>/<source> elements waiting for opts to be ready
+  // #7: without a bound, every new element on a long-running SPA piles into
+  // `pending` forever if the settings event never arrives (extension error,
+  // storage failure, race) — an unbounded memory leak.
+  const MAX_PENDING = 1000;
+  function queuePending(el) {
+    if (pending.size >= MAX_PENDING) return; // bounded; watchdog releases the rest
+    pending.add(el);
+  }
   const fallbackHandlers = new WeakSet();
   const fallbackMeta = new WeakMap();
 
@@ -106,7 +114,12 @@
   function buildProxyUrl(orig) {
     if (!proxyConfig || !proxyConfig.base || !isHttp(orig)) return orig;
     const cached = proxyUrlCache.get(orig);
-    if (cached) return cached;
+    if (cached !== undefined) {
+      // True LRU: refresh insertion order on hit (same fix as content.js).
+      proxyUrlCache.delete(orig);
+      proxyUrlCache.set(orig, cached);
+      return cached;
+    }
     const { base, sep, quality, maxWidth, grayscale } = proxyConfig;
     const bw = grayscale ? "1" : "0";
     const parts = [
@@ -189,6 +202,16 @@
   // APIs such as chrome.storage. content.js owns storage access and publishes
   // only the small, non-secret settings object needed by this interceptor.
   const SETTINGS_EVENT = "bh-settings-update";
+  // #7: watchdog — if content.js never publishes settings (extension error,
+  // storage failure, race), fall back to defaults after a grace period so the
+  // queued elements are released and `pending` cannot grow without bound.
+  const SETTINGS_WATCHDOG_MS = 5000;
+  setTimeout(() => {
+    if (!destroyed && !ready) {
+      applyOpts({ ...defaults });
+      flushPending();
+    }
+  }, SETTINGS_WATCHDOG_MS);
   document.addEventListener(SETTINGS_EVENT, event => {
     if (destroyed) return;
     try {
@@ -323,7 +346,7 @@
         // Settings not loaded yet: stash the original and drop href so the
         // browser cannot start downloading the full-resolution image.
         if (!stashed) el.dataset.bhPreloadHref = original;
-        pending.add(el);
+        queuePending(el);
         // Never write the same value from inside an observed attribute callback;
         // same-value setAttribute can still enqueue a mutation in some engines.
         if (current !== "about:blank") setAttr.call(el, "href", "about:blank");
@@ -344,7 +367,7 @@
         const decided = isFailed(this) ? String(value) : decideSrc(String(value));
         if (decided === null) {
           this.dataset.bhPendingSrc = String(value);
-          pending.add(this);
+          queuePending(this);
           nativeSetSrc(this, "about:blank");
         } else {
           if (decided !== String(value)) armProxyFallback(this, resolveHttp(String(value)), this.getAttribute("srcset") || "");
@@ -367,7 +390,7 @@
           const v = String(value || "");
           if (!ready || !opts) {
             this.dataset.bhPendingSrcset = v;
-            pending.add(this);
+            queuePending(this);
             nativeSetSrcset(this, "");
           } else if (!opts.enabled || !opts.proxyBase) {
             nativeSetSrcset(this, v);
@@ -394,7 +417,7 @@
           const v = String(value || "");
           if (!ready || !opts) {
             this.dataset.bhPendingSrcset = v;
-            pending.add(this);
+            queuePending(this);
             nativeSourceSetSrcset(this, "");
           } else if (!opts.enabled || !opts.proxyBase) {
             nativeSourceSetSrcset(this, v);
@@ -422,7 +445,7 @@
           const v = String(value || "").toLowerCase();
           if (!ready || !opts) {
             this.dataset.bhPendingLoading = v;
-            pending.add(this);
+            queuePending(this);
             loadingDesc.set.call(this, "lazy");
           } else if (!opts.enabled || !opts.proxyBase || pageExcluded) {
             loadingDesc.set.call(this, v);
@@ -449,7 +472,7 @@
             const decided = decideSrc(String(value));
             if (decided === null) {
               this.dataset.bhPreloadHref = String(value);
-              pending.add(this);
+              queuePending(this);
               linkHrefDesc.set.call(this, "about:blank");
               return;
             }
@@ -468,35 +491,39 @@
       if (destroyed) return setAttr.call(this, name, value);
       const n = String(name).toLowerCase();
 
-      // Handle these before the generic src/srcset gate; otherwise the early
-      // return below makes the loading and preload branches unreachable.
+      // #21: fast path first. The overwhelming majority of setAttribute calls
+      // (class, data-*, aria-*, id, …) hit this gate and return with zero
+      // instanceof checks. Only src/srcset/loading/href/rel/as/type fall
+      // through to the per-tag branches below.
+      if (n !== "src" && n !== "srcset" && n !== "loading" &&
+          n !== "href" && n !== "rel" && n !== "as" && n !== "type") {
+        return setAttr.call(this, name, value);
+      }
+
+      // <link rel="preload"> attributes must land before inspection.
+      if (this instanceof HTMLLinkElement) {
+        setAttr.call(this, name, value);
+        processPreloadLink(this);
+        return;
+      }
+
       if (this instanceof HTMLImageElement && n === "loading") {
         const v = String(value || "").toLowerCase();
         if (!ready || !opts) {
           this.dataset.bhPendingLoading = v;
-          pending.add(this);
+          queuePending(this);
           return setAttr.call(this, "loading", "lazy");
         }
         if (!opts.enabled || !opts.proxyBase || pageExcluded) return setAttr.call(this, "loading", v);
         return setAttr.call(this, "loading", v === "eager" ? "eager" : "lazy");
       }
 
-      if (this instanceof HTMLLinkElement &&
-          (n === "href" || n === "rel" || n === "as" || n === "type")) {
-        // Let the attribute land first so isImagePreloadLink() sees the full
-        // rel/as/href combination (order of attribute sets is page-controlled).
-        setAttr.call(this, name, value);
-        processPreloadLink(this);
-        return;
-      }
-
-      if (n !== "src" && n !== "srcset") return setAttr.call(this, name, value);
       if (this instanceof HTMLImageElement && (n === "src" || n === "srcset")) {
         if (n === "src") {
           const decided = isFailed(this) ? String(value) : decideSrc(String(value));
           if (decided === null) {
             this.dataset.bhPendingSrc = String(value);
-            pending.add(this);
+            queuePending(this);
             return setAttr.call(this, "src", "about:blank");
           }
           if (decided !== String(value)) armProxyFallback(this, resolveHttp(String(value)), this.getAttribute("srcset") || "");
@@ -505,7 +532,7 @@
           const v = String(value || "");
           if (!ready || !opts) {
             this.dataset.bhPendingSrcset = v;
-            pending.add(this);
+            queuePending(this);
             return setAttr.call(this, "srcset", "");
           }
           if (!opts.enabled || !opts.proxyBase) return setAttr.call(this, "srcset", v);
@@ -518,7 +545,7 @@
         const v = String(value || "");
         if (!ready || !opts) {
           this.dataset.bhPendingSrcset = v;
-          pending.add(this);
+          queuePending(this);
           return setAttr.call(this, "srcset", "");
         }
         if (!opts.enabled || !opts.proxyBase) return setAttr.call(this, "srcset", v);

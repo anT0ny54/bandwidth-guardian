@@ -253,7 +253,13 @@
     if (!proxyConfig || !isHttp(orig)) return orig;
 
     const cached = proxyUrlCache.get(orig);
-    if (cached) return cached;
+    if (cached !== undefined) {
+      // Refresh insertion order so frequently-used URLs are evicted last
+      // (FIFO eviction would drop them just for being inserted early).
+      proxyUrlCache.delete(orig);
+      proxyUrlCache.set(orig, cached);
+      return cached;
+    }
 
     const { base, sep, quality, maxWidth, grayscale } = proxyConfig;
     const bw = grayscale ? "1" : "0";
@@ -412,7 +418,7 @@
   function rewriteBg(el) {
     if (!el || doneBg.has(el)) return;
     if (!opts?.proxyBase || !opts?.enabled) return;
-    const bg = el.style?.backgroundImage;
+    const bg = el.style.backgroundImage;
     if (!bg) return;
 
     // Rewrite every HTTP(S) url(...) token while preserving gradients, CSS
@@ -448,7 +454,11 @@
     el.setAttribute("href", buildProxyUrl(absolute));
   }
 
-  const CANDIDATE_SELECTOR = ["img", "source", LAZY_SELECTOR, "[style*='url(' i]", 'link[rel~="preload"]'].join(",");
+  // #17: the [style*='url(' i] substring scan is expensive on huge documents,
+  // so it is kept out of the hot path. The initial one-off full-page scan uses
+  // it directly; mutation flushes only style-check nodes from the batch itself.
+  const CANDIDATE_SELECTOR = ["img", "source", LAZY_SELECTOR, 'link[rel~="preload"]'].join(",");
+  const STYLE_SELECTOR = "[style*='url(' i]";
 
   // ── Full-page scan ────────────────────────────────────────────────────────
   function processCandidate(el) {
@@ -461,6 +471,9 @@
   function rewriteAll() {
     if (destroyed) return;
     document.querySelectorAll(CANDIDATE_SELECTOR).forEach(processCandidate);
+    // Initial scan only: this C++-level substring check is too broad for the
+    // per-mutation-flush path.
+    document.querySelectorAll(STYLE_SELECTOR).forEach(rewriteBg);
   }
 
   function scheduleInitialRewrite() {
@@ -479,11 +492,18 @@
   let pendingMutations = [];
   let mutationFlushQueued = false;
 
+  // #18: module-level reusable collections, cleared between flushes, instead
+  // of allocating four new containers per mutation batch on churn-heavy pages.
+  const addedRoots = [];
+  const imageTargets = new Set();
+  const lazyTargets = new Set();
+  const bgTargets = new Set();
+
   function processMutations(mutations) {
-    const addedRoots = [];
-    const imageTargets = new Set();
-    const lazyTargets = new Set();
-    const bgTargets = new Set();
+    addedRoots.length = 0;
+    imageTargets.clear();
+    lazyTargets.clear();
+    bgTargets.clear();
 
     for (const m of mutations) {
       if (m.type === "childList") {
@@ -512,8 +532,13 @@
             imageTargets.add(t);
           }
         } else if (m.attributeName === "style") {
-          doneBg.delete(t);
-          bgTargets.add(t);
+          // #19: most style mutations (color, display, …) don't touch
+          // background-image. Gate here so those elements never reach
+          // rewriteBg's doomed early return.
+          if (t.style && t.style.backgroundImage) {
+            doneBg.delete(t);
+            bgTargets.add(t);
+          }
         } else if (lazyAttrSet.has(m.attributeName) || m.attributeName === "data-srcset") {
           doneLazy.delete(t);
           lazyTargets.add(t);
@@ -524,10 +549,22 @@
     for (const root of addedRoots) {
       processCandidate(root);
       root.querySelectorAll?.(CANDIDATE_SELECTOR).forEach(processCandidate);
+      // #17: style-attribute candidates from THIS batch only.
+      if (root.nodeType === 1) {
+        if (root.hasAttribute?.("style") && String(root.getAttribute("style")).includes("url(")) {
+          rewriteBg(root);
+        }
+        root.querySelectorAll?.(STYLE_SELECTOR).forEach(rewriteBg);
+      }
     }
     imageTargets.forEach(rewriteImg);
     lazyTargets.forEach(rewriteLazy);
     bgTargets.forEach(rewriteBg);
+
+    addedRoots.length = 0;
+    imageTargets.clear();
+    lazyTargets.clear();
+    bgTargets.clear();
   }
 
   const MUTATION_RECORD_LIMIT = 2000;
@@ -559,6 +596,7 @@
     destroyed = true;
     try { mo && mo.disconnect(); } catch {}
     pendingMutations = [];
+    proxyUrlCache.clear(); // #14: parity with prehook.js stop()
   }
 
   let mo = null;

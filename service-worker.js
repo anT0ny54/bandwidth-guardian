@@ -30,12 +30,9 @@ const DEFAULTS = {
 };
 const sameOpts = (a, b) => !!a && !!b && Object.keys(DEFAULTS).every(k => a[k] === b[k]);
 
-// Rule 1 is no longer added, but we still remove it on every refresh so any
-// leftover rule from a previous version of the extension is cleaned up.
-const RULE_ID_REDIRECT = 1;  // legacy — removed, never re-added
 const RULE_ID_CSP      = 2;  // strips CSP headers so proxy images can load
 const RULE_ID_SAVE_DATA = 3; // adds Save-Data: on to requests
-const ALL_RULE_IDS     = [RULE_ID_REDIRECT, RULE_ID_CSP, RULE_ID_SAVE_DATA];
+const ALL_RULE_IDS     = [RULE_ID_CSP, RULE_ID_SAVE_DATA];
 
 // ── Concurrency guard ─────────────────────────────────────────────────────────
 let refreshing     = false;
@@ -153,14 +150,19 @@ function getProxyResponseStats(responseHeaders) {
     getHeaderInt(responseHeaders, "x-bytes-saved");
 
   let received = compressed;
-  if (received === null && original !== null && savedHeader !== null) {
+  // `known` tracks whether `received` reflects an actual measurement. Without
+  // it, the content-length fallback (?? 0) made saved = original - 0, i.e. the
+  // ENTIRE image size was reported as saved even when the proxy sent no
+  // size headers at all — a misleading statistic (#22).
+  let known = received !== null;
+  if (!known && original !== null && savedHeader !== null) {
     received = Math.max(0, original - Math.min(savedHeader, original));
+    known = true;
   }
-  if (received === null) received = getHeaderInt(responseHeaders, "content-length") ?? 0;
+  if (!known) received = getHeaderInt(responseHeaders, "content-length") ?? 0;
 
   let saved = savedHeader;
-  if (saved === null && original !== null) saved = Math.max(0, original - received);
-  if (saved === null) saved = 0;
+  if (saved === null) saved = known && original !== null ? Math.max(0, original - received) : 0;
 
   return { received, saved };
 }
@@ -174,6 +176,8 @@ function flushStats() {
   statsFlushInProgress = true;
   const delta = pendingStats;
   pendingStats = { filesProcessed: 0, bytesProcessed: 0, bytesSaved: 0 };
+  // #6: clear the crash-recovery mirror now that the delta is committed.
+  try { chrome.storage.local.set({ statsPending: pendingStats }); } catch {}
   chrome.storage.local.get({ stats: { filesProcessed: 0, bytesProcessed: 0, bytesSaved: 0 } }, d => {
     const s = d.stats || { filesProcessed: 0, bytesProcessed: 0, bytesSaved: 0 };
     s.filesProcessed = Number(s.filesProcessed) || 0;
@@ -201,8 +205,27 @@ function recordStats(bytes, saved) {
   pendingStats.filesProcessed += 1;
   pendingStats.bytesProcessed += Math.max(0, Number(bytes) || 0);
   pendingStats.bytesSaved     += Math.max(0, Number(saved) || 0);
+  // #6: MV3 workers can be killed at any moment between record and flush.
+  // Mirror the pending delta to storage.local so the stats survive worker
+  // termination; flushStats clears the scratch key once committed.
+  try { chrome.storage.local.set({ statsPending: pendingStats }); } catch {}
   scheduleStatsFlush();
 }
+
+// #6: recover stats stranded by a worker killed between recordStats() and
+// flushStats(), then drop the scratch key.
+chrome.storage.local.get({ statsPending: null }, d => {
+  const p = d.statsPending;
+  if (p) try { chrome.storage.local.remove("statsPending"); } catch {}
+  const files = Number(p?.filesProcessed) || 0;
+  const bytes = Math.max(0, Number(p?.bytesProcessed) || 0);
+  const saved = Math.max(0, Number(p?.bytesSaved) || 0);
+  if (!files && !bytes && !saved) return;
+  pendingStats.filesProcessed += files;
+  pendingStats.bytesProcessed += bytes;
+  pendingStats.bytesSaved     += saved;
+  scheduleStatsFlush();
+});
 
 // Observe completed image requests and read the response headers.
 // `types: ["image"]` limits listener overhead to image responses only.
@@ -230,8 +253,8 @@ function onProxyCompleted(details) {
 }
 
 // ── DNR rules ─────────────────────────────────────────────────────────────────
-// Only Rule 2 (CSP stripping) is active. Rule 1 (redirect) is intentionally
-// not added — see top-of-file explanation.
+// Only Rule 2 (CSP stripping) and Rule 3 (Save-Data) are active. The old
+// Rule 1 (redirect) was removed and its cleanup retired — see top-of-file.
 //
 // Uses callback form throughout — the Promise-returning form of chrome APIs
 // (e.g. await chrome.storage.sync.get()) is not available in classic

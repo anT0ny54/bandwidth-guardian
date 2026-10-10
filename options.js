@@ -242,10 +242,13 @@ async function save() {
     excludeDomains,
   });
 
-  // Reload whenever a URL-shaping setting changed, not just quality.
+  // Reload whenever a URL-shaping setting changed — including excluded
+  // domains, whose effect is only visible after a reload restores the page's
+  // already-proxied images (or stops proxying a newly excluded site).
   if (proxyBase !== String(current.proxyBase || "") ||
       quality  !== Number(current.quality  ?? DEFAULTS.quality) ||
-      maxWidth !== Number(current.maxWidth ?? DEFAULTS.maxWidth)) {
+      maxWidth !== Number(current.maxWidth ?? DEFAULTS.maxWidth) ||
+      excludeDomains !== String(current.excludeDomains || "")) {
     await reloadCurrentPage();
   }
 
@@ -289,6 +292,9 @@ proxyBaseEl.addEventListener("input", () => proxyBaseEl.classList.remove("invali
 async function resetAll() {
   await chrome.storage.sync.set(DEFAULTS);
   await load();
+  // Resetting clears the proxy URL; without a reload the current page keeps
+  // serving proxied images from the old proxy until manually refreshed.
+  await reloadCurrentPage();
   showToast("Reset to defaults");
 }
 
