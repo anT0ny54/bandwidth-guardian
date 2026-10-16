@@ -32,16 +32,21 @@
   // Known ad/tracking image URLs (ported from the original shouldCompress.js).
   // Pixel/cleardot only match as the start of a file name: the old
   // `(?:pixel|cleardot)\.*\.(?:gif|jpg|jpeg)` only ever matched "pixel.gif".
+  //
+  // The trailing `+` quantifiers that used to follow some alternation groups
+  // were removed: TRACKING_RE is always used with an unanchored .test()
+  // search, so a repeated group could never extend a match — the quantifier
+  // only added backtracking overhead for zero behavior change.
   const TRACKING_RE = new RegExp([
     "pagead",
     "\\/(?:pixel|cleardot)[^/?#]*\\.(?:gif|jpe?g)(?:[?#]|$)",
-    "google\\.(?:[a-z.]+)\\/(?:ads|generate_204|.*\\/log204)+",
-    "google-analytics\\.(?:[a-z.]+)\\/(?:r|collect)+",
-    "youtube\\.(?:[a-z.]+)\\/(?:api|ptracking|player_204|live_204)+",
-    "doubleclick\\.(?:[a-z.]+)\\/(?:pcs|pixel|r)+",
+    "google\\.(?:[a-z.]+)\\/(?:ads|generate_204|.*\\/log204)",
+    "google-analytics\\.(?:[a-z.]+)\\/(?:r|collect)",
+    "youtube\\.(?:[a-z.]+)\\/(?:api|ptracking|player_204|live_204)",
+    "doubleclick\\.(?:[a-z.]+)\\/(?:pcs|pixel|r)",
     "googlesyndication\\.(?:[a-z.]+)\\/ddm",
     "pixel\\.facebook\\.(?:[a-z.]+)",
-    "facebook\\.(?:[a-z.]+)\\/(?:impression\\.php|tr)+",
+    "facebook\\.(?:[a-z.]+)\\/(?:impression\\.php|tr)",
     "ad\\.bitmedia\\.io",
     "yahoo\\.(?:[a-z.]+)\\/pixel",
     "criteo\\.net\\/img",
@@ -209,7 +214,14 @@
   const FAILED_ATTR = "data-bh-failed";           // proxy failed: never proxy again
   const ORIG_SRCSET_ATTR = "data-bh-orig-srcset"; // original <source> srcset
   const TIMEOUT_EVENT = "bh-proxy-timeout";       // content.js: proxy load stalled
-  const BRIDGE_KEY = "__bhBridge";                // settings MessageChannel handshake
+  // Settings MessageChannel handshake. The envelope key carries one of three
+  // values: 1 = handshake (content -> prehook, with a transferred port),
+  // BRIDGE_REQ = "please (re)send the port" (prehook -> content),
+  // BRIDGE_ACK = "port accepted" (prehook -> content, over the port itself,
+  // so pages cannot read or spoof it).
+  const BRIDGE_KEY = "__bhBridge";
+  const BRIDGE_REQ = 2;
+  const BRIDGE_ACK = 3;
 
   // Per-world proxy-failure fallback. Restores the ORIGINAL URLs (recovered
   // from the proxy URLs themselves, so it works for every path: parser,
@@ -282,6 +294,7 @@
     createProxyUrlBuilder, originalFromProxyUrl,
     parseSrcset, mapSrcset, unproxySrcset,
     saveSettings,
-    FAILED_ATTR, ORIG_SRCSET_ATTR, TIMEOUT_EVENT, BRIDGE_KEY, createFallback,
+    FAILED_ATTR, ORIG_SRCSET_ATTR, TIMEOUT_EVENT,
+    BRIDGE_KEY, BRIDGE_REQ, BRIDGE_ACK, createFallback,
   });
 })();

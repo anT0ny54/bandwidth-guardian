@@ -45,7 +45,7 @@ Page JavaScript / HTML parser
    settings mirror / DNR rules / stats / icon
 ```
 
-At `document_start`, `prehook.js` installs its hooks synchronously, and `content.js` synchronously posts one handshake message carrying a `MessagePort`. Because both run before any page script, `prehook.js`'s capture listener receives that message first, keeps the port, stops the message from reaching page listeners, and removes itself; later look-alike messages are ignored. Settings (proxy URL, exclusion list) then travel only over that port.
+At `document_start`, `prehook.js` installs its hooks synchronously, and the two layers establish a private `MessageChannel` with a **two-way handshake**: `content.js` posts a handshake carrying a `MessagePort`, and `prehook.js` also posts a settings request of its own. This is required because the injection order of MAIN-world and isolated-world `document_start` scripts is **not guaranteed** (Chromium builds order them differently): whichever script runs first loses its first message on a listener that does not exist yet, so both directions speak until one lands. A transferred `MessagePort` is one-shot, so every retry uses a fresh channel. `prehook.js`'s capture listener takes the first handshake, stops it from reaching page listeners, and removes itself; the accepted port is then acknowledged **over the port itself** (pages cannot read or spoof ports), after which no further bridge messages are honored. Settings (proxy URL, exclusion list) then travel only over that port.
 
 Until settings arrive, eligible page-created URLs are **held in memory** instead of being written to the DOM: nothing downloads, no `about:blank` error events fire, and the patched getters (`img.src`, `img.srcset`, …) return the value the page wrote. Up to 1000 elements are held; beyond that, values pass through unproxied so no image is ever left blank. If settings never arrive, a 5-second watchdog releases everything unproxied.
 
@@ -260,9 +260,6 @@ The build script:
 
 The artifact is `dist/bandwidth-guardian-<version>.zip`.
 
-### Releases
-
-`.github/workflows/build.yml` builds on every push to `main` and creates the GitHub release `v<version>` from `manifest.json`. An existing release is never modified (a warning is logged instead), so a tag always matches the code its zip was built from — bump `version` in `manifest.json` to publish a new release. Dependabot keeps the workflow actions up to date.
 
 ## Runtime architecture
 
@@ -292,7 +289,7 @@ Runs at `document_start` in the extension's **isolated world**. It owns extensio
 Responsibilities include:
 
 - loading settings from the local mirror with sync fallback;
-- publishing settings to `prehook.js` over the private `MessageChannel`;
+- publishing settings to `prehook.js` over the private `MessageChannel` (two-way, race-proof handshake);
 - reacting to settings changes (without writing the local mirror — the service worker and the popup/Options pages own it);
 - parser-created image processing;
 - lazy attributes and `data-srcset`;
@@ -402,6 +399,7 @@ The extension source/build has been validated with:
 
 - JavaScript syntax checks for shipped scripts;
 - logic checks of `shared.js`, `prehook.js`, `content.js` and `service-worker.js` against minimal DOM/`chrome.*` stubs (held elements, fallback paths, picture sources, stall guard, settings bridge, DNR rule contents, statistics);
+- a two-world integration test of the settings bridge under BOTH injection orders (MAIN-world first and isolated-world first), including the disabled case;
 - ZIP integrity validation;
 - reproducible build verification; and
 - manifest/runtime-file consistency checks.

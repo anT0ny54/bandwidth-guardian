@@ -270,19 +270,31 @@
   }
 
   // ── Settings bridge ────────────────────────────────────────────────────────
-  // content.js (isolated world, owns chrome.storage) posts ONE message at
-  // document_start carrying a MessagePort, before any page script can run.
-  // This listener is registered first on window (capture), takes the first
-  // matching message, stops it from reaching page listeners and removes
-  // itself, so later look-alike messages from the page are ignored. Settings
-  // (proxy URL, exclusion list) then flow only over the private port — page
-  // scripts can neither read nor spoof them.
+  // content.js (isolated world, owns chrome.storage) hands settings over a
+  // private MessagePort. The handshake is TWO-WAY because the injection order
+  // of MAIN-world and isolated-world document_start scripts is NOT guaranteed
+  // (Chromium builds order them differently): whichever script runs first
+  // loses its first message on a listener that does not exist yet — in 0.1.8
+  // a lost startup handshake left prehook settings-less until the 5-second
+  // watchdog, so every JavaScript-assigned image loaded unproxied. Both sides
+  // therefore speak: prehook listens for content.js's handshake AND posts a
+  // settings request of its own, which content.js answers with a fresh port.
+  // At least one direction always lands, under every injection order, before
+  // any page script runs.
+  //
+  // This capture listener takes the first handshake, stops it from reaching
+  // page listeners and removes itself; later look-alike messages from the
+  // page are ignored. Settings (proxy URL, exclusion list) then travel only
+  // over the private port — page scripts can neither read nor spoof them —
+  // and the ack that closes the handshake travels over the port itself.
   function onBridge(e) {
     try {
       if (e.source !== window || !e.data || e.data[BH.BRIDGE_KEY] !== 1 || !e.ports || !e.ports[0]) return;
       e.stopImmediatePropagation();
       window.removeEventListener("message", onBridge, true);
       const port = e.ports[0];
+      // Tell content.js which port was accepted so it stops offering new ones.
+      try { port.postMessage({ [BH.BRIDGE_KEY]: BH.BRIDGE_ACK }); } catch {}
       port.onmessage = m => {
         if (destroyed) return;
         const next = m.data;
@@ -300,6 +312,9 @@
     } catch {}
   }
   window.addEventListener("message", onBridge, true);
+  // Also ASK for settings: if prehook ran first, content.js's startup
+  // handshake was already lost; this request makes it re-post one.
+  try { window.postMessage({ [BH.BRIDGE_KEY]: BH.BRIDGE_REQ }, "*"); } catch {}
 
   // Watchdog: if settings never arrive (extension error, storage failure),
   // release held elements unproxied so nothing stays imageless.
@@ -338,7 +353,7 @@
     });
   }
 
-  // ── Patch <source>.srcset inside <picture> ────────────────────────────────
+  // ── Patch <source>.srcset inside <picture> ───────────────────────────────
   if (sourceProto && sourceSrcsetDesc && sourceSrcsetDesc.set) {
     Object.defineProperty(sourceProto, "srcset", {
       configurable: true,

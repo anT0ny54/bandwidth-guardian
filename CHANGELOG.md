@@ -22,11 +22,29 @@ Bandwidth Hero-compatible proxy).
   to `prehook.js` as a `bh-settings-update` DOM event that any page could
   listen to (exposing the proxy URL and the excluded-domains list) or
   dispatch itself. They now travel over a private `MessageChannel`. The
-  handshake is posted at `document_start` before any page script runs, is
-  accepted once, and is hidden from page listeners.
+  handshake is two-way (either world's startup message can be the one that
+  lands, because cross-world injection order is not guaranteed), is accepted
+  once, is acknowledged over the port itself so pages cannot spoof the
+  acknowledgment, and is hidden from page listeners.
 
 ### Fixed
 
+- **Proxy configured but nothing was proxied (0.1.8 regression).** Settings
+  reached `prehook.js` over a `MessagePort` handed over in a one-shot
+  handshake posted synchronously at `document_start`. The injection order of
+  MAIN-world and isolated-world `document_start` scripts is not guaranteed
+  (Chromium builds order them differently); when the isolated-world script
+  ran first, the handshake fired before `prehook.js` registered its listener
+  and was lost. `prehook.js` then stayed without settings until the
+  5-second watchdog, after which every JavaScript-assigned image
+  (`img.src`, `new Image()`, framework hydration) loaded unproxied. In
+  0.1.7 the settings event was dispatched asynchronously after the storage
+  read, so both listeners were always registered in time. The handshake is
+  now two-way: `prehook.js` also posts a settings request, and `content.js`
+  answers requests with a fresh port (a transferred port is one-shot) until
+  the accepted port is acknowledged over the port itself. At least one
+  direction always lands, under every injection order, before any page
+  script runs. Verified with a two-world integration test in both orders.
 - **Queued `srcset` was proxied while disabled.** A `srcset` set before
   settings arrived was always proxied, even with Guardian turned off.
 - **Lazy-loaded images had no fallback.** `data-src` is rewritten to a proxy
@@ -98,7 +116,7 @@ Bandwidth Hero-compatible proxy).
   - proxy-URL building
   - srcset parsing
   - the fallback
-  
+
   It is listed first in both `content_scripts` entries (each world gets its
   own copy), loaded with `importScripts` in the classic service worker, and
   imported by the popup and options pages.
@@ -139,8 +157,12 @@ Bandwidth Hero-compatible proxy).
 - Firefox metadata (`browser_specific_settings`). Firefox does not support
   `background.service_worker`, and the stats listener uses the Chromium-only
   `extraHeaders`, so the manifest could not load there.
-- The `Keep Fork Alive` workflow and `.github/keep-alive.txt`. Only
-  scheduled workflows are disabled after 60 days of inactivity, and the
-  keep-alive was the only one, so it was only keeping itself alive.
 - Stale comments, such as "KEEP IN SYNC with bandwidth-saver" and the
   description of the style-attribute scan.
+
+### Housekeeping
+
+- **`shared.js`: dropped the redundant `+` quantifiers in `TRACKING_RE`.**
+  The filter is always used with an unanchored `.test()` search, so a
+  repeated alternation group could never extend a match — the quantifiers
+  only added backtracking overhead. Matching behavior is unchanged.
