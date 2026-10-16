@@ -260,6 +260,9 @@ The build script:
 
 The artifact is `dist/bandwidth-guardian-<version>.zip`.
 
+### Releases
+
+`.github/workflows/build.yml` builds on every push to `main` and creates the GitHub release `v<version>` from `manifest.json`. An existing release is never modified (a warning is logged instead), so a tag always matches the code its zip was built from — bump `version` in `manifest.json` to publish a new release. Dependabot keeps the workflow actions up to date.
 
 ## Runtime architecture
 
