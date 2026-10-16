@@ -76,6 +76,17 @@ Bandwidth Hero-compatible proxy).
 - **Save-Data was not sent on page navigations.** A DNR rule without
   `resourceTypes` matches everything except `main_frame`. The types are now
   listed explicitly.
+- **Proxying stopped when the local settings mirror went stale (0.1.8
+  regression).** `content.js` and the service worker read a `storage.local`
+  mirror before `storage.sync`. The mirror was refreshed only when the MV3
+  service worker observed a `storage.onChanged` event; on browsers where that
+  wake-up is not reliable, the mirror kept old values (for example an empty
+  proxy URL), so pages loaded unproxied and statistics stayed at zero. v0.1.7
+  read `storage.sync` directly, which is why it kept working there. The mirror
+  is now only a fast first paint: both layers reconcile against
+  `chrome.storage.sync` (authoritative) on startup and rewrite the mirror, so
+  a stale mirror self-heals within milliseconds. Verified with a stale-mirror
+  integration test: proxying and grayscale (`bw=1`) are applied from sync.
 - **The stat for the event that woke the service worker was lost.** Image
   responses that arrive before the proxy origin has loaded are now queued and
   counted.

@@ -441,19 +441,20 @@
     stop();
   });
 
-  // The local mirror written by the service worker and by saveSettings() is
-  // authoritative here. Sync fallback only if the worker has not run yet.
+  // The local mirror is only a FAST first paint. chrome.storage.sync is
+  // authoritative: on browsers where the MV3 worker does not reliably wake for
+  // storage.onChanged (Kiwi/Cromite-class builds), the mirror can go stale —
+  // v0.1.7 read sync directly, which is why it kept working. So: apply the
+  // mirror instantly (if present), then reconcile against sync and rewrite the
+  // mirror. If the mirror was stale, proxying starts as soon as sync lands.
   chrome.storage.local.get({ bhOpts: null }, d => {
     if (destroyed) return;
-    if (d.bhOpts) {
-      applyOpts(d.bhOpts);
-    } else {
-      chrome.storage.sync.get(DEFAULTS, synced => {
-        if (destroyed) return;
-        applyOpts(synced);
-        chrome.storage.local.set({ bhOpts: synced });
-      });
-    }
+    if (d.bhOpts) applyOpts(d.bhOpts);
+    chrome.storage.sync.get(DEFAULTS, synced => {
+      if (destroyed) return;
+      if (!BH.sameOpts(synced, opts)) applyOpts(synced);
+      chrome.storage.local.set({ bhOpts: synced });
+    });
   });
 
   // Settings changes made in the popup/options pages; sync is authoritative.

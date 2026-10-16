@@ -16,7 +16,7 @@ The extension is intentionally **proxy-agnostic**: it does not require a built-i
 - Supports normal images, `srcset`, `<picture>` sources, lazy-loading attributes, image preloads, inline background images, and dynamically inserted elements.
 - Automatic per-image fallback to the original URL when a proxy request fails **or stalls** — for every path, including lazy-loaded images and `<picture>` sources.
 - Configurable quality, grayscale, maximum width, and excluded domains.
-- Local settings mirror for fast content-script startup.
+- Local settings mirror for fast content-script startup (`chrome.storage.sync` remains authoritative and re-heals the mirror on every startup).
 - Usage statistics collected from proxy response headers by the service worker.
 - CSP response-header handling through Declarative Net Request, active only while a proxy is configured.
 - Optional `Save-Data: on` request header for every request, including page navigations.
@@ -264,6 +264,7 @@ The artifact is `dist/bandwidth-guardian-<version>.zip`.
 
 `.github/workflows/build.yml` builds on every push to `main` and creates the GitHub release `v<version>` from `manifest.json`. An existing release is never modified (a warning is logged instead), so a tag always matches the code its zip was built from — bump `version` in `manifest.json` to publish a new release. Dependabot keeps the workflow actions up to date.
 
+
 ## Runtime architecture
 
 ### `prehook.js`
@@ -291,7 +292,7 @@ Runs at `document_start` in the extension's **isolated world**. It owns extensio
 
 Responsibilities include:
 
-- loading settings from the local mirror with sync fallback;
+- loading settings with the local mirror as a fast first paint and `chrome.storage.sync` as the authoritative source (reconciled and mirrored back on every startup);
 - publishing settings to `prehook.js` over the private `MessageChannel` (two-way, race-proof handshake);
 - reacting to settings changes (without writing the local mirror — the service worker and the popup/Options pages own it);
 - parser-created image processing;

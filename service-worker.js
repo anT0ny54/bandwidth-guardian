@@ -69,9 +69,18 @@ function loadProxyOrigin() {
     const queued = earlyEvents.splice(0);
     for (const details of queued) onProxyCompleted(details);
   };
+  // Mirror first (fast): content scripts read it at startup. chrome.storage.sync
+  // is authoritative — the mirror can go stale on builds where storage.onChanged
+  // does not reliably wake the MV3 worker (v0.1.7 read sync directly, which is why
+  // it kept working). Reconcile with sync and rewrite the mirror so it self-heals.
   chrome.storage.local.get({ bhOpts: null }, d => {
-    if (d && d.bhOpts) return done(d.bhOpts.proxyBase);
-    chrome.storage.sync.get({ proxyBase: DEFAULTS.proxyBase }, s => done(s && s.proxyBase));
+    if (d && d.bhOpts) done(d.bhOpts.proxyBase);
+    chrome.storage.sync.get(DEFAULTS, s => {
+      if (!d || !d.bhOpts || !sameOpts(d.bhOpts, s)) {
+        chrome.storage.local.set({ bhOpts: s });
+        if (!d || !d.bhOpts || d.bhOpts.proxyBase !== s.proxyBase) done(s.proxyBase);
+      }
+    });
   });
 }
 
