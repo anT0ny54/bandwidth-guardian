@@ -1,4 +1,7 @@
-import { DEFAULTS } from "./defaults.js";
+import "./shared.js";
+
+const BH = globalThis.__bhShared;
+const { DEFAULTS } = BH;
 
 const $ = id => document.getElementById(id);
 
@@ -27,24 +30,16 @@ let currentIsWeb = false;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-function parseDomains(text) {
-  return String(text || "")
-    .split(/[,\s]+/)
-    .map(s => s.trim().toLowerCase()).filter(Boolean)
-    .map(s => s.replace(/^https?:\/\//, "").split("/")[0].replace(/\.$/, ""));
-}
+const parseDomains = BH.parseDomainList;
 
 function findExcludedDomain(host, domains) {
   return domains.find(domain => host === domain || host.endsWith(`.${domain}`)) || "";
 }
 
-function nearestPreset(q) {
-  return PRESETS.reduce((best, v) =>
-    Math.abs(v - q) < Math.abs(best - q) ? v : best, PRESETS[0]);
-}
-
+// Exact match only, like the options page: a custom quality (e.g. 55)
+// highlights no preset instead of pretending to be the nearest one.
 function setActivePreset(q) {
-  const match = nearestPreset(q);
+  const match = PRESETS.includes(Number(q)) ? Number(q) : null;
   presetBtns.forEach(b => b.classList.toggle("active", Number(b.dataset.q) === match));
 }
 
@@ -62,12 +57,14 @@ function applyUI(d) {
 }
 
 function updateEnabledUI(enabled) {
+  const hasProxy = !!BH.parseProxyBase(state.proxyBase);
   // Only the compression-settings card dims — the enable toggle itself is in a
   // separate card above and stays fully interactive at all times.
   ctrlCard.classList.toggle("card-dim", !enabled);
   headerSub.textContent = enabled ? "Active" : "Disabled";
-  statusState.classList.toggle("active", enabled);
-  statusText.textContent = enabled ? "Compression active" : "Compression disabled";
+  statusState.classList.toggle("active", enabled && hasProxy);
+  statusText.textContent = !enabled ? "Compression disabled"
+    : hasProxy ? "Compression active" : "No proxy URL set (open Settings)";
 }
 
 // ── Load ──────────────────────────────────────────────────────────────────────
@@ -83,8 +80,11 @@ load();
 
 enabledEl.addEventListener("change", async () => {
   const enabled = enabledEl.checked;
-  await chrome.storage.sync.set({ enabled });
+  state = await BH.saveSettings({ enabled });
   updateEnabledUI(enabled);
+  // Turning on starts proxying new images immediately, but images already on
+  // the page (and turning off) only change after a reload.
+  showNudge();
 });
 
 // ── Grayscale ─────────────────────────────────────────────────────────────────
@@ -92,7 +92,7 @@ enabledEl.addEventListener("change", async () => {
 // on the page can't change without a reload.
 
 grayscaleEl.addEventListener("change", async () => {
-  await chrome.storage.sync.set({ grayscale: grayscaleEl.checked });
+  state = await BH.saveSettings({ grayscale: grayscaleEl.checked });
   showNudge();
 });
 
@@ -101,7 +101,9 @@ grayscaleEl.addEventListener("change", async () => {
 presetBtns.forEach(btn => {
   btn.addEventListener("click", async () => {
     const quality = Number(btn.dataset.q);
-    await chrome.storage.sync.set({ quality });
+    // Writes sync AND the local mirror before the reload, so the reloaded
+    // page cannot read the previous quality from a not-yet-updated mirror.
+    state = await BH.saveSettings({ quality });
     // Single highlight path — the storage.onChanged listener re-renders too,
     // so the old manual class toggles ran the same work twice.
     setActivePreset(quality);
@@ -175,7 +177,7 @@ excludeBtn.addEventListener("click", async () => {
   const excludedDomain = findExcludedDomain(currentHost, Array.from(list));
   if (excludedDomain) list.delete(excludedDomain);
   else list.add(currentHost);
-  await chrome.storage.sync.set({ excludeDomains: Array.from(list).join(" ") });
+  state = await BH.saveSettings({ excludeDomains: Array.from(list).join(" ") });
   showNudge(); // page must reload for the change to take effect
 });
 

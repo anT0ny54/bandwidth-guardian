@@ -1,4 +1,7 @@
-import { DEFAULTS } from "./defaults.js";
+import "./shared.js";
+
+const BH = globalThis.__bhShared;
+const { DEFAULTS, MAX_WIDTH_LIMIT } = BH;
 
 const $ = id => document.getElementById(id);
 
@@ -28,6 +31,10 @@ const WIDTH_PRESETS   = [768, 1024, 0];
 // custom input is cleared (previously this wrongly restored DEFAULTS).
 let savedQuality = DEFAULTS.quality;
 let savedWidth   = DEFAULTS.maxWidth;
+// Fields edited here but not saved yet. Changes made elsewhere (popup
+// "Exclude this site", another options tab) update every field that is NOT
+// dirty, so Save never writes a stale value back over them.
+const dirty = new Set();
 
 if (versionEl) {
   versionEl.textContent = `v${chrome.runtime.getManifest().version}`;
@@ -45,11 +52,12 @@ function showToast(msg, type = "") {
 
 // ── Formatting ────────────────────────────────────────────────────────────────
 
+// Binary (1024-based) sizes, labelled as such.
 function fmtBytes(n) {
   n = Number(n) || 0;
-  if (n >= 1 << 30) return (n / (1 << 30)).toFixed(2) + " GB";
-  if (n >= 1 << 20) return (n / (1 << 20)).toFixed(2) + " MB";
-  if (n >= 1 << 10) return (n / (1 << 10)).toFixed(2) + " KB";
+  if (n >= 1 << 30) return (n / (1 << 30)).toFixed(2) + " GiB";
+  if (n >= 1 << 20) return (n / (1 << 20)).toFixed(2) + " MiB";
+  if (n >= 1 << 10) return (n / (1 << 10)).toFixed(2) + " KiB";
   return n + " B";
 }
 
@@ -128,6 +136,7 @@ async function load() {
   savedWidth   = d.maxWidth ?? DEFAULTS.maxWidth;
   setQualityUI(savedQuality);
   setWidthUI(savedWidth);
+  dirty.clear();
 
   renderStats(s.stats);
 }
@@ -143,6 +152,15 @@ function renderStats(st) {
 // Keep the counters live while this page is open (the service worker flushes in batches).
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area === "local" && changes.stats) renderStats(changes.stats.newValue);
+  if (area !== "sync") return;
+  const val = k => changes[k].newValue ?? DEFAULTS[k];
+  if ("enabled" in changes)   enabledEl.checked   = !!val("enabled");
+  if ("grayscale" in changes) grayscaleEl.checked = !!val("grayscale");
+  if ("saveData" in changes)  saveDataEl.checked  = !!val("saveData");
+  if ("proxyBase" in changes && !dirty.has("proxyBase")) proxyBaseEl.value = val("proxyBase") || "";
+  if ("excludeDomains" in changes && !dirty.has("excludeDomains")) excludeEl.value = val("excludeDomains") || "";
+  if ("quality" in changes && !dirty.has("quality")) { savedQuality = val("quality"); setQualityUI(savedQuality); }
+  if ("maxWidth" in changes && !dirty.has("maxWidth")) { savedWidth = val("maxWidth"); setWidthUI(savedWidth); }
 });
 
 // ── Quality preset buttons ────────────────────────────────────────────────────
@@ -152,11 +170,13 @@ qualityPresets.forEach(btn => {
     qualityPresets.forEach(b => b.classList.remove("active"));
     btn.classList.add("active");
     customQualityEl.value = ""; // preset takes priority; clear custom
+    dirty.add("quality");
   });
 });
 
 // Custom quality input — deselects all presets when user types a value.
 customQualityEl.addEventListener("input", () => {
+  dirty.add("quality");
   const v = parseInt(customQualityEl.value, 10);
   if (!isNaN(v) && v >= 1 && v <= 100) {
     qualityPresets.forEach(b => b.classList.remove("active"));
@@ -173,10 +193,12 @@ widthPresets.forEach(btn => {
     widthPresets.forEach(b => b.classList.remove("active"));
     btn.classList.add("active");
     customWidthEl.value = "";
+    dirty.add("maxWidth");
   });
 });
 
 customWidthEl.addEventListener("input", () => {
+  dirty.add("maxWidth");
   const v = parseInt(customWidthEl.value, 10);
   if (!isNaN(v) && v >= 0) {
     widthPresets.forEach(b => b.classList.remove("active"));
@@ -189,17 +211,17 @@ customWidthEl.addEventListener("input", () => {
 // These two feel like instant switches; everything else uses the Save button.
 
 enabledEl.addEventListener("change", async () => {
-  await chrome.storage.sync.set({ enabled: !!enabledEl.checked });
+  await BH.saveSettings({ enabled: !!enabledEl.checked });
   showToast(enabledEl.checked ? "Compression enabled" : "Compression disabled", "ok");
 });
 
 grayscaleEl.addEventListener("change", async () => {
-  await chrome.storage.sync.set({ grayscale: !!grayscaleEl.checked });
+  await BH.saveSettings({ grayscale: !!grayscaleEl.checked });
   showToast("Reload the page to apply", "warn");
 });
 
 saveDataEl.addEventListener("change", async () => {
-  await chrome.storage.sync.set({ saveData: !!saveDataEl.checked });
+  await BH.saveSettings({ saveData: !!saveDataEl.checked });
   showToast(saveDataEl.checked ? "Save-Data header enabled" : "Save-Data header disabled", "ok");
 });
 
@@ -213,18 +235,15 @@ async function save() {
     showToast("Quality must be 1–100", "err");
     return;
   }
-  if (cw !== "" && !/^\d+$/.test(cw)) {
-    showToast("Width must be 0 or a positive number", "err");
+  if (cw !== "" && !(/^\d+$/.test(cw) && +cw <= MAX_WIDTH_LIMIT)) {
+    showToast(`Width must be 0–${MAX_WIDTH_LIMIT}`, "err");
     return;
   }
   const proxyBase = (proxyBaseEl.value || "").trim();
-  // Fully parse the URL — a scheme-prefix check let values like "https://not a url"
-  // through, which every downstream consumer then choked on (empty derived proxy
-  // host, never-matching already-proxied guard, broken image URLs).
-  try {
-    const parsedProxy = new URL(proxyBase);
-    if (parsedProxy.protocol !== "http:" && parsedProxy.protocol !== "https:") throw new Error("bad protocol");
-  } catch {
+  // Empty = image proxying off (quality, exclusions and Save-Data can still
+  // be saved). Otherwise fully parse the URL — a scheme-prefix check let
+  // values like "https://not a url" through.
+  if (proxyBase && !BH.parseProxyBase(proxyBase)) {
     proxyBaseEl.classList.add("invalid");
     showToast("Proxy URL must be a valid http:// or https:// URL", "err");
     proxyBaseEl.focus();
@@ -235,12 +254,14 @@ async function save() {
   const excludeDomains = (excludeEl.value || "").trim();
   const current = await chrome.storage.sync.get(DEFAULTS);
 
-  await chrome.storage.sync.set({
+  // Writes sync and the local mirror together, before any reload below.
+  await BH.saveSettings({
     proxyBase,
     quality,
     maxWidth,
     excludeDomains,
   });
+  dirty.clear();
 
   // Reload whenever a URL-shaping setting changed — including excluded
   // domains, whose effect is only visible after a reload restores the page's
@@ -257,25 +278,42 @@ async function save() {
   savedWidth   = maxWidth;
   setQualityUI(quality);
   setWidthUI(maxWidth);
-  showToast("Saved", "ok");
+  showToast(proxyBase ? "Saved" : "Saved — image proxying is off (no proxy URL)", proxyBase ? "ok" : "warn");
+}
+
+async function fetchWithTimeout(url, ms) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), ms);
+  try { return await fetch(url, { signal: ctrl.signal, cache: "no-store" }); }
+  finally { clearTimeout(timer); }
+}
+
+// bhp2 serves /api/health next to /api/index; "health" resolved against the
+// proxy URL finds it for both /api/index and /.netlify/functions/index.
+async function readHealth(base) {
+  try {
+    const res = await fetchWithTimeout(new URL("health", base).href, 8000);
+    if (!res.ok) return null;
+    const data = await res.json();
+    return data && data.service === "bandwidth-hero-proxy" ? data : null;
+  } catch { return null; }
 }
 
 async function testProxy() {
   const url = (proxyBaseEl.value || "").trim();
-  try {
-    const parsedTest = new URL(url);
-    if (parsedTest.protocol !== "http:" && parsedTest.protocol !== "https:") throw new Error("bad protocol");
-  } catch { showToast("Enter a valid proxy URL first", "err"); return; }
+  if (!BH.parseProxyBase(url)) { showToast("Enter a valid proxy URL first", "err"); return; }
   const orig = testProxyBtn.textContent;
   testProxyBtn.textContent = "Testing…"; testProxyBtn.disabled = true;
   try {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 8000);
-    const res = await fetch(url, { signal: ctrl.signal });
-    clearTimeout(timer);
+    const res = await fetchWithTimeout(url, 8000);
     const body = await res.text();
-    if (res.ok && body.trim() === "bandwidth-hero-proxy") showToast("Proxy is working ✓", "ok");
-    else if (res.ok) showToast(`Proxy responded (${res.status})`, "warn");
+    if (res.ok && body.trim() === "bandwidth-hero-proxy") {
+      const health = await readHealth(url);
+      if (!health) showToast("Proxy is working ✓ (no /health endpoint)", "ok");
+      else if (health.sharp && health.sharp.available === false) showToast(`Proxy v${health.version}: image engine (Sharp) unavailable`, "err");
+      else showToast(`Proxy is working ✓ v${health.version} · API ${health.api}`, "ok");
+    }
+    else if (res.ok) showToast(`Proxy responded (${res.status}) but is not a Bandwidth Hero proxy`, "warn");
     else showToast(`Proxy returned HTTP ${res.status}`, "err");
   } catch (e) {
     showToast(e?.name === "AbortError" ? "Timed out — proxy not reachable" : "Connection failed — check URL and CORS", "err");
@@ -285,12 +323,13 @@ async function testProxy() {
 }
 
 testProxyBtn.addEventListener("click", testProxy);
-proxyBaseEl.addEventListener("input", () => proxyBaseEl.classList.remove("invalid"));
+proxyBaseEl.addEventListener("input", () => { proxyBaseEl.classList.remove("invalid"); dirty.add("proxyBase"); });
+excludeEl.addEventListener("input", () => dirty.add("excludeDomains"));
 
 // ── Reset ─────────────────────────────────────────────────────────────────────
 
 async function resetAll() {
-  await chrome.storage.sync.set(DEFAULTS);
+  await BH.saveSettings(DEFAULTS);
   await load();
   // Resetting clears the proxy URL; without a reload the current page keeps
   // serving proxied images from the old proxy until manually refreshed.
