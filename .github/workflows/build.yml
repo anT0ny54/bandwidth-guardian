@@ -64,9 +64,13 @@ jobs:
           VERSION="$(python3 -c 'import json; print(json.load(open("manifest.json"))["version"])')"
           ZIP="dist/bandwidth-guardian-${VERSION}.zip"
 
+          # A published release is immutable: its tag points at the commit it
+          # was built from. Replacing the asset (--clobber) used to pair an old
+          # tag with a zip built from newer code. Bump manifest.json "version"
+          # to publish again.
           if gh release view "v${VERSION}" >/dev/null 2>&1; then
-            echo "Release v${VERSION} exists; replacing release asset."
-            gh release upload "v${VERSION}" "$ZIP" --clobber
+            echo "::warning::Release v${VERSION} already exists; not modifying it. Bump manifest.json version to publish a new release."
+            exit 0
           else
             echo "Creating v${VERSION} release."
             gh release create "v${VERSION}" "$ZIP" \
