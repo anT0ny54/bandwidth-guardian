@@ -1,5 +1,3 @@
-import "./shared.js";
-
 const BH = globalThis.__bhShared;
 const { DEFAULTS } = BH;
 
