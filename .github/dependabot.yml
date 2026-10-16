@@ -1,0 +1,8 @@
+version: 2
+updates:
+  # Keeps actions/checkout, upload-artifact and download-artifact current
+  # (same policy as bhp2).
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
