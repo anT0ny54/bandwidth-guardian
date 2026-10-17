@@ -27,7 +27,7 @@ let currentTabId = null;
 // (prehook/content/worker) — "example.com:8080" would never match a hostname.
 function parseDomains(text) {
   return String(text || "")
-    .split(/[,\s]+/)
+    .split(/[ ,\s]+/)
     .map(s => s.trim().toLowerCase()).filter(Boolean)
     .map(s => s.replace(/^https?:\/\//, "").split("/")[0].replace(/:\d+$/, "").replace(/\.$/, ""));
 }
@@ -124,9 +124,9 @@ load();
 
 enabledEl.addEventListener("change", async () => {
   const enabled = enabledEl.checked;
-  try { await chrome.storage.sync.set({ enabled }); }
-  catch { enabledEl.checked = !enabled; reportStorageError(); return; } // switch must not show an unsaved value
   state.enabled = enabled;
+  try { await chrome.storage.sync.set({ enabled }); }
+  catch { reportStorageError(); return; }
   updateEnabledUI(enabled);
   showNudge(); // same "reload to apply" pattern as every other setting
 });
@@ -134,10 +134,9 @@ enabledEl.addEventListener("change", async () => {
 // ── Grayscale ─────────────────────────────────────────────────────────────────
 
 grayscaleEl.addEventListener("change", async () => {
-  const grayscale = grayscaleEl.checked;
-  try { await chrome.storage.sync.set({ grayscale }); }
-  catch { grayscaleEl.checked = !grayscale; reportStorageError(); return; }
-  state.grayscale = grayscale;
+  state.grayscale = grayscaleEl.checked;
+  try { await chrome.storage.sync.set({ grayscale: grayscaleEl.checked }); }
+  catch { reportStorageError(); return; }
   showNudge();
 });
 
@@ -147,9 +146,9 @@ presetBtns.forEach(btn => {
   btn.addEventListener("click", async () => {
     const quality = Number(btn.dataset.q);
     if (quality === Number(state.quality)) return; // unchanged: nothing to apply
+    state.quality = quality;
     try { await chrome.storage.sync.set({ quality }); }
     catch { reportStorageError(); return; }
-    state.quality = quality; // only after a successful write: a failed click stays retryable
     setActivePreset(quality);
     showNudge(); // unified pattern: no unconditional auto-reload
   });
@@ -215,7 +214,8 @@ excludeBtn.addEventListener("click", async () => {
   try { d = await chrome.storage.sync.get(DEFAULTS); }
   catch { reportStorageError(); return; }
   const raw  = String(d.excludeDomains || "");
-  const excludedDomain = findExcludedDomain(currentHost, parseDomains(raw));
+  const list = new Set(parseDomains(raw));
+  const excludedDomain = findExcludedDomain(currentHost, Array.from(list));
   let next;
   if (excludedDomain) {
     // B21: remove only the matching token, preserving the user's separators
@@ -224,6 +224,7 @@ excludeBtn.addEventListener("click", async () => {
       .filter(tok => /[,\s]/.test(tok) || parseDomains(tok)[0] !== excludedDomain)
       .join("");
   } else {
+    list.add(currentHost);
     next = raw.trim() ? raw.replace(/[\s,]*$/, "") + "\n" + currentHost : currentHost;
   }
   state.excludeDomains = next;
@@ -253,7 +254,5 @@ chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== "sync") return;
   for (const [k, v] of Object.entries(changes)) state[k] = v.newValue ?? DEFAULTS[k];
   applyUI(state);
-  // The site card depends only on the exclusion list; enabled/proxyBase are
-  // already rendered by applyUI() above.
-  if ("excludeDomains" in changes) loadSiteUI(state);
+  if ("excludeDomains" in changes || "enabled" in changes || "proxyBase" in changes) loadSiteUI(state);
 });

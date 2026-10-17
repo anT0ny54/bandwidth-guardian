@@ -17,13 +17,10 @@
 //   loader promotes them to a real src/srcset URL.
 //
 // Layer 2 — THIS FILE (document_start, isolated world, async after storage)
-//   Backstop for what prehook's setters cannot see:
+//   Catches what prehook cannot:
 //   A) HTML-parser-created <img>/<source> nodes — the C++ parser bypasses JS
-//      setters. prehook's MutationObserver (processParserImage) normally gets
-//      there first; this pass catches anything it missed, and skips elements
-//      prehook already pointed at the proxy.
-//   B) Inline CSS background-image via el.style.backgroundImage (prehook has
-//      no equivalent, so this layer is the only DOM handler for it).
+//      setters; rewriting cancels the in-flight original request.
+//   B) Inline CSS background-image via el.style.backgroundImage.
 //   Parser-created <link rel=preload as=image> hrefs are handled by prehook's
 //   MutationObserver (registered first), so no preload handling is needed here.
 //
@@ -60,8 +57,8 @@
   // prehook.js runs in the page MAIN world and cannot use extension APIs.
   // O7: publish ONLY the fields prehook needs, on a per-load random event name
   // (falling back to the default name when prehook could not expose one).
-  // quality/maxWidth go out PRE-CLAMPED (updateProxyConfig always runs first
-  // and is the single source of truth, so proxyConfig is never null here); `failed` is omitted entirely when unchanged so a
+  // quality/maxWidth go out PRE-CLAMPED (updateProxyConfig is the single
+  // source of truth); `failed` is omitted entirely when unchanged so a
   // settings publish can never stomp retry entries prehook collected itself.
   let lastFailedSig = "";
   function publishPrehookSettings(next) {
@@ -69,9 +66,11 @@
     const payload = {
       enabled: next?.enabled !== false,
       proxyBase: typeof next?.proxyBase === "string" ? next.proxyBase : "",
-      quality: proxyConfig.quality,
+      quality: proxyConfig
+        ? proxyConfig.quality
+        : Math.max(1, Math.min(100, Number(next?.quality ?? DEFAULTS.quality))),
       grayscale: !!next?.grayscale,
-      maxWidth: proxyConfig.maxWidth,
+      maxWidth: proxyConfig ? proxyConfig.maxWidth : Math.max(0, Number(next?.maxWidth) || 0),
       excludeDomains: typeof next?.excludeDomains === "string" ? next.excludeDomains : "",
       redirect: runtime.redirect !== false,
       suspended: !!runtime.suspended
@@ -174,17 +173,10 @@
     return false;
   }
 
-  // KEEP IN SYNC with normQuality in prehook.js / service-worker.js (pinned by a
-  // test): clamp to 1–100, missing or non-numeric falls back to the default.
-  function normQuality(v) {
-    const n = v == null || v === "" ? NaN : Number(v);
-    return Number.isFinite(n) ? Math.max(1, Math.min(100, n)) : DEFAULTS.quality;
-  }
-
   function updateProxyConfig(next) {
     opts = next;
     const base = String(opts.proxyBase || "").trim();
-    const quality = normQuality(opts.quality);
+    const quality = Math.max(1, Math.min(100, Number(opts.quality ?? DEFAULTS.quality)));
     const maxWidth = Number(opts.maxWidth) || 0;
     proxyConfig = { base, sep: base.includes("?") ? "&" : "?", quality,
       maxWidth: maxWidth > 0 ? maxWidth : 0, grayscale: !!opts.grayscale };

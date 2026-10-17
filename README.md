@@ -63,18 +63,12 @@ once and before Chrome starts it.
      `&max_width=` would be truncated by the raw contract, so the network rule
      skips them and the DOM layer proxies them URL-encoded instead.
 2. **DOM layer, `prehook.js` (MAIN world, `document_start`) and `content.js`.**
-   `prehook.js` patches `<img>.src`/`srcset`/`loading`, `<source>.srcset`,
-   image-preload `<link>.href` and `setAttribute`, and observes the document and
-   every open, closed and declarative shadow root (including parser-created
-   `<img>`/`<source>`/preload nodes, which bypass JavaScript setters).
-   `content.js` is a backstop for parser-created `<img>`/`<source>` nodes and
-   the only DOM handler for inline `style="background-image:…"`. Video
-   posters, SVG `<image>`, `<object>`/`<embed>` and all stylesheet images are
-   covered by the network layer alone. When the network rule is live the DOM
-   layer only handles conflict URLs and hands everything else to the network
-   layer untouched (so nothing is wrapped twice). If the network rule could not
-   be installed, it falls back to rewriting every eligible URL itself (the
-   pre-0.1.9 behaviour).
+   Patches `src`/`srcset`/`href`/`poster`/`setAttribute` and observes the
+   document and every open, closed and declarative shadow root. When the
+   network rule is live it only handles conflict URLs, and hands everything else
+   to the network layer untouched (so nothing is wrapped twice). If the network
+   rule could not be installed, it falls back to rewriting every eligible URL
+   itself (the pre-0.1.9 behaviour).
 
    While compression is active, the DOM layer also forces
    `loading="lazy"` onto any `<img>` that has no `loading` attribute
@@ -92,23 +86,15 @@ once and before Chrome starts it.
   when the URL was not found anywhere accessible). The bypass list is also
   given to new documents in that tab, so a reload does not try the proxy again.
   Bypass rules are removed when the tab closes.
-- If the proxy itself is unreachable or unhealthy (6 failures within 30 s —
-  connection-level errors, or `503`/`429`/`52x` responses; a successful proxy
-  response resets the count), the redirect is suspended for 2 minutes and pages
-  load images directly; it then resumes automatically. Per-image failures
-  (e.g. a `404` for one URL) fall back for that image only and never trip the
-  breaker.
+- If the proxy itself is unreachable (6 connection-level failures within 30 s),
+  the redirect is suspended for 2 minutes and pages load images directly; it
+  then resumes automatically.
 - Usage statistics are counted only from successful proxy responses of the
   strict image types above; failed and fallback requests are never counted.
 
-`service-worker.js` also injects `Save-Data: on` (independent of the proxy) and
-strips CSP **only while a valid proxy is configured** (only on documents whose
-CSP references `img-src`/`default-src`). Excluded domains always keep their own
-CSP.
-
-The rule refresh is resilient to storage hiccups: if `chrome.storage.sync`
-cannot be read, the currently installed rules are kept and the refresh lock is
-released, so the next settings change still takes effect.
+`service-worker.js` also injects `Save-Data: on` and strips CSP **only while a
+valid proxy is configured** (only on documents whose CSP references
+`img-src`/`default-src`). Excluded domains always keep their own CSP.
 
 ## Settings
 
@@ -116,18 +102,14 @@ released, so the next settings change still takes effect.
 |---|---|---|
 | `enabled` | `true` | Master switch for image compression |
 | `saveData` | `true` | Send `Save-Data: on` on requests (applies even when compression is off) |
-| `proxyBase` | `""` | Your proxy URL (`http://` or `https://`); empty = no proxy configured (nothing is compressed). A `#fragment` is stripped on save |
-| `quality` | `60` | 1–100. Out-of-range values are clamped; a missing or non-numeric value falls back to `60` (all layers share the same rule) |
+| `proxyBase` | `""` | Your proxy URL; empty = no proxy configured (nothing is compressed) |
+| `quality` | `60` | 1–100 |
 | `grayscale` | `true` | Server-side grayscale (`bw=1`) |
 | `maxWidth` | `768` | `0` = no limit |
-| `excludeDomains` | `""` | Comma/space/newline separated; subdomains match; schemes, ports and paths are ignored (all layers normalise the list identically) |
+| `excludeDomains` | `""` | Comma/space/newline separated; subdomains match |
 
 Settings changed on one surface (popup vs. options page) stay in sync on the
-other. The options page reloads the tab that opened it after a save; the popup
-and the options toggles show a "reload to apply" hint instead, because pages
-that are already loaded keep the images they have. If a setting cannot be
-saved (storage error), its switch snaps back to the stored value rather than
-showing something that was not persisted.
+other. The options page reloads the tab that opened it after a save.
 
 ## Interception coverage and tests
 
@@ -164,20 +146,8 @@ npm i --no-save playwright-core
 npx playwright-core install chromium          # or use an existing Chrome/Chromium
 git clone https://github.com/anT0ny54/bhp2 ../bhp2   # optional: real URL parser
 CHROME_PATH="$(node -e "console.log(require('playwright-core').chromium.executablePath())")" \
-BHP2_DIR=../bhp2 node --test --test-concurrency=1 \
-  tests/interception-simulation.test.cjs tests/browser/interception.browser.test.cjs
+BHP2_DIR=../bhp2 node --test --test-concurrency=1 tests/
 ```
-
-Pass the test files explicitly: `node --test tests/` (a bare directory) only
-works on Node 20 and fails on Node 21+. The real-Chrome suite skips itself when
-`playwright-core` or `CHROME_PATH` is missing. The simulation suite also pins
-the duplicated regexes (`TRACKING_RE`, `SKIP_URL_RE`, `CONFLICT_RE`) across
-`prehook.js`, `content.js` and `service-worker.js`, and unit-tests the service
-worker's pure helpers (raw redirect target, excluded-domain parsing, stats
-normalisation, webRequest listener re-registration, the shared `normQuality()`
-rule, refresh-lock release on a failed storage read). It also checks that the
-`DEFAULTS` copy inlined in `content.js` (a classic script that cannot import)
-still equals `defaults.js`.
 
 ### Known limits
 
@@ -194,16 +164,6 @@ still equals `defaults.js`.
 - Fallback can't re-request images inside closed declarative shadow roots or
   `new Image()` objects not attached to the document; a reload loads them
   directly because the bypass rule is already installed.
-- A per-tab bypass rule cannot be created for an original URL that contains a
-  literal `|` (DNR `urlFilter` has no escape for it). If the proxy fails for
-  such a URL, the direct retry is redirected to the proxy again and the image
-  stays broken (it is never retried in a loop). Add the host to the excluded
-  domains if this affects a site.
-- The `Save-Data: on` rule does not list `main_frame` in its `resourceTypes`;
-  Chrome's DNR default for such a rule excludes top-level navigations, so the
-  header is expected on sub-resource and sub-frame requests (this has not been
-  verified in a browser — treat it as a known gap until the browser suite
-  covers it).
 - Browser-internal pages, the Web Store and other extensions' pages are never
   touched by Chrome.
 
@@ -220,18 +180,13 @@ counters.
 ```
 
 The build stages the shipped files, syntax-checks the JavaScript, validates the
-manifest (MV3, and every file it references is in the package), normalizes
-file modes and timestamps, and writes a reproducible
-`bandwidth-guardian-<version>.zip` (same sources → same SHA-256, regardless of
-the builder's umask). It needs `bash`, `python3`, `node`, `zip` and GNU
-`touch`/`sha256sum` (Linux; on macOS use a GNU toolchain).
+manifest (MV3, Chrome-only), normalizes file modes, and writes a reproducible
+`bandwidth-guardian-<version>.zip`.
 
 Releasing is handled by `.github/workflows/build.yml`. Every push to `main`
-runs the tests, then builds the extension; the release job only runs when both
-succeed, so a failing test blocks the release. If a release for the manifest
-version does not exist, the workflow creates it; if that release already
-exists, it replaces the release asset. Bump `manifest.json`'s version (and add
-a `CHANGELOG.md` entry) when publishing a distinct release.
+builds the extension. If a release for the manifest version does not exist, the
+workflow creates it; if that release already exists, it replaces the release
+asset. Bump `manifest.json`'s version when publishing a distinct release.
 
 ## 🔗 Related projects (not part of this repository)
 

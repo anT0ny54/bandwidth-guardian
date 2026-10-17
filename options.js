@@ -22,7 +22,6 @@ const customWidthEl  = $("customWidth");
 const qualityPresets = Array.from(document.querySelectorAll("#qualityPresets .preset"));
 const widthPresets   = Array.from(document.querySelectorAll("#widthPresets  .preset"));
 
-const ZERO_STATS      = { filesProcessed: 0, bytesProcessed: 0, bytesSaved: 0 };
 const QUALITY_PRESETS = [45, 60, 80];
 const WIDTH_PRESETS   = [768, 1024, 0];
 const WIDTH_MAX       = 16384; // mirrors the customWidth input's max attribute
@@ -148,7 +147,7 @@ async function load() {
   try {
     [d, s] = await Promise.all([
       chrome.storage.sync.get(DEFAULTS),
-      chrome.storage.local.get({ stats: ZERO_STATS })
+      chrome.storage.local.get({ stats: { filesProcessed: 0, bytesProcessed: 0, bytesSaved: 0 } })
     ]);
   } catch { showToast("Could not load settings", "err"); return; }
   enabledEl.checked    = !!d.enabled;
@@ -261,20 +260,19 @@ window.addEventListener("beforeunload", e => {
 
 enabledEl.addEventListener("change", async () => {
   try { await chrome.storage.sync.set({ enabled: !!enabledEl.checked }); }
-  catch { enabledEl.checked = !enabledEl.checked; showToast("Save failed", "err"); return; }
-  // Already-loaded pages keep their images until reloaded (same hint as grayscale).
-  showToast(enabledEl.checked ? "Compression enabled — reload the page to apply" : "Compression disabled — reload the page to apply", "warn");
+  catch { showToast("Save failed", "err"); return; }
+  showToast(enabledEl.checked ? "Compression enabled" : "Compression disabled", "ok");
 });
 
 grayscaleEl.addEventListener("change", async () => {
   try { await chrome.storage.sync.set({ grayscale: !!grayscaleEl.checked }); }
-  catch { grayscaleEl.checked = !grayscaleEl.checked; showToast("Save failed", "err"); return; }
+  catch { showToast("Save failed", "err"); return; }
   showToast("Reload the page to apply", "warn");
 });
 
 saveDataEl.addEventListener("change", async () => {
   try { await chrome.storage.sync.set({ saveData: !!saveDataEl.checked }); }
-  catch { saveDataEl.checked = !saveDataEl.checked; showToast("Save failed", "err"); return; }
+  catch { showToast("Save failed", "err"); return; }
   showToast(saveDataEl.checked ? "Save-Data header enabled" : "Save-Data header disabled", "ok");
 });
 
@@ -291,9 +289,7 @@ async function save() {
     showToast(`Width must be 0–${WIDTH_MAX}`, "err");
     return;
   }
-  // A "#fragment" would swallow the query the DOM layers append after the base
-  // (the service worker already strips it), so never store one.
-  const proxyBase = (proxyBaseEl.value || "").trim().replace(/#.*$/, "");
+  const proxyBase = (proxyBaseEl.value || "").trim();
   // B3: an empty proxyBase is allowed — it means "proxying disabled". Validate
   // only when a value was entered, so quality/width/exclusions are savable
   // without a proxy and the proxy can actually be cleared.
@@ -327,7 +323,6 @@ async function save() {
 
   savedQuality = quality;
   savedWidth   = maxWidth;
-  proxyBaseEl.value = proxyBase; // show what was actually stored
   setQualityUI(quality);
   setWidthUI(maxWidth);
   for (const k in dirty) dirty[k] = false;
@@ -391,7 +386,7 @@ async function resetStats() {
   if (!confirm("Clear all saved-bandwidth statistics?")) return;
   // Only touch the stats: load() would also overwrite unsaved form edits.
   try {
-    await chrome.storage.local.set({ stats: { ...ZERO_STATS } });
+    await chrome.storage.local.set({ stats: { filesProcessed: 0, bytesProcessed: 0, bytesSaved: 0 } });
   } catch { showToast("Clear failed", "err"); return; }
   renderStats(null);
   showToast("Stats cleared");

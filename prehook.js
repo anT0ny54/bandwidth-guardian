@@ -40,6 +40,7 @@
   const pending = new Set();
   function queuePending(el) {
     if (el) pending.add(el);
+    return true;
   }
 
   const fallbackHandlers = new WeakSet();
@@ -120,17 +121,10 @@
     }, { capture: true, once: true });
   }
 
-  // KEEP IN SYNC with normQuality in content.js / service-worker.js (pinned by a
-  // test): clamp to 1–100, missing or non-numeric falls back to the default.
-  function normQuality(v) {
-    const n = v == null || v === "" ? NaN : Number(v);
-    return Number.isFinite(n) ? Math.max(1, Math.min(100, n)) : 60;
-  }
-
   function updateProxyConfig(next) {
     opts = next;
     const base = String(opts.proxyBase || "").trim();
-    const quality = normQuality(opts.quality);
+    const quality = Math.max(1, Math.min(100, Number(opts.quality ?? 60)));
     const maxWidth = Number(opts.maxWidth) || 0;
     proxyConfig = { base, sep: base.includes("?") ? "&" : "?", quality,
       maxWidth: maxWidth > 0 ? maxWidth : 0, grayscale: !!opts.grayscale };
@@ -777,26 +771,29 @@
   // them — now bypassing the proxy.
   function retryRules(container, base, has, seen) {
     let rules;
-    try { rules = container.cssRules; } catch { return; } // cross-origin
+    try { rules = container.cssRules; } catch { return false; } // cross-origin
+    let hit = false;
     for (let i = rules.length - 1; i >= 0; i--) {
       const r = rules[i];
       try {
         if (r.styleSheet) { // @import
-          if (!seen.has(r.styleSheet)) { seen.add(r.styleSheet); retryRules(r.styleSheet, r.styleSheet.href || base, has, seen); }
+          if (!seen.has(r.styleSheet)) { seen.add(r.styleSheet); hit = retryRules(r.styleSheet, r.styleSheet.href || base, has, seen) || hit; }
           continue;
         }
         const text = r.cssText;
         if (!text || text.indexOf("url(") < 0) continue;
         if (r.constructor && r.constructor.name !== "CSSStyleRule" && r.cssRules) {
-          retryRules(r, base, has, seen);
+          hit = retryRules(r, base, has, seen) || hit;
           continue;
         }
         if (cssUrls(text, base).some(has)) {
           container.deleteRule(i);
           container.insertRule(text, i);
+          hit = true;
         }
       } catch {}
     }
+    return hit;
   }
 
   function retryFailed(items) {
@@ -815,6 +812,7 @@
     const has = abs => { if (!abs || !originals.has(abs)) return false; matched.add(abs); return true; };
     const hasRel = (v, base) => { const r = v ? safeURL(v, base || document.baseURI) : null; if (!r) return false; r.hash = ""; return has(r.href); };
     const reset = (el, name) => { const v = el.getAttribute(name); if (v !== null) setAttr.call(el, name, v); };
+    let found = 0;
     const crossOrigin = [];
 
     for (const root of collectRoots()) {
@@ -840,18 +838,19 @@
             markFailed(el);
             if (ss !== null) setAttr.call(el, "srcset", ss);
             if (src !== null) setAttr.call(el, "src", src);
+            found++;
           } else if (tag === "video") {
-            if (hasRel(el.getAttribute("poster"), el.baseURI) && !el.hasAttribute(FAILED_ATTR)) { markFailed(el); reset(el, "poster"); }
+            if (hasRel(el.getAttribute("poster"), el.baseURI) && !el.hasAttribute(FAILED_ATTR)) { markFailed(el); reset(el, "poster"); found++; }
           } else if (tag === "image" && el.namespaceURI === "http://www.w3.org/2000/svg") {
             if (el.hasAttribute(FAILED_ATTR)) continue;
             const XLINK = "http://www.w3.org/1999/xlink";
             const href = el.getAttribute("href");
             const xhref = el.getAttributeNS(XLINK, "href");
-            if (href && hasRel(href, el.baseURI)) { markFailed(el); setAttr.call(el, "href", href); }
-            else if (xhref && hasRel(xhref, el.baseURI)) { markFailed(el); el.setAttributeNS(XLINK, "xlink:href", xhref); }
+            if (href && hasRel(href, el.baseURI)) { markFailed(el); setAttr.call(el, "href", href); found++; }
+            else if (xhref && hasRel(xhref, el.baseURI)) { markFailed(el); el.setAttributeNS(XLINK, "xlink:href", xhref); found++; }
           } else if (tag === "object" || tag === "embed" || tag === "input") {
             const name = tag === "object" ? "data" : "src";
-            if (hasRel(el.getAttribute(name), el.baseURI) && !el.hasAttribute(FAILED_ATTR)) { markFailed(el); reset(el, name); }
+            if (hasRel(el.getAttribute(name), el.baseURI) && !el.hasAttribute(FAILED_ATTR)) { markFailed(el); reset(el, name); found++; }
           }
           // Inline styles (any element, including the ones above).
           const style = el.getAttribute("style");
@@ -865,6 +864,7 @@
               // insignificant trailing whitespace to force fresh image values.
               if (next === style) next = /\s$/.test(style) ? style.replace(/\s+$/, "") : style + " ";
               setAttr.call(el, "style", next); // re-parse → fresh request
+              found++;
             }
           }
         } catch {}
@@ -879,7 +879,7 @@
         let readable = true;
         try { void sh.cssRules; } catch { readable = false; }
         if (!readable) { crossOrigin.push(sh); continue; }
-        retryRules(sh, sh.href || document.baseURI, has, seen);
+        if (retryRules(sh, sh.href || document.baseURI, has, seen)) found++;
       }
     }
 
