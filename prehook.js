@@ -31,10 +31,8 @@
   const pageHost = location.hostname.toLowerCase();
   let pageExcluded = false;
 
-  // Keep every element waiting for settings. A hard queue cap lets later
-  // parser-created images fall through with their original URL (and setter-
-  // queued images can remain blank forever). The queue is temporary: settings
-  // normally arrive quickly, and the watchdog releases it after five seconds.
+  // Elements waiting for settings. The queue is temporary: settings normally
+  // arrive quickly, and the watchdog releases it after five seconds.
   const pending = new Set();
   function queuePending(el) {
     if (el) pending.add(el);
