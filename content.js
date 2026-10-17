@@ -1,6 +1,6 @@
 // Bandwidth Guardian — content script (document_start, isolated world)
 //
-// ══ ARCHITECTURE ════════════════════════════════════════════════════════════
+// ══ ARCHITECTURE ══════════════════════════════════════════════════════════════
 //
 // Layer 0 — service-worker.js declarativeNetRequest redirect
 //   Proxies EVERY image request (any element, any stylesheet, any shadow
@@ -26,7 +26,7 @@
 //
 // The old DNR regexSubstitution redirect was removed because DNR cannot
 // encodeURIComponent the captured URL; content scripts can.
-// ══════════════════════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════════════════════
 
 (function () {
   "use strict";
@@ -122,7 +122,7 @@
   let pageExcluded = false;
   let srcsetCache = new WeakMap();
 
-  // ── Helpers ────────────────────────────────────────────────────────────
+  // ── Helpers ────────────────────────────────────────────────────────────────
   const safeURL = (u, base = document.baseURI) => { try { return new URL(u, base); } catch { return null; } };
   const resolveHttp = u => {
     const r = safeURL(u);
@@ -322,7 +322,7 @@
     el.addEventListener("load", () => fallbackMeta.delete(el), { capture: true, once: true });
   }
 
-  // ── A) Parser-created <img src> / <source srcset> ──────────────────────
+  // ── A) Parser-created <img src> / <source srcset> ──────────────────────────
   function rewriteImg(el) {
     if (!el || doneImg.has(el) || failedEls.has(el)) return;
     if (!active) return; // R6: single active gate (shouldSkip checks it too)
@@ -363,7 +363,7 @@
     if (rewrote) doneImg.add(el);
   }
 
-  // ── B) Inline background-image ──────────────────────────────────────
+  // ── B) Inline background-image ──────────────────────────────────────────────
   function rewriteBg(el) {
     if (!el || doneBg.has(el) || failedEls.has(el)) return;
     if (!active) return;
@@ -514,7 +514,7 @@
     } catch {}
   }
 
-  // ── Settings load ──────────────────────────────────────────────────────
+  // ── Settings load ──────────────────────────────────────────────────────────
   // Fast path: bhOpts mirror in storage.local (~5 ms). Cold path: storage.sync,
   // then write the mirror — the service worker is the mirror's sole writer in
   // steady state (B4); this is the only content-script write, on the cold path.
