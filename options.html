@@ -549,14 +549,13 @@
         <div class="row">
           <label class="field-label" for="proxyBase">Proxy URL</label>
           <div class="proxy-row">
-            <input id="proxyBase" class="input" type="text" inputmode="url" placeholder="https://your-proxy.example.com/api/index" autocomplete="url" spellcheck="false" autocorrect="off" autocapitalize="off">
+            <input id="proxyBase" class="input" type="text" inputmode="url" placeholder="https://your-proxy.example.com" autocomplete="url" spellcheck="false" autocorrect="off" autocapitalize="off">
             <button id="testProxy" class="btn test" type="button">Test</button>
           </div>
           <div class="hint">
             Need a proxy? →
             <a href="https://github.com/anT0ny54/bhp2" target="_blank" rel="noopener">bandwidth-hero-proxy2</a><br>
-            Expects <code>?url=…&amp;quality=…&amp;bw=1&amp;jpeg=0</code><br>
-            Leave empty to turn image proxying off (Save-Data still works).
+            Expects <code>?url=…&amp;quality=…&amp;bw=1&amp;jpeg=0</code>
           </div>
         </div>
       </div>
@@ -610,8 +609,8 @@
               <div class="hint">Overrides the quality preset when a valid value is entered.</div>
             </div>
             <div class="advanced-item">
-              <div class="advanced-label">Custom max width (px, 0 = no limit, max 8192)</div>
-              <input id="customWidth" class="input" type="number" min="0" max="8192" step="10" placeholder="e.g. 1440" inputmode="numeric">
+              <div class="advanced-label">Custom max width (px, 0 = no limit)</div>
+              <input id="customWidth" class="input" type="number" min="0" step="10" placeholder="e.g. 1440" inputmode="numeric">
               <div class="hint">Overrides the width preset when a valid value is entered.</div>
             </div>
           </div>
@@ -637,7 +636,6 @@
 
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
 
-  <script src="shared.js"></script>
-  <script src="options.js"></script>
+  <script type="module" src="options.js"></script>
 </body>
 </html>
