@@ -9,9 +9,6 @@ on:
 permissions:
   contents: write
 
-env:
-  NODE_VERSION: 20
-
 jobs:
   test:
     name: Interception tests
@@ -24,7 +21,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: ${{ env.NODE_VERSION }}
+          node-version: 20
 
       - name: Checkout proxy (URL parser used by the mock proxy)
         uses: actions/checkout@v4
@@ -41,7 +38,7 @@ jobs:
         run: |
           export CHROME_PATH="$(node -e "console.log(require('playwright-core').chromium.executablePath())")"
           export BHP2_DIR="$GITHUB_WORKSPACE/bhp2"
-          node --test --test-concurrency=5 tests/
+          node --test --test-concurrency=1 tests/
 
   build:
     name: Build extension
@@ -51,11 +48,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
 
       - name: Read manifest version
         id: version
@@ -82,16 +74,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-
       - name: Read manifest version
         id: version
         shell: bash
         run: echo "version=$(python3 -c 'import json; print(json.load(open("manifest.json"))["version"])')" >> "$GITHUB_OUTPUT"
 
+      # Reuse the zip the build job already produced (the build is
+      # reproducible) instead of building a second time.
       - name: Download build artifact
         uses: actions/download-artifact@v4
         with:
