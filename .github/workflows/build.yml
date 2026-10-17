@@ -38,7 +38,7 @@ jobs:
         run: |
           export CHROME_PATH="$(node -e "console.log(require('playwright-core').chromium.executablePath())")"
           export BHP2_DIR="$GITHUB_WORKSPACE/bhp2"
-          node --test --test-concurrency=1 tests/interception-simulation.test.cjs tests/browser/interception.browser.test.cjs
+          node --test --test-concurrency=10 tests/interception-simulation.test.cjs tests/browser/interception.browser.test.cjs
 
   build:
     name: Build extension
