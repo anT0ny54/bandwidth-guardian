@@ -2,9 +2,16 @@
 //
 // ══ ARCHITECTURE ══════════════════════════════════════════════════════════════
 //
+// Layer 0 — service-worker.js declarativeNetRequest redirect
+//   Proxies EVERY image request (any element, any stylesheet, any shadow
+//   root) inside the network stack before the original host is contacted.
+//   The DOM layers below therefore only rewrite URLs that redirect exempts
+//   (CONFLICT_RE) — or everything, if the redirect rule is not installed —
+//   so one image is never proxied by two layers.
+//
 // Layer 1 — prehook.js (document_start, page MAIN world)
-//   Patches image URL setters before the HTML parser runs, so JS-assigned image
-//   URLs (including lazy-loader assignments) are proxied before a request fires.
+//   Patches image URL setters before the HTML parser runs, so JS-assigned
+//   DOM-layer URLs are proxied before a request fires; owns the fallback retry.
 //   Lazy data-* values are not rewritten in advance: they can contain templates
 //   (for example, lazysizes {width}) and are only meaningful when the page's
 //   loader promotes them to a real src/srcset URL.
@@ -35,25 +42,33 @@
   };
   // KEEP IN SYNC with prehook.js.
   const DEFAULT_SETTINGS_EVENT = "bh-settings-update";
+  // Written by the service worker: is the network redirect live, and is the
+  // circuit breaker open? Missing (fresh install) = assume the redirect is live.
+  let runtime = { redirect: true, suspended: false };
+  // Originals whose proxy request already failed in this tab (from the worker).
+  let failedUrls = new Set();
+  const stripHash = u => { try { const r = new URL(u); r.hash = ""; return r.href; } catch { return u; } };
+  const settingsEventName = () => (document.documentElement && document.documentElement.dataset &&
+    document.documentElement.dataset.bhSettingsEvent) || DEFAULT_SETTINGS_EVENT;
+  function sendToPrehook(payload) {
+    try { document.dispatchEvent(new CustomEvent(settingsEventName(), { detail: JSON.stringify(payload) })); } catch {}
+  }
 
   // prehook.js runs in the page MAIN world and cannot use extension APIs.
   // O7: publish ONLY the fields prehook needs, on a per-load random event name
   // (falling back to the default name when prehook could not expose one).
   function publishPrehookSettings(next) {
-    try {
-      const name = (document.documentElement && document.documentElement.dataset &&
-        document.documentElement.dataset.bhSettingsEvent) || DEFAULT_SETTINGS_EVENT;
-      document.dispatchEvent(new CustomEvent(name, {
-        detail: JSON.stringify({
-          enabled: next?.enabled !== false,
-          proxyBase: typeof next?.proxyBase === "string" ? next.proxyBase : "",
-          quality: next?.quality,
-          grayscale: !!next?.grayscale,
-          maxWidth: next?.maxWidth,
-          excludeDomains: typeof next?.excludeDomains === "string" ? next.excludeDomains : ""
-        })
-      }));
-    } catch {}
+    sendToPrehook({
+      enabled: next?.enabled !== false,
+      proxyBase: typeof next?.proxyBase === "string" ? next.proxyBase : "",
+      quality: next?.quality,
+      grayscale: !!next?.grayscale,
+      maxWidth: next?.maxWidth,
+      excludeDomains: typeof next?.excludeDomains === "string" ? next.excludeDomains : "",
+      redirect: runtime.redirect !== false,
+      suspended: !!runtime.suspended,
+      failed: Array.from(failedUrls)
+    });
   }
 
   // Anchored tracking-pixel patterns (B13). KEEP IN SYNC with prehook.js.
@@ -61,6 +76,9 @@
 
   // Favicons, .ico and .svg are never proxied.
   const SKIP_URL_RE = /favicon|\.(?:ico|svg)(?:[?#]|$)/i;
+  // URLs the raw-URL network redirect cannot carry. KEEP IN SYNC with prehook.js
+  // and CONFLICT_PATTERN in service-worker.js.
+  const CONFLICT_RE = /&(?:quality|l|bw|jpeg|max_width)=/;
 
   // Known lazy-loader attributes. These are signals only: their values are
   // never changed or proxied directly. The loader's eventual src/srcset write
@@ -135,6 +153,10 @@
     if (!u) return true;
     if (SKIP_URL_RE.test(absolute) || TRACKING_RE.test(absolute)) return true;
     if (u.origin === proxyOrigin) return true; // already proxied
+    if (failedUrls.size && failedUrls.has(stripHash(absolute))) return true; // proxy failed before
+    // The network redirect owns every non-conflict URL; rewriting it here too
+    // would proxy the same image twice.
+    if (runtime.redirect !== false && !CONFLICT_RE.test(absolute)) return true;
     if (excludedHost(u.hostname)) return true;
     return false;
   }
@@ -158,7 +180,7 @@
     proxyUrlCache.clear();
     excludedDomains = domainSet(opts.excludeDomains);
     pageExcluded = excludedHost(pageHost);
-    active = !!opts.enabled && !!proxyConfig.base && !pageExcluded;
+    active = !!opts.enabled && !!proxyConfig.base && !pageExcluded && !runtime.suspended;
     if (destroyed) return;
     if (active) {
       ensureObserver();
@@ -341,7 +363,7 @@
 
   // ── B) Inline background-image ──────────────────────────────────────────────
   function rewriteBg(el) {
-    if (!el || doneBg.has(el)) return;
+    if (!el || doneBg.has(el) || failedEls.has(el)) return;
     if (!active) return;
     const bg = el.style.backgroundImage;
     if (!bg) return;
@@ -492,8 +514,21 @@
   // Fast path: bhOpts mirror in storage.local (~5 ms). Cold path: storage.sync,
   // then write the mirror — the service worker is the mirror's sole writer in
   // steady state (B4); this is the only content-script write, on the cold path.
-  chrome.storage.local.get({ bhOpts: null }, d => {
+  // The known-failed list is fetched in parallel with settings (bounded wait),
+  // so the first publish already carries it.
+  const failedListReady = new Promise(resolve => {
+    const timer = setTimeout(resolve, 400);
+    try {
+      chrome.runtime.sendMessage({ type: "bh-failed-list" }, res => {
+        void chrome.runtime.lastError;
+        if (res && Array.isArray(res.urls)) failedUrls = new Set(res.urls.filter(u => typeof u === "string"));
+        clearTimeout(timer); resolve();
+      });
+    } catch { clearTimeout(timer); resolve(); }
+  });
+  chrome.storage.local.get({ bhOpts: null, bhRuntime: null }, d => failedListReady.then(() => {
     if (destroyed) return;
+    if (d.bhRuntime && typeof d.bhRuntime === "object") runtime = d.bhRuntime;
     if (d.bhOpts) {
       applyOpts(d.bhOpts);
     } else {
@@ -503,13 +538,14 @@
         try { chrome.storage.local.set({ bhOpts: synced }); } catch {}
       });
     }
-  });
+  }));
 
   chrome.storage.onChanged.addListener((changes, area) => {
     if (destroyed) return;
-    if (area === "local" && changes.bhOpts) {
-      const next = changes.bhOpts.newValue || DEFAULTS;
-      if (!sameOpts(next, opts)) applyOpts(next);
+    if (area === "local" && (changes.bhOpts || changes.bhRuntime)) {
+      if (changes.bhRuntime) runtime = changes.bhRuntime.newValue || { redirect: true, suspended: false };
+      const next = changes.bhOpts ? (changes.bhOpts.newValue || DEFAULTS) : opts;
+      if (next && (changes.bhRuntime || !sameOpts(next, opts))) applyOpts(next);
     } else if (area === "sync") {
       // B4: apply in memory only — no mirror write (the worker owns it).
       if (!opts) {
@@ -523,6 +559,20 @@
       if (!sameOpts(next, opts)) applyOpts(next);
     }
   });
+
+  // Fallback relay: the service worker reports proxy failures (after it has
+  // installed a per-tab bypass rule) and prehook — which can reach closed
+  // shadow roots — re-requests the affected elements once.
+  try {
+    chrome.runtime.onMessage.addListener(msg => {
+      if (destroyed || !msg || msg.type !== "bh-retry" || !Array.isArray(msg.items)) return;
+      const items = msg.items
+        .filter(it => it && typeof it.original === "string")
+        .map(it => ({ original: it.original, proxyUrl: typeof it.proxyUrl === "string" ? it.proxyUrl : "" }));
+      for (const it of items) failedUrls.add(stripHash(it.original));
+      if (items.length) sendToPrehook({ kind: "retry", items });
+    });
+  } catch {}
 
   window.addEventListener("pagehide", e => {
     if (e.persisted) return;

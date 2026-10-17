@@ -29,29 +29,66 @@ statistics:
 | JPEG XL | `image/jxl` |
 
 Usage statistics are counted only for proxy responses whose actual
-`Content-Type` is one of the above. Favicons, `.ico`, `.svg`, and known
-tracking-pixel URLs are never proxied by the URL rewriters.
+`Content-Type` is one of the above. Favicons, `.ico`, `.svg`, known
+tracking-pixel URLs, excluded domains and private-network hosts are never
+proxied.
 
 ## How it works
 
-- **prehook.js** (`document_start`, page MAIN world): patches
-  `HTMLImageElement.src/srcset/loading`, `HTMLSourceElement.srcset`,
-  `HTMLLinkElement.href` and `Element.prototype.setAttribute` before page
-  scripts run, so JS-assigned image URLs (including every lazy loader's
-  `img.src = dataset.src`) are proxied before any network request fires. A
-  child-list observer also catches parser-created `<img>`/`<source>` elements
-  and holds their URL attributes until settings are available, which reduces
-  the initial direct-request race but cannot undo DNS work that already began.
-- **content.js** (isolated world): catches HTML-parser-created `<img>`/`<source>`
-  nodes and inline CSS `background-image`. When idle (extension disabled, no
-  proxy configured, or an excluded page) its MutationObserver disconnects and
-  it does no per-mutation work.
-- **service-worker.js**: keeps the fast `storage.local` settings mirror, counts
-  stats from the proxy's `x-bh-*` response headers (only for the strict image
-  types above), injects `Save-Data: on` via DNR, and strips CSP **only while a
-  valid proxy is configured** (and only on documents whose CSP references
-  `img-src`/`default-src`, where the browser supports the header condition).
-  Excluded domains always keep their own CSP.
+Interception happens in two layers, so an image request is rewritten exactly
+once and before Chrome starts it.
+
+1. **Network layer (primary), `service-worker.js`.** A declarativeNetRequest
+   `redirect` rule (`regexFilter ^https?://.+`, resource type `image`, plus
+   `object` requests whose URL ends in an image extension) rewrites every image
+   request to
+   `<proxy>?jpeg=0&bw=N&quality=N[&max_width=N]&url=<original, unencoded>`
+   inside the browser's network stack, **before any connection or DNS lookup to
+   the original host**. It covers every way a page can ask for an image:
+   `<img>`, `srcset`/`<picture>`, preload links, lazy loaders, all CSS
+   (inline, same-origin, cross-origin, `@import`, pseudo-elements,
+   `image-set()`), shadow roots, SVG `<image>`, video posters, `new Image()`.
+   The raw `url=` form relies on the bandwidth-hero-proxy2 contract: an
+   unencoded `url` starting with `http` is taken verbatim up to the first
+   `&quality=`, `&l=`, `&bw=`, `&jpeg=` or `&max_width=`.
+   - **No duplicate proxying:** an allow rule with higher priority matches the
+     proxy origin itself, so a proxied URL is never redirected again.
+   - **Exemptions** (higher priority than the redirect): excluded domains
+     (both as request host and page/initiator), favicons, `.ico`/`.svg`,
+     known tracking pixels, `data:`/`blob:` (never matched), localhost,
+     `*.local`, single-label intranet hosts and private/link-local IP
+     literals (a public proxy cannot reach them; bandwidth-hero-proxy2 answers
+     403 for them).
+   - **Conflict URLs:** URLs containing `&quality=`, `&l=`, `&bw=`, `&jpeg=` or
+     `&max_width=` would be truncated by the raw contract, so the network rule
+     skips them and the DOM layer proxies them URL-encoded instead.
+2. **DOM layer, `prehook.js` (MAIN world, `document_start`) and `content.js`.**
+   Patches `src`/`srcset`/`href`/`poster`/`setAttribute` and observes the
+   document and every open, closed and declarative shadow root. When the
+   network rule is live it only handles conflict URLs, and hands everything else
+   to the network layer untouched (so nothing is wrapped twice). If the network
+   rule could not be installed, it falls back to rewriting every eligible URL
+   itself (the pre-0.1.9 behaviour).
+
+### Fallback, loops and the circuit breaker
+
+- A proxied request that fails (HTTP error, wrong type, network error) is
+  reported by `webRequest`; the original URL gets a **per-tab session bypass
+  rule** and the page is asked to re-request that one URL **directly, once**
+  (`<img>`, `<picture>`, poster, SVG `<image>`, `<object>/<embed>`, inline
+  styles, same-origin CSS rules; cross-origin `<link>` sheets are reloaded once
+  when the URL was not found anywhere accessible). The bypass list is also
+  given to new documents in that tab, so a reload does not try the proxy again.
+  Bypass rules are removed when the tab closes.
+- If the proxy itself is unreachable (6 connection-level failures within 30 s),
+  the redirect is suspended for 2 minutes and pages load images directly; it
+  then resumes automatically.
+- Usage statistics are counted only from successful proxy responses of the
+  strict image types above; failed and fallback requests are never counted.
+
+`service-worker.js` also injects `Save-Data: on` and strips CSP **only while a
+valid proxy is configured** (only on documents whose CSP references
+`img-src`/`default-src`). Excluded domains always keep their own CSP.
 
 ## Settings
 
@@ -70,33 +107,59 @@ other. The options page reloads the tab that opened it after a save.
 
 ## Interception coverage and tests
 
-The interceptor covers JavaScript `img.src`/`img.srcset` writes, `setAttribute`
-updates, parser-created `<img>` and `<source>` nodes, `<picture>` responsive
-sources, image preload links, and **inline** CSS `background-image` URLs. The
-prehook now queues every element while settings are loading rather than
-silently dropping elements after a 1,000-item cap. This matters on long feeds
-and image-heavy pages.
+| Image mechanism | How it is covered | Browser test |
+|---|---|---|
+| `<img src>`, JS-assigned, `setAttribute`, `innerHTML`, URL changes, mutation bursts | Network redirect; DOM layer for conflict URLs | 2,500-image burst, URL changes |
+| `srcset`, `sizes`, `<picture>`, `<source>` | Network redirect applies to whichever candidate Chrome selects; DOM layer rewrites every candidate and keeps descriptors | viewport growth, media switching |
+| `<link rel="preload" as="image">`, `imagesrcset` | Network redirect; preload and `<img>` share one proxied request | attribute changes, de-duplication |
+| Lazy loading (`loading=lazy`, `data-src`, `data-srcset`, framework loaders) | The URL is redirected when the loader actually activates it | nothing requested early |
+| Inline, same-origin, cross-origin and `@import` stylesheet backgrounds, multiple backgrounds, `image-set()`, `@media` | Network redirect (no CSSOM access needed, so cross-origin sheets are covered) | each case |
+| CSS pseudo-elements `::before`/`::after` | Network redirect | computed-style + request check |
+| Open, closed and declarative shadow roots | Network redirect; `attachShadow` is wrapped so the DOM layer also observes roots | all three |
+| SVG `<image href>` / `xlink:href` | Redirected; `<use>` sprite references and `.svg` files are left alone, fragments intact | fragments preserved |
+| `<video poster>` | Redirected | poster renders |
+| `<object>`/`<embed>` image URLs | Redirected only when the URL has an image extension; documents in `<object>` untouched | |
+| `<canvas>` | Images drawn from proxied `<img>` are proxied; the proxy sends `Access-Control-Allow-Origin: *`, so `crossorigin="anonymous"` images stay untainted | |
 
-Run the regression simulation from the repository root with Node.js:
+Every browser test checks the actual URL Chrome requested (logged by a local
+mock origin and a mock proxy built from bandwidth-hero-proxy2's own URL parser),
+that the image loaded, fallback behaviour and that no request was proxied twice.
+Further tests cover a 600-image responsive, lazy, infinite-scroll page with
+viewport changes, dynamically loaded content, exclusions and private hosts,
+page CSP, enable/disable and settings changes, statistics and the circuit
+breaker.
+
+### Running the tests
 
 ```sh
+# Unit/simulation tests (no browser needed)
 node --test tests/interception-simulation.test.cjs
+
+# Real-Chrome tests
+npm i --no-save playwright-core
+npx playwright-core install chromium          # or use an existing Chrome/Chromium
+git clone https://github.com/anT0ny54/bhp2 ../bhp2   # optional: real URL parser
+CHROME_PATH="$(node -e "console.log(require('playwright-core').chromium.executablePath())")" \
+BHP2_DIR=../bhp2 node --test --test-concurrency=1 tests/
 ```
 
-The simulation checks URL encoding, `srcset` parsing, the main-world setters,
-parser-created images, preload links, and more than 2,000 queued images. The
-inline-CSS test exercises the existing content-script rewrite routine.
+### Known limits
 
-This is not proof that every web page can be intercepted. Images referenced by
-external stylesheets or CSS pseudo-elements, external SVG `<image>` elements,
-`<video poster>`, browser-internal pages, and `data:`/`blob:` resources are not
-covered by the same interception paths. Stylesheet images may begin loading
-before a content script can inspect computed styles, and MutationObserver
-callbacks are asynchronous. Use Chromium DevTools **Network** on the target
-site to confirm each intended image request actually goes to your configured
-proxy; compare requests from the proxy origin with requests to the original
-image hosts. A site-specific test can establish coverage for that site's
-current markup, but cannot certify all websites.
+- Requests Chrome does not classify as `image` are not proxied: `fetch()`/XHR
+  image downloads, images fetched by a page's own service worker (untested),
+  media Chrome loads as `media`, and `blob:`/`data:` URLs.
+- `crossorigin="use-credentials"` images fail through the proxy (credentialed
+  CORS cannot use `Access-Control-Allow-Origin: *`) and Chrome reports no
+  network error for it, so no automatic fallback occurs. Exclude such sites.
+- Same-origin images become cross-origin through the proxy; a canvas drawing
+  them without `crossorigin` becomes tainted for `getImageData()`/`toDataURL()`.
+- Conflict URLs (containing `&quality=` and similar) are proxied by the DOM
+  layer only; when referenced from stylesheets they load directly.
+- Fallback can't re-request images inside closed declarative shadow roots or
+  `new Image()` objects not attached to the document; a reload loads them
+  directly because the bypass rule is already installed.
+- Browser-internal pages, the Web Store and other extensions' pages are never
+  touched by Chrome.
 
 ## Stats
 

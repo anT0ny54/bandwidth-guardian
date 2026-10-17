@@ -1,21 +1,30 @@
 # Changelog
 
-## Unreleased
+## 0.1.9
 
 ### Fixed
 
-- Reduce the window in which parser-created image and source elements can
-  start direct requests before the extension has loaded its settings. The
-  early main-world observer holds URL attributes until settings are ready;
-  this is best-effort and is not a browser-wide DNS leak protection mechanism.
-- Remove the 1,000-element pending-queue cap. The cap could let later parser-
-  created images fetch directly, or leave setter-created images blank while
-  settings were loading. Add regression simulations for parser-created images,
-  preload links, responsive `srcset`, and 2,005 queued images.
-- Match Content Security Policy header values with the wildcard syntax
-  supported by Chrome declarative network rules.
+- The CSP rule used `name` instead of `header` in its response-header
+  condition. Chrome rejected the whole rule update with a synchronous error, so
+  **no** dynamic rule (CSP and `Save-Data`) was ever installed and the refresh
+  lock stayed held. Rule updates now catch synchronous and asynchronous errors
+  and fall back step by step.
 
-### Documentation
+### Added
 
-- Correct the release workflow description: an existing versioned release has
-  its asset replaced rather than being skipped entirely.
+- Network-level interception: a declarativeNetRequest redirect proxies every
+  image request before the browser contacts the original host, covering
+  stylesheets (including cross-origin), pseudo-elements, shadow roots, SVG
+  `<image>`, posters and lazy loaders. A higher-priority allow rule for the
+  proxy origin prevents duplicate proxying.
+- The DOM layer now only handles URLs the raw proxy contract can't carry
+  (`&quality=`, `&l=`, `&bw=`, `&jpeg=`, `&max_width=`), or everything if the
+  redirect can't be installed. Shadow roots (open, closed, declarative) are
+  observed.
+- Fallback: failed proxy responses get a per-tab bypass rule and a one-time
+  direct re-request; reloads in the same tab don't retry the proxy.
+- Circuit breaker: an unreachable proxy is suspended for 2 minutes.
+- Exemptions for localhost, `*.local`, single-label and private-IP hosts.
+- Real-Chrome test suite (`tests/browser/`, 17 tests) and extended simulation
+  tests; the CI build runs them before packaging.
+
