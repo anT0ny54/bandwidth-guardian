@@ -29,7 +29,9 @@ jobs:
             echo "release-exists=false" >> "$GITHUB_OUTPUT"
           fi
       - name: Build
-        run: ./build.sh
+        # Invoke through bash: the executable bit is not preserved by zip
+        # exports or some checkouts, which made "./build.sh" fail with 126.
+        run: bash build.sh
       - uses: actions/upload-artifact@v4
         with:
           name: bandwidth-guardian-main
