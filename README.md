@@ -68,6 +68,36 @@ tracking-pixel URLs are never proxied by the URL rewriters.
 Settings changed on one surface (popup vs. options page) stay in sync on the
 other. The options page reloads the tab that opened it after a save.
 
+## Interception coverage and tests
+
+The interceptor covers JavaScript `img.src`/`img.srcset` writes, `setAttribute`
+updates, parser-created `<img>` and `<source>` nodes, `<picture>` responsive
+sources, image preload links, and **inline** CSS `background-image` URLs. The
+prehook now queues every element while settings are loading rather than
+silently dropping elements after a 1,000-item cap. This matters on long feeds
+and image-heavy pages.
+
+Run the regression simulation from the repository root with Node.js:
+
+```sh
+node --test tests/interception-simulation.test.cjs
+```
+
+The simulation checks URL encoding, `srcset` parsing, the main-world setters,
+parser-created images, preload links, and more than 2,000 queued images. The
+inline-CSS test exercises the existing content-script rewrite routine.
+
+This is not proof that every web page can be intercepted. Images referenced by
+external stylesheets or CSS pseudo-elements, external SVG `<image>` elements,
+`<video poster>`, browser-internal pages, and `data:`/`blob:` resources are not
+covered by the same interception paths. Stylesheet images may begin loading
+before a content script can inspect computed styles, and MutationObserver
+callbacks are asynchronous. Use Chromium DevTools **Network** on the target
+site to confirm each intended image request actually goes to your configured
+proxy; compare requests from the proxy origin with requests to the original
+image hosts. A site-specific test can establish coverage for that site's
+current markup, but cannot certify all websites.
+
 ## Stats
 
 Processed images, bytes processed and bytes saved are read from the proxy's

@@ -20,12 +20,13 @@
   const pageHost = location.hostname.toLowerCase();
   let pageExcluded = false;
 
-  const pending = new Set(); // elements waiting for opts; bounded (see #7)
-  const MAX_PENDING = 1000;
+  // Keep every element waiting for settings. A hard queue cap lets later
+  // parser-created images fall through with their original URL (and setter-
+  // queued images can remain blank forever). The queue is temporary: settings
+  // normally arrive quickly, and the watchdog releases it after five seconds.
+  const pending = new Set();
   function queuePending(el) {
-    if (pending.has(el)) return true;
-    if (pending.size >= MAX_PENDING) return false;
-    pending.add(el);
+    if (el) pending.add(el);
     return true;
   }
 
@@ -160,8 +161,12 @@
 
   function flushPending() {
     if (destroyed) return;
-    for (const el of pending) {
-      pending.delete(el);
+    // Snapshot then clear so this function is safe if restoring an element
+    // triggers another setter. Every queued element is processed, including
+    // pages containing far more than 1,000 images.
+    const toFlush = Array.from(pending);
+    pending.clear();
+    for (const el of toFlush) {
       try {
         if (el instanceof HTMLLinkElement) { processPreloadLink(el); continue; }
         if (el instanceof HTMLImageElement && loadingDesc && loadingDesc.set) {
@@ -386,14 +391,14 @@
       if (!ready || !opts) {
         if (isImg) {
           const src = el.getAttribute("src");
-          if (src && el.dataset.bhPendingSrc === undefined && (pending.has(el) || pending.size < MAX_PENDING)) {
+          if (src && el.dataset.bhPendingSrc === undefined) {
             queuePending(el);
             el.dataset.bhPendingSrc = src;
             el.removeAttribute("src");
           }
         }
         const srcset = el.getAttribute("srcset");
-        if (srcset && el.dataset.bhPendingSrcset === undefined && (pending.has(el) || pending.size < MAX_PENDING)) {
+        if (srcset && el.dataset.bhPendingSrcset === undefined) {
           queuePending(el);
           el.dataset.bhPendingSrcset = srcset;
           el.removeAttribute("srcset");
