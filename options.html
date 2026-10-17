@@ -1,0 +1,643 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0b1120">
+  <title>Bandwidth Guardian — Settings</title>
+  <style>
+    :root {
+      --brand-a: #1a3e99;
+      --brand-b: #0891b2;
+      --brand-c: #16a34a;
+      --brand-grad: linear-gradient(135deg, var(--brand-a), var(--brand-b), var(--brand-c));
+
+      --bg: #0b1120;
+      --surface: #111827;
+      --surface-2: #172033;
+      --border: #263650;
+      --text: #e5edf7;
+      --muted: #8a9ab1;
+      --accent: #16a4c5;
+      --accent-soft: rgba(8,145,178,.13);
+      --ok: #22c55e;
+      --ok-soft: rgba(34,197,94,.12);
+      --warn: #f59e0b;
+      --warn-soft: rgba(245,158,11,.12);
+      --danger: #ef4444;
+      --danger-soft: rgba(239,68,68,.12);
+      --off: #3a4658;
+      --radius: 16px;
+      --control: 46px;
+      --bar-space: 82px;
+    }
+
+    @media (prefers-color-scheme: light) {
+      :root {
+        --bg: #f3f7fc;
+        --surface: #fff;
+        --surface-2: #f7f9fc;
+        --border: #d7e0ed;
+        --text: #142033;
+        --muted: #66758a;
+        --accent: #087f9a;
+        --accent-soft: rgba(8,145,178,.09);
+        --ok: #15803d;
+        --ok-soft: rgba(21,128,61,.09);
+        --warn: #b45309;
+        --warn-soft: rgba(245,158,11,.12);
+        --danger: #dc2626;
+        --danger-soft: rgba(220,38,38,.09);
+        --off: #9aa8bb;
+      }
+    }
+
+    *, *::before, *::after { box-sizing: border-box; }
+    html {
+      -webkit-text-size-adjust: 100%;
+      text-size-adjust: 100%;
+      min-height: 100%;
+      background: var(--bg);
+      color-scheme: dark light;
+      overscroll-behavior: none;
+    }
+    body {
+      margin: 0;
+      min-width: 280px;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--text);
+      font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+      padding: 14px 12px calc(var(--bar-space) + env(safe-area-inset-bottom, 0px));
+    }
+    button, input, textarea { font: inherit; }
+    button, a, input, textarea, summary { -webkit-tap-highlight-color: transparent; }
+    button, summary { touch-action: manipulation; }
+    button { color: inherit; }
+    a { color: var(--accent); }
+    a:hover { text-decoration: underline; }
+    a:focus-visible, button:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus-visible {
+      outline: 3px solid var(--accent-soft);
+      outline-offset: 2px;
+    }
+
+    .page {
+      width: 100%;
+      max-width: 680px;
+      margin: 0 auto;
+    }
+
+    .hero {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 4px 2px 14px;
+    }
+    .hero-icon {
+      width: 44px;
+      height: 44px;
+      flex: 0 0 44px;
+    }
+    .hero-copy { min-width: 0; }
+    .hero-title {
+      margin: 0;
+      font-size: 20px;
+      line-height: 1.15;
+      font-weight: 800;
+      letter-spacing: -.3px;
+      background: var(--brand-grad);
+      -webkit-background-clip: text;
+      background-clip: text;
+      -webkit-text-fill-color: transparent;
+      color: var(--accent);
+    }
+    .hero-sub {
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.4;
+    }
+
+    .section {
+      margin-top: 12px;
+    }
+    .section:first-of-type { margin-top: 0; }
+    .section-title {
+      margin: 0 4px 7px;
+      color: var(--muted);
+      font-size: 10px;
+      line-height: 1.2;
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: .09em;
+    }
+    .card {
+      overflow: hidden;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+    }
+
+    .switch-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      min-height: 66px;
+      padding: 11px 14px;
+      cursor: pointer;
+      user-select: none;
+    }
+    .switch-row + .switch-row { border-top: 1px solid var(--border); }
+    .switch-copy { min-width: 0; }
+    .switch-title { font-size: 13px; font-weight: 700; }
+    .switch-hint { margin-top: 2px; color: var(--muted); font-size: 11px; line-height: 1.4; }
+
+    .switch {
+      -webkit-appearance: none;
+      appearance: none;
+      position: relative;
+      width: 48px;
+      height: 28px;
+      flex: 0 0 48px;
+      margin: 0;
+      border: 0;
+      border-radius: 999px;
+      background: var(--off);
+      cursor: pointer;
+    }
+    .switch::after {
+      content: "";
+      position: absolute;
+      top: 3px;
+      left: 3px;
+      width: 22px;
+      height: 22px;
+      border-radius: 50%;
+      background: #fff;
+      box-shadow: 0 1px 4px rgba(0,0,0,.32);
+      transition: transform .15s ease;
+    }
+    .switch:checked { background: var(--accent); }
+    .switch:checked::after { transform: translateX(20px); }
+
+    .row { padding: 14px; }
+    .field-label {
+      display: block;
+      margin-bottom: 6px;
+      font-size: 13px;
+      font-weight: 700;
+    }
+    .hint {
+      margin-top: 7px;
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.5;
+    }
+    .hint code {
+      padding: 1px 5px;
+      border-radius: 5px;
+      background: var(--accent-soft);
+      color: var(--accent);
+      font-size: 10px;
+    }
+
+    .presets {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 7px;
+    }
+    .preset {
+      -webkit-appearance: none;
+      appearance: none;
+      width: 100%;
+      min-height: 52px;
+      padding: 8px 6px;
+      border: 1px solid var(--border);
+      border-radius: 11px;
+      background: var(--surface-2);
+      color: var(--text);
+      cursor: pointer;
+      text-align: center;
+    }
+    .preset.active {
+      border-color: var(--accent);
+      background: var(--accent-soft);
+    }
+    .p-label { display: block; font-size: 13px; font-weight: 800; }
+    .p-hint { display: block; margin-top: 2px; color: var(--muted); font-size: 10px; line-height: 1.2; }
+    .preset.active .p-label { color: var(--accent); }
+
+    .input {
+      display: block;
+      width: 100%;
+      min-height: var(--control);
+      padding: 10px 12px;
+      border: 1px solid var(--border);
+      border-radius: 11px;
+      background: var(--surface-2);
+      color: var(--text);
+      outline: 0;
+      font-size: 16px;
+      line-height: 1.35;
+    }
+    textarea.input {
+      min-height: 96px;
+      resize: vertical;
+    }
+    .input:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px var(--accent-soft);
+    }
+    .input.invalid {
+      border-color: var(--danger);
+      box-shadow: 0 0 0 3px var(--danger-soft);
+    }
+    .proxy-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 8px;
+      align-items: stretch;
+    }
+    .proxy-row .input { width: 100%; min-width: 0; }
+    .proxy-row .btn { flex: 0 0 auto; }
+    input[type="number"] { -moz-appearance: textfield; }
+    input[type="number"]::-webkit-inner-spin-button { -webkit-appearance: none; }
+
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 8px;
+    }
+    @media (max-width: 480px) {
+      .stats { grid-template-columns: 1fr; }
+    }
+    .stat {
+      min-width: 0;
+      padding: 12px;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      background: var(--surface-2);
+    }
+    .stat-label {
+      color: var(--muted);
+      font-size: 10px;
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: .05em;
+    }
+    .stat-value {
+      margin-top: 3px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      font-size: 20px;
+      line-height: 1.15;
+      font-weight: 800;
+    }
+
+    .button-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 11px;
+    }
+    .btn {
+      -webkit-appearance: none;
+      appearance: none;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 44px;
+      min-width: 0;
+      padding: 0 14px;
+      border: 1px solid var(--border);
+      border-radius: 11px;
+      background: var(--surface-2);
+      color: var(--text);
+      cursor: pointer;
+      font-size: 12px;
+      font-weight: 700;
+      text-align: center;
+    }
+    .btn:active { opacity: .78; }
+    .btn:disabled { opacity: .42; cursor: default; }
+    .btn.primary {
+      border-color: transparent;
+      background: var(--brand-grad);
+      color: #fff;
+    }
+    .btn.full { width: 100%; }
+
+    details { margin: 0; }
+    summary {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-height: 48px;
+      padding: 0 14px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+      cursor: pointer;
+      list-style: none;
+      user-select: none;
+    }
+    summary::-webkit-details-marker { display: none; }
+    summary::before {
+      content: "";
+      width: 7px;
+      height: 7px;
+      border-right: 1.5px solid currentColor;
+      border-bottom: 1.5px solid currentColor;
+      transform: rotate(-45deg);
+    }
+    details[open] summary { border-bottom: 1px solid var(--border); }
+    details[open] summary::before { transform: rotate(45deg); }
+    .advanced-body {
+      display: grid;
+      gap: 14px;
+      padding: 14px;
+    }
+    .advanced-item + .advanced-item { border-top: 1px solid var(--border); padding-top: 14px; }
+    .advanced-label { margin-bottom: 6px; font-size: 12px; font-weight: 700; }
+
+    .source {
+      padding: 12px 14px;
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.5;
+      overflow-wrap: anywhere;
+    }
+    .source-link { display: inline-block; margin-top: 3px; }
+    .version {
+      display: inline-block;
+      margin-top: 7px;
+      padding: 3px 7px;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      background: var(--surface-2);
+      color: var(--text);
+      font-size: 10px;
+      font-weight: 800;
+    }
+
+    .action-bar {
+      position: fixed;
+      z-index: 20;
+      right: 0;
+      bottom: 0;
+      left: 0;
+      padding: 8px 12px calc(8px + env(safe-area-inset-bottom, 0px));
+      border-top: 1px solid var(--border);
+      background: var(--surface);
+    }
+    .action-inner {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      gap: 8px;
+      width: 100%;
+      max-width: 680px;
+      margin: 0 auto;
+    }
+    .action-inner .btn { width: 100%; }
+
+    .toast {
+      position: fixed;
+      z-index: 30;
+      right: 12px;
+      bottom: calc(76px + env(safe-area-inset-bottom, 0px));
+      left: 12px;
+      max-width: 520px;
+      margin: 0 auto;
+      padding: 10px 13px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: var(--surface);
+      color: var(--text);
+      box-shadow: 0 8px 28px rgba(0,0,0,.2);
+      text-align: center;
+      font-size: 12px;
+      font-weight: 700;
+      opacity: 0;
+      pointer-events: none;
+      transform: translateY(7px);
+      transition: opacity .15s ease, transform .15s ease;
+    }
+    .toast.show { opacity: 1; transform: translateY(0); }
+    .toast.ok { border-color: rgba(34,197,94,.35); background: var(--ok-soft); color: var(--ok); }
+    .toast.err { border-color: rgba(239,68,68,.35); background: var(--danger-soft); color: var(--danger); }
+    .toast.warn { border-color: rgba(245,158,11,.35); background: var(--warn-soft); color: var(--warn); }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .001ms !important; }
+    }
+
+    @media (min-width: 560px) {
+      body { padding-right: 18px; padding-left: 18px; }
+      .page { max-width: 720px; }
+      .action-inner { max-width: 720px; }
+      .toast { max-width: 560px; }
+    }
+
+    @media (max-width: 359px) {
+      body { padding-right: 8px; padding-left: 8px; }
+      .presets { grid-template-columns: 1fr; }
+      .preset { min-height: 46px; text-align: left; padding: 8px 12px; }
+      .p-label, .p-hint { display: inline; }
+      .p-hint { margin-left: 5px; }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <header class="hero">
+      <svg class="hero-icon" viewBox="0 0 44 44" fill="none" aria-hidden="true">
+        <defs>
+          <linearGradient id="logoGradient" x1="2" y1="2" x2="42" y2="42" gradientUnits="userSpaceOnUse">
+            <stop offset="0" stop-color="#1a3e99"/>
+            <stop offset=".52" stop-color="#0891b2"/>
+            <stop offset="1" stop-color="#22c55e"/>
+          </linearGradient>
+        </defs>
+        <path d="M22 3 40 9.5v12.8c0 9.7-7.8 16.5-18 18.7C12 38.8 4 32 4 22.3V9.5L22 3Z" fill="url(#logoGradient)"/>
+        <path d="m9 32 7.1-12 4.5 6.3L27 14l8 18" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" opacity=".92"/>
+        <path d="m12 29 10-5 9 3" stroke="#fff" stroke-width="1.7" stroke-linecap="round" opacity=".84"/>
+        <circle cx="12" cy="29" r="2.2" fill="#fff" opacity=".94"/>
+        <circle cx="22" cy="24" r="2.2" fill="#fff" opacity=".94"/>
+        <circle cx="31" cy="27" r="2.2" fill="#fff" opacity=".94"/>
+      </svg>
+      <div class="hero-copy">
+        <h1 class="hero-title">Bandwidth Guardian</h1>
+        <div class="hero-sub">Mobile-first image compression settings</div>
+      </div>
+    </header>
+
+    <section class="section">
+      <h2 class="section-title">Compression</h2>
+      <div class="card">
+        <label class="switch-row" for="enabled">
+          <span class="switch-copy">
+            <span class="switch-title">Enable compression</span>
+            <span class="switch-hint">Route images through the proxy</span>
+          </span>
+          <input type="checkbox" id="enabled" class="switch">
+        </label>
+        <label class="switch-row" for="grayscale">
+          <span class="switch-copy">
+            <span class="switch-title">Grayscale</span>
+            <span class="switch-hint">Convert images to B&amp;W to reduce data</span>
+          </span>
+          <input type="checkbox" id="grayscale" class="switch">
+        </label>
+        <label class="switch-row" for="saveData">
+          <span class="switch-copy">
+            <span class="switch-title">Save-Data request header</span>
+            <span class="switch-hint">Send <code>Save-Data: on</code> to compatible websites</span>
+          </span>
+          <input type="checkbox" id="saveData" class="switch">
+        </label>
+      </div>
+    </section>
+
+    <section class="section">
+      <h2 class="section-title">Quality</h2>
+      <div class="card">
+        <div class="row">
+          <div class="presets" id="qualityPresets">
+            <button class="preset" data-q="45" type="button">
+              <span class="p-label">Small</span>
+              <span class="p-hint">Most saving</span>
+            </button>
+            <button class="preset" data-q="60" type="button">
+              <span class="p-label">Normal</span>
+              <span class="p-hint">Balanced</span>
+            </button>
+            <button class="preset" data-q="80" type="button">
+              <span class="p-label">Sharp</span>
+              <span class="p-hint">More detail</span>
+            </button>
+          </div>
+          <div class="hint">Reload the current page after changing quality.</div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <h2 class="section-title">Maximum image width</h2>
+      <div class="card">
+        <div class="row">
+          <div class="presets" id="widthPresets">
+            <button class="preset" data-w="768" type="button">
+              <span class="p-label">HD</span>
+              <span class="p-hint">768 px</span>
+            </button>
+            <button class="preset" data-w="1024" type="button">
+              <span class="p-label">Full HD</span>
+              <span class="p-hint">1024 px</span>
+            </button>
+            <button class="preset" data-w="0" type="button">
+              <span class="p-label">No limit</span>
+              <span class="p-hint">Original size</span>
+            </button>
+          </div>
+          <div class="hint">Larger images are resized before compression.</div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <h2 class="section-title">Image proxy</h2>
+      <div class="card">
+        <div class="row">
+          <label class="field-label" for="proxyBase">Proxy URL</label>
+          <div class="proxy-row">
+            <input id="proxyBase" class="input" type="text" inputmode="url" placeholder="https://your-proxy.example.com" autocomplete="url" spellcheck="false" autocorrect="off" autocapitalize="off">
+            <button id="testProxy" class="btn test" type="button">Test</button>
+          </div>
+          <div class="hint">
+            Need a proxy? →
+            <a href="https://github.com/anT0ny54/bhp2" target="_blank" rel="noopener">bandwidth-hero-proxy2</a><br>
+            Expects <code>?url=…&amp;quality=…&amp;bw=1&amp;jpeg=0</code>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <h2 class="section-title">Excluded sites</h2>
+      <div class="card">
+        <div class="row">
+          <label class="field-label" for="excludeDomains">Skip these domains</label>
+          <textarea id="excludeDomains" class="input" rows="3" placeholder="google.com, gstatic.com, example.com"></textarea>
+          <div class="hint">Space or comma separated. Matching sites bypass the proxy.</div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <h2 class="section-title">Usage</h2>
+      <div class="card">
+        <div class="row">
+          <div class="stats">
+            <div class="stat">
+              <div class="stat-label">Images</div>
+              <div class="stat-value" id="statImages">0</div>
+            </div>
+            <div class="stat">
+              <div class="stat-label">Proxy bytes</div>
+              <div class="stat-value" id="statBytes">0 B</div>
+            </div>
+            <div class="stat">
+              <div class="stat-label">Data saved</div>
+              <div class="stat-value" id="statSaved">0 B</div>
+            </div>
+          </div>
+          <div class="hint">Counts bytes received from your configured image proxy for processed images.</div>
+          <div class="button-row">
+            <button id="resetStats" class="btn" type="button">Reset stats</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="card">
+        <details>
+          <summary>Advanced settings</summary>
+          <div class="advanced-body">
+            <div class="advanced-item">
+              <div class="advanced-label">Custom quality (1–100)</div>
+              <input id="customQuality" class="input" type="number" min="1" max="100" step="1" placeholder="e.g. 55" inputmode="numeric">
+              <div class="hint">Overrides the quality preset when a valid value is entered.</div>
+            </div>
+            <div class="advanced-item">
+              <div class="advanced-label">Custom max width (px, 0 = no limit)</div>
+              <input id="customWidth" class="input" type="number" min="0" step="10" placeholder="e.g. 1440" inputmode="numeric">
+              <div class="hint">Overrides the width preset when a valid value is entered.</div>
+            </div>
+          </div>
+        </details>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="card source">
+        <div>Source</div>
+        <a class="source-link" href="https://github.com/anT0ny54/bandwidth-guardian" target="_blank" rel="noopener noreferrer">github.com/anT0ny54/bandwidth-guardian</a>
+        <div id="extensionVersion" class="version">v—</div>
+      </div>
+    </section>
+  </main>
+
+  <div class="action-bar">
+    <div class="action-inner">
+      <button id="resetAll" class="btn" type="button">Reset defaults</button>
+      <button id="save" class="btn primary" type="button">Save changes</button>
+    </div>
+  </div>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+  <script type="module" src="options.js"></script>
+</body>
+</html>
