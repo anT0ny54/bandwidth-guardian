@@ -15,11 +15,10 @@ The extension is intentionally **proxy-agnostic**: it does not require a built-i
 - No JavaScript objects or `chrome.*` APIs are shared across execution worlds.
 - Supports normal images, `srcset`, `<picture>` sources, lazy-loading attributes, image preloads, inline background images, and dynamically inserted elements.
 - Automatic per-image fallback to the original URL when a proxy request fails.
-- DNS-leak protection: non-proxied image requests are blocked at the network layer (Declarative Net Request) before any connection or DNS lookup to origin image hosts can occur.
 - Configurable quality, grayscale, maximum width, and excluded domains.
 - Local settings mirror for fast content-script startup.
 - Usage statistics collected from proxy response headers by the service worker.
-- CSP response-header handling and `Save-Data: on` request-header injection through Declarative Net Request.
+- CSP response-header handling through Declarative Net Request.
 - Reproducible deterministic build.
 
 ## Important extension architecture fix
@@ -77,21 +76,6 @@ A batched `MutationObserver` handles dynamic changes without continuously scanni
 
 When a proxied image fails, Guardian restores the original URL. The failure is marked with `data-bh-failed` so the isolated and MAIN-world handlers can coordinate without sharing JavaScript objects.
 
-### DNS-leak protection
-
-Chromium's speculative preload scanner starts fetching parser-discovered `<img src>` URLs during HTML parsing — before any `document_start` script or MutationObserver microtask can rewrite them. Rewriting the URL cancels the in-flight download, but the DNS query to the origin image host has already been sent, leaking the hostname to the local resolver (visible on dnsleaktest.com when the browser is supposed to resolve everything through your VPN/proxy).
-
-Guardian closes this gap with Declarative Net Request image-guard rules that are evaluated before the network stack:
-
-- image responses from the configured proxy are **allowed**;
-- favicon and `.ico` requests are **allowed** (tab and site icons keep working);
-- excluded domains and their subdomains are **allowed**; and
-- every other direct image request is **blocked**, so the browser never opens a connection or sends a DNS query to an origin image host.
-
-The rules are installed only while compression is enabled and a proxy is configured, and are removed when either is unset.
-
-Note: stylesheet-defined CSS `background-image` URLs cannot be rewritten in MV3, so on non-excluded sites those requests are blocked rather than leaked. Inline `style="background-image: …"` images are proxied normally. If a site loses its background images, add it to the excluded domains. This also protects the browser only — a system-level VPN DNS leak is outside the extension's reach.
-
 ### Requests that are intentionally skipped
 
 Guardian does not proxy URLs that are not appropriate image candidates, including:
@@ -99,7 +83,7 @@ Guardian does not proxy URLs that are not appropriate image candidates, includin
 - already-proxied URLs
 - configured excluded domains and their subdomains
 - favicons
-- `.ico` resources
+- `.ico` and `.svg` resources
 - known advertising/tracking/pixel URL patterns
 - invalid or unsupported URLs
 
@@ -148,7 +132,6 @@ Fresh-install defaults are:
 | Setting | Default |
 |---|---:|
 | Enabled | `true` |
-| Save-Data request header | `true` |
 | Proxy URL | empty — must be configured |
 | Quality | `60` |
 | Grayscale | `true` |
@@ -185,25 +168,13 @@ The toolbar popup can also exclude or re-include the current website.
 
 The Options page reports:
 
-- **Images** — completed successful proxy image responses with an allowed detected image media type counted by the service worker.
+- **Images** — completed successful proxy image responses counted by the service worker.
 - **Proxy bytes** — estimated bytes delivered by the configured proxy.
 - **Data saved** — estimated bytes saved compared with the original image size when the proxy supplies the required size information.
 
-Statistics are collected from `webRequest.onCompleted` response headers. Cached responses are excluded. Only successful HTTP 2xx responses from the configured proxy origin with one of the following detected image media types are counted:
+Statistics are collected from `webRequest.onCompleted` response headers. Cached responses are excluded, and only successful HTTP 2xx image responses matching the configured proxy origin are counted.
 
-| Detected type | `Content-Type` |
-|---|---|
-| JPEG | `image/jpeg` |
-| PNG | `image/png` |
-| WebP | `image/webp` |
-| GIF | `image/gif` |
-| TIFF | `image/tiff` |
-| JPEG XL | `image/jxl` |
-| SVG | `image/svg+xml` |
-
-Media-type parameters such as `charset=utf-8` are ignored when identifying the type. Other image classifications, including AVIF, ICO, BMP, and opaque binary responses, are not counted.
-
-The service worker understands these response-size header families, preferring the `x-bh-*` names and supporting legacy names:
+The service worker understands these header families, preferring the `x-bh-*` names and supporting legacy names:
 
 ```text
 x-bh-compressed-size   / x-compressed-size
@@ -213,7 +184,7 @@ x-bh-bytes-saved       / x-bytes-saved
 
 If compressed size is not provided, `Content-Length` can be used as a fallback. If the proxy does not provide usable size headers, the corresponding statistics may remain `0` or be less complete.
 
-Statistics are stored in `storage.local` and written in batches (750 ms) rather than once for every image response. A pending delta is mirrored to a scratch `statsPending` key so it survives an MV3 worker kill; the scratch key is overwritten with the current in-memory delta at commit time (never blindly cleared) so a delta recorded mid-flush cannot lose its crash-recovery mirror.
+Statistics are stored in `storage.local` and written in batches (750 ms) rather than once for every image response.
 
 ### Resetting statistics
 
@@ -311,13 +282,12 @@ Handles:
 
 - `storage.sync` → `storage.local` settings mirroring;
 - missing-setting initialization;
-- CSP response-header removal and `Save-Data: on` request-header injection through Declarative Net Request (the Save-Data rule always carries `urlFilter: "*"` so its condition is never an empty object, which Chromium DNR validators reject);
-- the pre-network image guard (allow proxy/favicon/excluded, block everything else image-typed) that prevents origin-image-host DNS leaks;
+- CSP response-header rules through Declarative Net Request;
 - enabled/disabled extension icon state;
 - proxy response-header statistics; and
 - batched local statistics writes.
 
-Image URL rewriting itself is **not** performed with a DNR redirect rule. The content scripts need normal JavaScript URL handling so the original image URL can be safely encoded. Instead, a DNR allow/block image guard stops any non-proxied image request before it reaches the network stack (see "DNS-leak protection").
+Image URL rewriting itself is **not** performed with a DNR redirect rule. The content scripts need normal JavaScript URL handling so the original image URL can be safely encoded.
 
 ### `popup.js`
 
@@ -358,7 +328,6 @@ bandwidth-guardian/
 ├── _locales/en/messages.json
 ├── build.sh
 ├── LICENSE
-├── CHANGELOG.md
 └── README.md
 ```
 
@@ -368,7 +337,7 @@ bandwidth-guardian/
 |---|---|
 | `storage` | Store settings and local usage statistics |
 | `tabs` | Reload tabs after relevant settings changes |
-| `declarativeNetRequestWithHostAccess` | Strip CSP response headers so proxied images can load, and inject the `Save-Data: on` request header |
+| `declarativeNetRequestWithHostAccess` | Manage CSP response-header handling |
 | `webRequest` | Read proxy response headers for usage statistics |
 | `<all_urls>` host access | Process eligible images on web pages |
 
@@ -414,37 +383,6 @@ https://github.com/anT0ny54/bandwidth-guardian
 Proxy example:
 
 https://github.com/anT0ny54/bhp2
-
-## 🔗 Related projects (not part of this repository)
-
-The services below are maintained separately and are **not** part of this repository, its build pipeline, or its release cycle. They are listed here for convenience only.
-
-### 🌐 Free DNS Services
-
-High-performance DNS utilizing HaGeZi Blocklists (Multi Pro + TIF).
-
-| Blocklist | DNS-over-HTTPS (DoH) |
-| :--- | :--- |
-| Multi Pro + TIF | `https://freedns.koyeb.app/dns-query` (Recommended) |
-| Multi Pro + TIF | `https://dns.mydoh.workers.dev/dns-query` (Recommended) |
-| Multi Pro + TIF | `https://dns-pi.vercel.app/api/doh/dns-query` (Recommended) |
-| Multi Pro + TIF | `https://dnssix.netlify.app/api/doh/dns-query` |
-| Multi Pro + TIF | `https://dns-93aca.containers.snapdeploy.app/dns-query` |
-| Multi Pro + TIF | `https://doh-93aca.containers.snapdeploy.app/dns-query` |
-
-### ⚡ Bandwidth Hero Server
-
-A lightweight image optimization proxy designed to slash bandwidth usage and accelerate web browsing.
-
-Bandwidth Hero Server fetches remote images, compresses them on the fly, and delivers optimized versions to the client. This significantly reduces data consumption while improving page load performance.
-
-🖥️ **Live Demo:** [Bandwidth Hero](https://bhserv.netlify.app/).
-
-## Supporting the Project
-
-If you find this project useful, donations are appreciated:
-
-- **Bitcoin**: `1HntwKxyqGCfnSGvGLMUTRAqLnTvLarAQP`
 
 ## License
 
