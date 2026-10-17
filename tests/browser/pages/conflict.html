@@ -1,0 +1,6 @@
+<!doctype html><html><head><meta charset="utf-8"></head><body>
+<img id="c1" src="http://cdn.test:__PORT__/img/conflict/parser.png?w=50&quality=80">
+<div id="c3" style="width:40px;height:30px;background-image:url('http://cdn.test:__PORT__/img/conflict/bg.png?w=40&bw=1')"></div>
+<script>
+  const i = new Image(); i.id = 'c2'; i.src = 'http://cdn.test:__PORT__/img/conflict/js.png?w=50&quality=80&l=1'; document.body.append(i);
+</script></body></html>
