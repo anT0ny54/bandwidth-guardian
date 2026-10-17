@@ -374,10 +374,25 @@ test.describe('Bandwidth Guardian in Chrome', { skip: SKIP }, () => {
 
   test('image-heavy page: 600 responsive lazy images, infinite scroll and viewport changes', async () => {
     const page = await open('heavy.html', { width: 1280, height: 900 });
-    for (let y = 0; y < 20; y++) { await page.mouse.wheel(0, 4000); await sleep(120); }
+    // Wait for visible images instead of sleeping a fixed 120 ms after every
+    // scroll. This keeps the lazy-loading stress coverage while avoiding ~4.8 s
+    // of unconditional delay on fast CI workers.
+    const scrollThroughPage = async () => {
+      for (let y = 0; y < 20; y++) {
+        await page.mouse.wheel(0, 4000);
+        await page.waitForFunction(() => {
+          const visible = Array.from(document.images).filter(i => {
+            const r = i.getBoundingClientRect();
+            return r.bottom > 0 && r.top < innerHeight;
+          });
+          return visible.every(i => i.complete && i.naturalWidth > 0);
+        }, null, { timeout: 5000 });
+      }
+    };
+    await scrollThroughPage();
     await page.setViewportSize({ width: 420, height: 900 });
     await page.evaluate(() => window.scrollTo(0, 0));
-    for (let y = 0; y < 20; y++) { await page.mouse.wheel(0, 4000); await sleep(120); }
+    await scrollThroughPage();
     await page.waitForFunction(() => Array.from(document.images).filter(i => i.getBoundingClientRect().bottom > 0 && i.getBoundingClientRect().top < innerHeight).every(i => i.complete), null, { timeout: 15000 });
     await sleep(500);
     assert.ok(proxied('/img/heavy/').length > 600, `proxied ${proxied('/img/heavy/').length}`);
