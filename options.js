@@ -85,17 +85,21 @@ async function reloadCurrentPage() {
 
 // B16: exact match, or a visible "Custom" badge — the popup and options page
 // now agree, and custom values no longer highlight a nearby preset.
-let customBadgeEl = null;
+// Keep one badge per preset group: quality and width can both be custom.
+const customBadges = new WeakMap();
+
 function setCustomBadge(container, show) {
   if (!container) return;
-  if (show && !customBadgeEl) {
-    customBadgeEl = document.createElement("span");
-    customBadgeEl.textContent = "Custom";
-    customBadgeEl.style.cssText = "font-size:11px;opacity:.65;margin-left:8px;vertical-align:middle;";
-    container.appendChild(customBadgeEl);
-  } else if (!show && customBadgeEl) {
-    customBadgeEl.remove();
-    customBadgeEl = null;
+  let badge = customBadges.get(container);
+  if (show && !badge) {
+    badge = document.createElement("span");
+    badge.textContent = "Custom";
+    badge.style.cssText = "font-size:11px;opacity:.65;margin-left:8px;vertical-align:middle;";
+    container.appendChild(badge);
+    customBadges.set(container, badge);
+  } else if (!show && badge) {
+    badge.remove();
+    customBadges.delete(container);
   }
 }
 
@@ -191,6 +195,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
 
 qualityPresets.forEach(btn => {
   btn.addEventListener("click", () => {
+    dirty.quality = true;
     qualityPresets.forEach(b => b.classList.remove("active"));
     btn.classList.add("active");
     customQualityEl.value = ""; // preset takes priority; clear custom
@@ -212,6 +217,7 @@ customQualityEl.addEventListener("input", () => {
 
 widthPresets.forEach(btn => {
   btn.addEventListener("click", () => {
+    dirty.width = true;
     widthPresets.forEach(b => b.classList.remove("active"));
     btn.classList.add("active");
     customWidthEl.value = "";

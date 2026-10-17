@@ -31,6 +31,8 @@ The allowlist used when classifying proxy responses is strict:
 
 Usage statistics are updated only when the proxy response includes exactly one `Content-Type` header whose normalized media type matches this list. Missing, duplicate, ambiguous, or unsupported response types are ignored; parameters after the MIME type do not change the media-type match.
 
+Proxy failures are fail-closed. When a proxied image cannot load, the extension marks that element as failed and leaves the image unavailable. It does not restore the original URL or retry the original image directly, avoiding an unexpected full-bandwidth request through a broken proxy.
+
 **Important limitation:** the browser does not know the original resource's response `Content-Type` before the extension rewrites the candidate URL to the proxy. A proxy can also convert an unsupported source (such as SVG or AVIF) into an allowed output type (such as WebP). Therefore this repository's response allowlist does **not** prove that the upstream source had an allowed MIME type, and this extension alone cannot guarantee strict source-MIME interception. To guarantee that only the six source MIME types above are processed, the separate [Bandwidth Hero proxy](https://github.com/anT0ny54/bhp2) must enforce the same allowlist against the upstream response **before** decoding or conversion, rejecting missing, conflicting, and unsupported `Content-Type` values.
 
 ## How it works
@@ -40,10 +42,13 @@ Usage statistics are updated only when the proxy response includes exactly one `
   `HTMLLinkElement.href` and `Element.prototype.setAttribute` before page
   scripts run, so JS-assigned image URLs (including every lazy loader's
   `img.src = dataset.src`) are proxied before any network request fires.
+  Failed proxy loads remain unavailable rather than falling back to the
+  original URL.
 - **content.js** (isolated world): catches HTML-parser-created `<img>`/`<source>`
   nodes and inline CSS `background-image`. When idle (extension disabled, no
   proxy configured, or an excluded page) its MutationObserver disconnects and
-  it does no per-mutation work.
+  it does no per-mutation work. It also prevents already-failed proxied images
+  from being rewritten again.
 - **service-worker.js**: keeps the fast `storage.local` settings mirror, counts
   stats from the proxy's `x-bh-*` response headers (only for the strict image
   types above), injects `Save-Data: on` via DNR, and strips CSP **only while a
