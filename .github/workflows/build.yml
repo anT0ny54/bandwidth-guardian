@@ -3,20 +3,25 @@ on:
   push:
     branches: [main]
 
-# B11: two quick pushes must not race gh release create/upload.
+# The whole workflow is one job, so a second push queues behind the in-flight
+# release instead of cancelling it mid-gh-release-create (B11).
 concurrency:
   group: release-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
+
+permissions:
+  contents: write
 
 jobs:
-  build:
+  # Single job: the release step consumes the zip from the same filesystem,
+  # so the release can never fail with "Artifact not found" the way the old
+  # build->release artifact handoff did.
+  build-and-release:
     runs-on: ubuntu-latest
-    outputs:
-      version: ${{ steps.meta.outputs.version }}
-      release-exists: ${{ steps.meta.outputs.release-exists }}
     steps:
       # C7: keep checkout version in sync with Keep-Alive.yml (both @v5).
       - uses: actions/checkout@v5
+
       - id: meta
         env:
           GH_TOKEN: ${{ github.token }}
@@ -28,32 +33,30 @@ jobs:
           else
             echo "release-exists=false" >> "$GITHUB_OUTPUT"
           fi
+
       - name: Build
         # Invoke through bash: the executable bit is not preserved by zip
         # exports or some checkouts, which made "./build.sh" fail with 126.
         run: bash build.sh
+
+      # Artifact upload is kept for humans (run downloads / debugging), but a
+      # missing zip now fails the build HERE instead of surfacing later as a
+      # confusing "Artifact not found" in another job (upload-artifact v4
+      # defaults to silently warning when the path matches nothing).
       - uses: actions/upload-artifact@v4
         with:
           name: bandwidth-guardian-main
           path: bandwidth-guardian-main.zip
+          if-no-files-found: error
 
-  release:
-    needs: build
-    # B11: never clobber an existing release. The tag stays pinned to the
-    # commit it was created from, keeping the release reproducible — cut a
-    # new release by bumping manifest.json's version.
-    if: needs.build.outputs.release-exists == 'false'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: bandwidth-guardian-main
+      # B11: never clobber an existing release. The tag stays pinned to the
+      # commit it was created from, keeping the release reproducible — cut a
+      # new release by bumping manifest.json's version.
       - name: Create release
+        if: steps.meta.outputs.release-exists == 'false'
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ needs.build.outputs.version }}
+          VERSION: ${{ steps.meta.outputs.version }}
         run: |
           gh release create "v$VERSION" bandwidth-guardian-main.zip \
             --title "v$VERSION" --generate-notes
