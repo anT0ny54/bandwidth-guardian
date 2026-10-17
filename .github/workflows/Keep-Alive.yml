@@ -35,7 +35,9 @@ jobs:
           printf 'Last kept alive on: %s\n' "$timestamp" \
             > .github/keep-alive.txt
 
-      - name: Commit and push if changed
+      # R12: the old `git diff --cached --quiet` guard could never be true —
+      # the timestamp always changes — so it is gone; the commit always runs.
+      - name: Commit and push
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -44,11 +46,6 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           git add -- .github/keep-alive.txt
-
-          if git diff --cached --quiet -- .github/keep-alive.txt; then
-            echo "No changes to commit"
-            exit 0
-          fi
 
           git commit \
             -m "chore: update repository keep-alive [skip ci]"
