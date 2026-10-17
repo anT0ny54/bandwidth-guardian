@@ -15,6 +15,7 @@ The extension is intentionally **proxy-agnostic**: it does not require a built-i
 - No JavaScript objects or `chrome.*` APIs are shared across execution worlds.
 - Supports normal images, `srcset`, `<picture>` sources, lazy-loading attributes, image preloads, inline background images, and dynamically inserted elements.
 - Automatic per-image fallback to the original URL when a proxy request fails.
+- DNS-leak protection: non-proxied image requests are blocked at the network layer (Declarative Net Request) before any connection or DNS lookup to origin image hosts can occur.
 - Configurable quality, grayscale, maximum width, and excluded domains.
 - Local settings mirror for fast content-script startup.
 - Usage statistics collected from proxy response headers by the service worker.
@@ -75,6 +76,21 @@ A batched `MutationObserver` handles dynamic changes without continuously scanni
 ### Automatic fallback
 
 When a proxied image fails, Guardian restores the original URL. The failure is marked with `data-bh-failed` so the isolated and MAIN-world handlers can coordinate without sharing JavaScript objects.
+
+### DNS-leak protection
+
+Chromium's speculative preload scanner starts fetching parser-discovered `<img src>` URLs during HTML parsing — before any `document_start` script or MutationObserver microtask can rewrite them. Rewriting the URL cancels the in-flight download, but the DNS query to the origin image host has already been sent, leaking the hostname to the local resolver (visible on dnsleaktest.com when the browser is supposed to resolve everything through your VPN/proxy).
+
+Guardian closes this gap with Declarative Net Request image-guard rules that are evaluated before the network stack:
+
+- image responses from the configured proxy are **allowed**;
+- favicon and `.ico` requests are **allowed** (tab and site icons keep working);
+- excluded domains and their subdomains are **allowed**; and
+- every other direct image request is **blocked**, so the browser never opens a connection or sends a DNS query to an origin image host.
+
+The rules are installed only while compression is enabled and a proxy is configured, and are removed when either is unset.
+
+Note: stylesheet-defined CSS `background-image` URLs cannot be rewritten in MV3, so on non-excluded sites those requests are blocked rather than leaked. Inline `style="background-image: …"` images are proxied normally. If a site loses its background images, add it to the excluded domains. This also protects the browser only — a system-level VPN DNS leak is outside the extension's reach.
 
 ### Requests that are intentionally skipped
 
@@ -296,11 +312,12 @@ Handles:
 - `storage.sync` → `storage.local` settings mirroring;
 - missing-setting initialization;
 - CSP response-header removal and `Save-Data: on` request-header injection through Declarative Net Request (the Save-Data rule always carries `urlFilter: "*"` so its condition is never an empty object, which Chromium DNR validators reject);
+- the pre-network image guard (allow proxy/favicon/excluded, block everything else image-typed) that prevents origin-image-host DNS leaks;
 - enabled/disabled extension icon state;
 - proxy response-header statistics; and
 - batched local statistics writes.
 
-Image URL rewriting itself is **not** performed with a DNR redirect rule. The content scripts need normal JavaScript URL handling so the original image URL can be safely encoded.
+Image URL rewriting itself is **not** performed with a DNR redirect rule. The content scripts need normal JavaScript URL handling so the original image URL can be safely encoded. Instead, a DNR allow/block image guard stops any non-proxied image request before it reaches the network stack (see "DNS-leak protection").
 
 ### `popup.js`
 

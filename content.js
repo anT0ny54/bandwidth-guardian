@@ -229,7 +229,8 @@
   // Mirrors original buildCompressUrl() plus himshim proxy2 additions.
   function updateProxyConfig(next) {
     opts = next;
-    const base = String(opts.proxyBase || "").trim();
+    // Trim a trailing ? or &: "https://proxy/?" would otherwise produce "…/?&url=…".
+    const base = String(opts.proxyBase || "").trim().replace(/[?&]+$/, "");
     const quality = Math.max(1, Math.min(100, Number(opts.quality ?? 60) || 60));
     const maxWidth = Number(opts.maxWidth) || 0;
     proxyConfig = { base, sep: base.includes("?") ? "&" : "?", quality,
@@ -560,11 +561,8 @@
     imageTargets.forEach(rewriteImg);
     lazyTargets.forEach(rewriteLazy);
     bgTargets.forEach(rewriteBg);
-
-    addedRoots.length = 0;
-    imageTargets.clear();
-    lazyTargets.clear();
-    bgTargets.clear();
+    // No trailing clear needed: every batch clears these module-level
+    // collections at entry, so the second clear was redundant.
   }
 
   const MUTATION_RECORD_LIMIT = 2000;

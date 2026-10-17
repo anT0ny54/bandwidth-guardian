@@ -14,6 +14,11 @@
 //  Image src rewriting is therefore done in the content scripts, which CAN call
 //  encodeURIComponent. DNR Rule 2 (CSP header stripping) is kept.
 //
+//  Rules 4-6 (image allow/block guard): DNR runs BEFORE the network stack, so
+//  it is the only layer that can stop Chromium's speculative preload scanner
+//  from fetching an original image URL during HTML parsing — a fetch the
+//  content scripts can only cancel after the DNS query has already leaked.
+//
 // ══════════════════════════════════════════════════════════════════════════════
 
 // Kiwi/Cromite do not support ES module service workers ("type": "module"),
@@ -30,9 +35,12 @@ const DEFAULTS = {
 };
 const sameOpts = (a, b) => !!a && !!b && Object.keys(DEFAULTS).every(k => a[k] === b[k]);
 
-const RULE_ID_CSP      = 2;  // strips CSP headers so proxy images can load
+const RULE_ID_CSP       = 2; // strips CSP headers so proxy images can load
 const RULE_ID_SAVE_DATA = 3; // adds Save-Data: on to requests
-const ALL_RULE_IDS     = [RULE_ID_CSP, RULE_ID_SAVE_DATA];
+const RULE_ID_IMG_PROXY = 4; // allows image responses from the configured proxy
+const RULE_ID_IMG_ICO   = 5; // allows favicons/.ico so site icons keep working
+const RULE_ID_IMG_BLOCK = 6; // blocks direct image loads so origin hosts are never resolved (DNS-leak guard)
+const ALL_RULE_IDS     = [RULE_ID_CSP, RULE_ID_SAVE_DATA, RULE_ID_IMG_PROXY, RULE_ID_IMG_ICO, RULE_ID_IMG_BLOCK];
 
 // Strict detected image types. Statistics are recorded only for proxy
 // responses whose Content-Type matches one of these media types. Parameters
@@ -104,7 +112,7 @@ chrome.runtime.onInstalled.addListener(function() {
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== "sync") return;
   mirrorToLocal();
-  if ("enabled" in changes || "saveData" in changes || "excludeDomains" in changes) refreshRules();
+  if ("enabled" in changes || "saveData" in changes || "excludeDomains" in changes || "proxyBase" in changes) refreshRules();
   if ("enabled" in changes) updateIcon();
 });
 
@@ -291,8 +299,8 @@ function onProxyCompleted(details) {
 }
 
 // ── DNR rules ─────────────────────────────────────────────────────────────────
-// Only Rule 2 (CSP stripping) and Rule 3 (Save-Data) are active. The old
-// Rule 1 (redirect) was removed and its cleanup retired — see top-of-file.
+// Active: Rule 2 (CSP stripping), Rule 3 (Save-Data), Rules 4-6 (image guard).
+// The old Rule 1 (redirect) was removed and its cleanup retired — see top-of-file.
 //
 // Uses callback form throughout — the Promise-returning form of chrome APIs
 // (e.g. await chrome.storage.sync.get()) is not available in classic
@@ -320,6 +328,10 @@ function doRefreshRules(done) {
       .filter(function(s) { return /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$/.test(s); });
     var excludedDomains = Array.from(new Set(excluded));
     var addRules = [];
+
+    // Hostname of the configured proxy, for the image-guard allow rule.
+    var proxyHost = "";
+    try { proxyHost = new URL(String(opts.proxyBase || "").trim()).hostname.toLowerCase(); } catch (e) { proxyHost = ""; }
 
     // Rule 2: Strip CSP headers so proxy-domain images aren't blocked by the page.
     // CSP only matters for top-level/frame documents, so keep this rule narrow.
@@ -365,6 +377,42 @@ function doRefreshRules(done) {
           ]
         },
         condition: saveDataCondition
+      });
+    }
+
+    // ── DNS-leak guard (Rules 4-6) ──────────────────────────────────────────
+    // Chromium's speculative preload scanner fetches parser-discovered
+    // <img src> URLs during HTML parsing — before document_start scripts or
+    // any MutationObserver microtask can rewrite them. The content scripts
+    // cancel the in-flight fetch after the fact, but by then the DNS query
+    // to the origin image host has already been sent (a DNS leak, e.g. on
+    // dnsleaktest.com when the browser is supposed to resolve everything
+    // through the VPN/proxy). DNR evaluates before the network stack, so a
+    // blocked image request never opens a connection or sends a DNS lookup.
+    if (opts.enabled && proxyHost) {
+      // Proxied images must obviously load.
+      addRules.push({
+        id: RULE_ID_IMG_PROXY,
+        priority: 3,
+        action: { type: "allow" },
+        condition: { urlFilter: "||" + proxyHost, resourceTypes: ["image"] }
+      });
+      // Favicons and .ico resources keep working (tab/site icons).
+      addRules.push({
+        id: RULE_ID_IMG_ICO,
+        priority: 3,
+        action: { type: "allow" },
+        condition: { regexFilter: "favicon|\\.ico([?#]|$)", resourceTypes: ["image"] }
+      });
+      // Everything else image-typed is blocked pre-network. Excluded domains
+      // (matched with subdomains by excludedRequestDomains) stay direct.
+      var imgBlockCondition = { urlFilter: "|http", resourceTypes: ["image"] };
+      if (excludedDomains.length) imgBlockCondition.excludedRequestDomains = excludedDomains;
+      addRules.push({
+        id: RULE_ID_IMG_BLOCK,
+        priority: 1,
+        action: { type: "block" },
+        condition: imgBlockCondition
       });
     }
 

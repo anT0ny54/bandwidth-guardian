@@ -96,7 +96,8 @@
 
   function updateProxyConfig(next) {
     opts = next;
-    const base = String(opts.proxyBase || "").trim();
+    // Trim a trailing ? or &: "https://proxy/?" would otherwise produce "…/?&url=…".
+    const base = String(opts.proxyBase || "").trim().replace(/[?&]+$/, "");
     const quality = Math.max(1, Math.min(100, Number(opts.quality ?? 60) || 60));
     const maxWidth = Number(opts.maxWidth) || 0;
     proxyConfig = { base, sep: base.includes("?") ? "&" : "?", quality,
@@ -184,12 +185,21 @@
         const pendingSrc = el.dataset.bhPendingSrc;
         if (pendingSrc && el instanceof HTMLImageElement) {
           el.removeAttribute("data-bh-pending-src");
-          nativeSetSrc(el, decideSrc(pendingSrc) ?? pendingSrc);
+          const decided = decideSrc(pendingSrc);
+          // Arm the failure fallback before assigning: without it a parked
+          // parser-created image whose proxy request fails has no error
+          // handler at all (content.js skips proxy URLs, so it never arms
+          // one for these elements either) and is left as a broken image.
+          if (decided !== null && decided !== pendingSrc) {
+            armProxyFallback(el, resolveHttp(pendingSrc), el.getAttribute("srcset") || "");
+          }
+          nativeSetSrc(el, decided ?? pendingSrc);
         }
         const pendingSrcset = el.dataset.bhPendingSrcset;
         if (pendingSrcset) {
           el.removeAttribute("data-bh-pending-srcset");
           const rewritten = rewriteSrcset(pendingSrcset, el);
+          if (rewritten !== pendingSrcset) armProxyFallback(el, "", pendingSrcset);
           if (el instanceof HTMLImageElement) {
             nativeSetSrcset(el, rewritten);
           } else if (sourceProto && el instanceof HTMLSourceElement) {
@@ -221,6 +231,17 @@
       const raw = event?.detail;
       const next = typeof raw === "string" ? JSON.parse(raw) : null;
       if (!next || typeof next !== "object") return;
+      // Security: page JavaScript can dispatch this event too, with an
+      // attacker-controlled proxyBase that would hijack every image. The
+      // first event (from content.js at document_start) establishes the
+      // proxy; later events may tune quality/grayscale/exclusions but can
+      // never redirect images to a different proxy host. An empty current
+      // proxyHost (watchdog defaults, proxy not configured) always accepts.
+      if (ready && proxyHost) {
+        let nextHost = "";
+        try { nextHost = new URL(String(next.proxyBase || "")).hostname.toLowerCase(); } catch {}
+        if (nextHost !== proxyHost) return;
+      }
       applyOpts({
         enabled: next.enabled !== false,
         proxyBase: typeof next.proxyBase === "string" ? next.proxyBase : "",
