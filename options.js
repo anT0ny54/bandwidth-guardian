@@ -177,11 +177,11 @@ chrome.storage.onChanged.addListener((changes, area) => {
   if (changes.excludeDomains && !dirty.excludeDomains) {
     excludeEl.value = changes.excludeDomains.newValue || "";
   }
-  if (changes.quality && !dirty.quality && !dirty.width) {
+  if (changes.quality && !dirty.quality) {
     savedQuality = changes.quality.newValue ?? DEFAULTS.quality;
     setQualityUI(savedQuality);
   }
-  if (changes.maxWidth && !dirty.width && !dirty.quality) {
+  if (changes.maxWidth && !dirty.width) {
     savedWidth = changes.maxWidth.newValue ?? DEFAULTS.maxWidth;
     setWidthUI(savedWidth);
   }

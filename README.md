@@ -14,9 +14,11 @@ matching). Firefox is **not** supported: MV3 `background.service_worker` and
 the DNR features used here are Chromium-only, so the manifest no longer ships a
 `browser_specific_settings.gecko` block.
 
-## What gets proxied
+## Image handling and MIME policy
 
-Only **strictly detected image types** are ever treated as images:
+The extension intercepts image candidates in `<img>`, `<source>`, image preloads, and inline CSS backgrounds. It also skips known favicon, `.ico`, `.svg`, and tracking-pixel URL patterns where recognizable. These URL-based exclusions are heuristics, not MIME verification.
+
+The allowlist used when classifying proxy responses is strict:
 
 | Type | MIME |
 |---|---|
@@ -27,9 +29,9 @@ Only **strictly detected image types** are ever treated as images:
 | TIFF | `image/tiff` |
 | JPEG XL | `image/jxl` |
 
-Usage statistics are counted only for proxy responses whose actual
-`Content-Type` is one of the above. Favicons, `.ico`, `.svg`, and known
-tracking-pixel URLs are never proxied.
+Usage statistics are updated only when the proxy response includes exactly one `Content-Type` header whose normalized media type matches this list. Missing, duplicate, ambiguous, or unsupported response types are ignored; parameters after the MIME type do not change the media-type match.
+
+**Important limitation:** the browser does not know the original resource's response `Content-Type` before the extension rewrites the candidate URL to the proxy. A proxy can also convert an unsupported source (such as SVG or AVIF) into an allowed output type (such as WebP). Therefore this repository's response allowlist does **not** prove that the upstream source had an allowed MIME type, and this extension alone cannot guarantee strict source-MIME interception. To guarantee that only the six source MIME types above are processed, the separate [Bandwidth Hero proxy](https://github.com/anT0ny54/bhp2) must enforce the same allowlist against the upstream response **before** decoding or conversion, rejecting missing, conflicting, and unsupported `Content-Type` values.
 
 ## How it works
 
