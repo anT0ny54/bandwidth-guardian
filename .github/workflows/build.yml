@@ -10,8 +10,39 @@ permissions:
   contents: write
 
 jobs:
+  test:
+    name: Interception tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Checkout proxy (URL parser used by the mock proxy)
+        uses: actions/checkout@v4
+        with:
+          repository: anT0ny54/bhp2
+          path: bhp2
+
+      - name: Install test browser
+        run: |
+          npm i --no-save playwright-core
+          npx playwright-core install --with-deps chromium
+
+      - name: Run tests
+        run: |
+          export CHROME_PATH="$(node -e "console.log(require('playwright-core').chromium.executablePath())")"
+          export BHP2_DIR="$GITHUB_WORKSPACE/bhp2"
+          node --test --test-concurrency=1 tests/
+
   build:
     name: Build extension
+    needs: test
     runs-on: ubuntu-latest
 
     steps:
