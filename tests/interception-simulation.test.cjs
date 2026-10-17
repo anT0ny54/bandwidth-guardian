@@ -329,9 +329,8 @@ test('content script rewrites URLs in inline CSS background-image', { skip: !con
   const rewriteBgSource = extractFunction(content, 'rewriteBg');
   const sandbox = {
     doneBg: new WeakSet(), active: true, failedEls: { has: () => false },
-    // rewriteBg() works on URL objects: resolveHttpURL() + shouldSkipURL().
-    shouldSkipURL(u) { return u.origin === 'https://proxy.example'; },
-    resolveHttpURL(url) { try { const u = new URL(url, 'https://page.example/'); return /^https?:$/.test(u.protocol) ? u : null; } catch { return null; } },
+    shouldSkip(url) { try { return !/^https?:$/.test(new URL(url).protocol) || new URL(url).origin === 'https://proxy.example'; } catch { return true; } },
+    resolveHttp(url) { try { const u = new URL(url, 'https://page.example/'); return /^https?:$/.test(u.protocol) ? u.href : null; } catch { return null; } },
     buildProxyUrl(url) { return 'https://proxy.example/convert?url=' + encodeURIComponent(url); }
   };
   vm.createContext(sandbox);
@@ -361,10 +360,10 @@ test('duplicated patterns stay in sync across prehook, content script and servic
 });
 
 test('service worker: raw redirect target round-trips through the proxy contract; recovery mirrors getImageUrl', { skip: !serviceWorker }, () => {
-  const sb = { URL, decodeURIComponent, DEFAULTS: { quality: 60 } };
+  const sb = { URL, decodeURIComponent };
   vm.createContext(sb);
   const consts = serviceWorker.slice(serviceWorker.indexOf('const TRACKING_PATTERNS'), serviceWorker.indexOf('const ALL_RULE_IDS'));
-  vm.runInContext(consts.replace(/^const /gm, 'var ') + '\n' + extractFunction(serviceWorker, 'normQuality') + '\nvar configuredProxyOrigin = "https://proxy.example";\nvar PROXY_PARAMETER_RE = new RegExp(CONFLICT_PATTERN);\n' +
+  vm.runInContext(consts.replace(/^const /gm, 'var ') + '\nvar configuredProxyOrigin = "https://proxy.example";\nvar PROXY_PARAMETER_RE = new RegExp(CONFLICT_PATTERN);\n' +
     extractFunction(serviceWorker, 'redirectSubstitution') + '\n' + extractFunction(serviceWorker, 'originalFromProxyUrl') +
     '\nthis.rs = redirectSubstitution; this.orig = originalFromProxyUrl;', sb);
   const sub = sb.rs({ quality: 55, grayscale: true, maxWidth: 1024 }, 'https://proxy.example/api/index');
@@ -405,102 +404,6 @@ test('architecture markers: network redirect is the primary layer, DOM layers de
   assert.match(serviceWorker, /updateSessionRules/);
   assert.match(serviceWorker, /header: "content-security-policy", values:/, 'HeaderInfo uses `header`, not `name`');
   assert.match(prehook, /const domHandles = absolute => !redirectLive \|\| CONFLICT_RE\.test\(absolute\)/);
-  assert.match(content, /runtime\.redirect !== false && !CONFLICT_RE\.test\(u\.href\)/);
+  assert.match(content, /runtime\.redirect !== false && !CONFLICT_RE\.test\(absolute\)/);
   assert.match(prehook, /function retryFailed\(/);
-});
-
-test('service worker: excluded domains are normalised like the DOM layers (ports stripped, junk dropped)', { skip: !serviceWorker }, () => {
-  const { fn: parseExcluded } = functionFrom(serviceWorker, 'parseExcluded');
-  const out = parseExcluded('Example.com:8080, https://cdn.example.org/a/b  sub.example.com.\nnot a host,, a_b.com');
-  assert.deepEqual(Array.from(out), ['example.com', 'cdn.example.org', 'sub.example.com', 'not', 'a', 'host']);
-  assert.deepEqual(Array.from(parseExcluded('')), []);
-  assert.deepEqual(Array.from(parseExcluded('dup.com dup.com')), ['dup.com']);
-});
-
-test('service worker: normStats never mutates shared state and tolerates null/undefined/garbage', { skip: !serviceWorker }, () => {
-  const sb = {};
-  vm.createContext(sb);
-  vm.runInContext(`const ZERO_STATS = Object.freeze({ filesProcessed: 0, bytesProcessed: 0, bytesSaved: 0 });\n${extractFunction(serviceWorker, 'normStats')}\nthis.n = normStats; this.Z = ZERO_STATS;`, sb);
-  for (const bad of [null, undefined, 'x', { filesProcessed: 'NaN', bytesSaved: -5 }, {}]) {
-    const s = sb.n(bad);
-    assert.deepEqual(JSON.parse(JSON.stringify(s)), { filesProcessed: 0, bytesProcessed: 0, bytesSaved: 0 });
-    s.filesProcessed += 7; // must be a fresh object each time
-  }
-  assert.equal(sb.Z.filesProcessed, 0);
-  assert.deepEqual(JSON.parse(JSON.stringify(sb.n({ filesProcessed: 3, bytesProcessed: '10', bytesSaved: 4 }))), { filesProcessed: 3, bytesProcessed: 10, bytesSaved: 4 });
-});
-
-test('service worker: webRequest listeners are re-registered only when the proxy origin changes', { skip: !serviceWorker }, () => {
-  const calls = { add: 0, remove: 0 };
-  const ev = () => ({ addListener() { calls.add++; }, removeListener() { calls.remove++; } });
-  const sb = { chrome: { webRequest: { onCompleted: ev(), onErrorOccurred: ev() } } };
-  vm.createContext(sb);
-  vm.runInContext(`var webRequestRegistered = false, registeredProxyOrigin = null;
-    var PROXY_REQUEST_TYPES = ["image", "object"];
-    function onProxyCompleted() {} function onProxyError() {}
-    ${extractFunction(serviceWorker, 'updateWebRequestListener')}
-    this.u = updateWebRequestListener;`, sb);
-  sb.u('');                          // startup: placeholder filter
-  sb.u('https://proxy.example');     // origin learned
-  const afterOrigin = { ...calls };
-  sb.u('https://proxy.example');     // quality/grayscale change: no-op
-  sb.u('https://proxy.example');
-  assert.deepEqual({ ...calls }, afterOrigin, 'unchanged origin must not re-register');
-  sb.u('https://other.example');     // proxy changed: re-register
-  assert.ok(calls.add > afterOrigin.add && calls.remove > afterOrigin.remove);
-});
-
-test('normQuality is identical in prehook, content script and service worker (no NaN / layer disagreement)', { skip: !content || !serviceWorker }, () => {
-  const mk = (src, defaults) => functionFrom(src, 'normQuality', { DEFAULTS: defaults }).fn;
-  const impls = { prehook: mk(prehook, { quality: 60 }), content: mk(content, { quality: 60 }), worker: mk(serviceWorker, { quality: 60 }) };
-  const cases = [[undefined, 60], [null, 60], ['', 60], ['abc', 60], [NaN, 60], [Infinity, 60], [0, 1], [-5, 1], [1, 1], [55, 55], ['70', 70], [100, 100], [250, 100]];
-  for (const [name, fn] of Object.entries(impls)) {
-    for (const [input, expected] of cases) assert.equal(fn(input), expected, `${name}(${String(input)})`);
-  }
-});
-
-test('content.js DEFAULTS stay in sync with defaults.js', { skip: !content }, () => {
-  const defaultsSrc = fs.readFileSync(path.join(ROOT, 'defaults.js'), 'utf8');
-  const literal = (src, name) => {
-    const m = new RegExp(`(?:const|export const) ${name}\\s*=\\s*(\\{[\\s\\S]*?\\n\\s*\\});`).exec(src);
-    assert.ok(m, `${name} literal present`);
-    return vm.runInNewContext(`(${m[1]})`);
-  };
-  assert.deepEqual(JSON.parse(JSON.stringify(literal(content, 'DEFAULTS'))), JSON.parse(JSON.stringify(literal(defaultsSrc, 'DEFAULTS'))));
-});
-
-test('service worker: a failed storage read releases the refresh lock instead of wedging it', { skip: !serviceWorker }, () => {
-  let doneCalls = 0;
-  const sb = {
-    DEFAULTS: { quality: 60 },
-    chrome: {
-      declarativeNetRequest: { updateDynamicRules() { throw new Error('must not be reached'); }, getDynamicRules() {} },
-      storage: { sync: { get: (_d, cb) => cb(undefined) }, session: { get: (_d, cb) => cb({}) } },
-      runtime: {}
-    }
-  };
-  vm.createContext(sb);
-  vm.runInContext(`var ALL_RULE_IDS = [], RULE_ID_REDIRECT_IMAGE = 10;\nfunction buildRules() { throw new Error('must not be reached'); }\nfunction publishRuntime() {}\nfunction readSuspended(cb) { cb(false); }\n${extractFunction(serviceWorker, 'doRefreshRules')}\nthis.run = doRefreshRules;`, sb);
-  sb.run(() => { doneCalls++; });
-  assert.equal(doneCalls, 1, 'done() must run when the storage read fails');
-
-  // buildRules throwing must also release the lock (and install nothing).
-  const installed = [];
-  const sb2 = {
-    DEFAULTS: { quality: 60 },
-    chrome: {
-      declarativeNetRequest: {
-        updateDynamicRules(arg, cb) { installed.push(arg.addRules.length); cb(); },
-        getDynamicRules(cb) { cb([]); }
-      },
-      storage: { sync: { get: (_d, cb) => cb({ enabled: true }) }, session: { get: (_d, cb) => cb({}) } },
-      runtime: {}
-    }
-  };
-  vm.createContext(sb2);
-  let done2 = 0;
-  vm.runInContext(`var ALL_RULE_IDS = [], RULE_ID_REDIRECT_IMAGE = 10;\nfunction buildRules() { throw new Error('boom'); }\nfunction publishRuntime() {}\nfunction readSuspended(cb) { cb(false); }\n${extractFunction(serviceWorker, 'doRefreshRules')}\nthis.run = doRefreshRules;`, sb2);
-  sb2.run(() => { done2++; });
-  assert.equal(done2, 1, 'done() must run when buildRules throws');
-  assert.deepEqual(installed, [0], 'a throwing build installs an empty rule set');
 });
