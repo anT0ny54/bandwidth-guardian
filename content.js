@@ -101,9 +101,9 @@
   ].join("|"), "i");
 
 
-  // Favicons, .ico and .svg are never proxied (cheap URL-only check; never load
-  // the original image just to inspect it).
-  const SKIP_URL_RE = /favicon|\.(?:ico|svg)(?:[?#]|$)/i;
+  // Favicons and .ico resources are never proxied. SVG remains eligible because
+  // image/svg+xml is included in the strict detected image-type allowlist.
+  const SKIP_URL_RE = /favicon|\.ico(?:[?#]|$)/i;
 
   // Generic lazy attributes can point at video/audio/fonts/scripts/documents.
   // Never send those URLs to an image proxy. KEEP IN SYNC with bandwidth-saver.

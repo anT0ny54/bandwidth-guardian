@@ -5,8 +5,10 @@
 (() => {
   // KEEP IN SYNC WITH defaults.js, content.js and service-worker.js.
   // Bandwidth Guardian uses its configurable custom image-proxy contract.
+  // saveData is intentionally absent: the service worker owns the Save-Data
+  // header and prehook never reads it.
   const defaults = {
-    enabled: true, saveData: true, proxyBase: "", quality: 60, grayscale: true,
+    enabled: true, proxyBase: "", quality: 60, grayscale: true,
     maxWidth: 768, excludeDomains: ""
   };
 
@@ -74,8 +76,9 @@
       .map(s => s.replace(/^https?:\/\//, "").split("/")[0].replace(/\.$/, ""))
   );
   const isHttp = u => /^https?:\/\//i.test(u);
-  // Parity with content.js (KEEP IN SYNC): favicons/.ico/.svg and known ad/tracking URLs.
-  const SKIP_URL_RE = /favicon|\.(?:ico|svg)(?:[?#]|$)/i;
+  // Parity with content.js (KEEP IN SYNC): favicons/.ico and known ad/tracking
+  // URLs. SVG remains eligible because image/svg+xml is a detected image type.
+  const SKIP_URL_RE = /favicon|\.ico(?:[?#]|$)/i;
   // prehook.js runs in the page's MAIN world while content.js runs in the
   // extension's isolated world, so JS objects cannot be shared between them.
   // Elements whose proxy load failed are flagged with a DOM attribute that
@@ -108,8 +111,6 @@
     pageExcluded = excludedHost(pageHost);
     ready = true;
   }
-
-  const sameOpts = (a, b) => !!a && !!b && Object.keys(defaults).every(k => a[k] === b[k]);
 
   function buildProxyUrl(orig) {
     if (!proxyConfig || !proxyConfig.base || !isHttp(orig)) return orig;

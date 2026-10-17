@@ -18,7 +18,7 @@ The extension is intentionally **proxy-agnostic**: it does not require a built-i
 - Configurable quality, grayscale, maximum width, and excluded domains.
 - Local settings mirror for fast content-script startup.
 - Usage statistics collected from proxy response headers by the service worker.
-- CSP response-header handling through Declarative Net Request.
+- CSP response-header handling and `Save-Data: on` request-header injection through Declarative Net Request.
 - Reproducible deterministic build.
 
 ## Important extension architecture fix
@@ -83,7 +83,7 @@ Guardian does not proxy URLs that are not appropriate image candidates, includin
 - already-proxied URLs
 - configured excluded domains and their subdomains
 - favicons
-- `.ico` and `.svg` resources
+- `.ico` resources
 - known advertising/tracking/pixel URL patterns
 - invalid or unsupported URLs
 
@@ -132,6 +132,7 @@ Fresh-install defaults are:
 | Setting | Default |
 |---|---:|
 | Enabled | `true` |
+| Save-Data request header | `true` |
 | Proxy URL | empty — must be configured |
 | Quality | `60` |
 | Grayscale | `true` |
@@ -168,13 +169,25 @@ The toolbar popup can also exclude or re-include the current website.
 
 The Options page reports:
 
-- **Images** — completed successful proxy image responses counted by the service worker.
+- **Images** — completed successful proxy image responses with an allowed detected image media type counted by the service worker.
 - **Proxy bytes** — estimated bytes delivered by the configured proxy.
 - **Data saved** — estimated bytes saved compared with the original image size when the proxy supplies the required size information.
 
-Statistics are collected from `webRequest.onCompleted` response headers. Cached responses are excluded, and only successful HTTP 2xx image responses matching the configured proxy origin are counted.
+Statistics are collected from `webRequest.onCompleted` response headers. Cached responses are excluded. Only successful HTTP 2xx responses from the configured proxy origin with one of the following detected image media types are counted:
 
-The service worker understands these header families, preferring the `x-bh-*` names and supporting legacy names:
+| Detected type | `Content-Type` |
+|---|---|
+| JPEG | `image/jpeg` |
+| PNG | `image/png` |
+| WebP | `image/webp` |
+| GIF | `image/gif` |
+| TIFF | `image/tiff` |
+| JPEG XL | `image/jxl` |
+| SVG | `image/svg+xml` |
+
+Media-type parameters such as `charset=utf-8` are ignored when identifying the type. Other image classifications, including AVIF, ICO, BMP, and opaque binary responses, are not counted.
+
+The service worker understands these response-size header families, preferring the `x-bh-*` names and supporting legacy names:
 
 ```text
 x-bh-compressed-size   / x-compressed-size
@@ -184,7 +197,7 @@ x-bh-bytes-saved       / x-bytes-saved
 
 If compressed size is not provided, `Content-Length` can be used as a fallback. If the proxy does not provide usable size headers, the corresponding statistics may remain `0` or be less complete.
 
-Statistics are stored in `storage.local` and written in batches (750 ms) rather than once for every image response.
+Statistics are stored in `storage.local` and written in batches (750 ms) rather than once for every image response. A pending delta is mirrored to a scratch `statsPending` key so it survives an MV3 worker kill; the scratch key is overwritten with the current in-memory delta at commit time (never blindly cleared) so a delta recorded mid-flush cannot lose its crash-recovery mirror.
 
 ### Resetting statistics
 
@@ -282,7 +295,7 @@ Handles:
 
 - `storage.sync` → `storage.local` settings mirroring;
 - missing-setting initialization;
-- CSP response-header rules through Declarative Net Request;
+- CSP response-header removal and `Save-Data: on` request-header injection through Declarative Net Request (the Save-Data rule always carries `urlFilter: "*"` so its condition is never an empty object, which Chromium DNR validators reject);
 - enabled/disabled extension icon state;
 - proxy response-header statistics; and
 - batched local statistics writes.
@@ -328,6 +341,7 @@ bandwidth-guardian/
 ├── _locales/en/messages.json
 ├── build.sh
 ├── LICENSE
+├── CHANGELOG.md
 └── README.md
 ```
 
@@ -337,7 +351,7 @@ bandwidth-guardian/
 |---|---|
 | `storage` | Store settings and local usage statistics |
 | `tabs` | Reload tabs after relevant settings changes |
-| `declarativeNetRequestWithHostAccess` | Manage CSP response-header handling |
+| `declarativeNetRequestWithHostAccess` | Strip CSP response headers so proxied images can load, and inject the `Save-Data: on` request header |
 | `webRequest` | Read proxy response headers for usage statistics |
 | `<all_urls>` host access | Process eligible images on web pages |
 
@@ -383,6 +397,37 @@ https://github.com/anT0ny54/bandwidth-guardian
 Proxy example:
 
 https://github.com/anT0ny54/bhp2
+
+## 🔗 Related projects (not part of this repository)
+
+The services below are maintained separately and are **not** part of this repository, its build pipeline, or its release cycle. They are listed here for convenience only.
+
+### 🌐 Free DNS Services
+
+High-performance DNS utilizing HaGeZi Blocklists (Multi Pro + TIF).
+
+| Blocklist | DNS-over-HTTPS (DoH) |
+| :--- | :--- |
+| Multi Pro + TIF | `https://freedns.koyeb.app/dns-query` (Recommended) |
+| Multi Pro + TIF | `https://dns.mydoh.workers.dev/dns-query` (Recommended) |
+| Multi Pro + TIF | `https://dns-pi.vercel.app/api/doh/dns-query` (Recommended) |
+| Multi Pro + TIF | `https://dnssix.netlify.app/api/doh/dns-query` |
+| Multi Pro + TIF | `https://dns-93aca.containers.snapdeploy.app/dns-query` |
+| Multi Pro + TIF | `https://doh-93aca.containers.snapdeploy.app/dns-query` |
+
+### ⚡ Bandwidth Hero Server
+
+A lightweight image optimization proxy designed to slash bandwidth usage and accelerate web browsing.
+
+Bandwidth Hero Server fetches remote images, compresses them on the fly, and delivers optimized versions to the client. This significantly reduces data consumption while improving page load performance.
+
+🖥️ **Live Demo:** [Bandwidth Hero](https://bhserv.netlify.app/).
+
+## Supporting the Project
+
+If you find this project useful, donations are appreciated:
+
+- **Bitcoin**: `1HntwKxyqGCfnSGvGLMUTRAqLnTvLarAQP`
 
 ## License
 
