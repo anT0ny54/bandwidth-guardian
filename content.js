@@ -2,27 +2,23 @@
 //
 // ══ ARCHITECTURE ══════════════════════════════════════════════════════════════
 //
-//  Image interception is split across two layers:
+// Layer 1 — prehook.js (document_start, page MAIN world)
+//   Patches image URL setters before the HTML parser runs, so JS-assigned image
+//   URLs (including lazy-loader assignments) are proxied before a request fires.
+//   Lazy data-* values are not rewritten in advance: they can contain templates
+//   (for example, lazysizes {width}) and are only meaningful when the page's
+//   loader promotes them to a real src/srcset URL.
 //
-//  Layer 1 — prehook.js (document_start, page MAIN world)
-//    Patches the image URL setters before the HTML parser runs, so JS-assigned
-//    URLs are proxied before any network request fires. Every lazy loader
-//    (lazysizes, lozad, …) assigns via img.src = dataset.src in the MAIN world,
-//    so those URLs pass through prehook too — there is deliberately NO
-//    lazy-attribute pre-proxying here (that used to break templated URLs like
-//    lazysizes {width} and left pre-proxied images without a fallback).
+// Layer 2 — THIS FILE (document_start, isolated world, async after storage)
+//   Catches what prehook cannot:
+//   A) HTML-parser-created <img>/<source> nodes — the C++ parser bypasses JS
+//      setters; rewriting cancels the in-flight original request.
+//   B) Inline CSS background-image via el.style.backgroundImage.
+//   Parser-created <link rel=preload as=image> hrefs are handled by prehook's
+//   MutationObserver (registered first), so no preload handling is needed here.
 //
-//  Layer 2 — THIS FILE (document_start, isolated world, async after storage)
-//    Catches what prehook cannot:
-//    A) HTML-parsed <img src>/<source srcset> — the C++ parser bypasses the
-//       JS setters; rewriting cancels the in-flight original request.
-//    B) Inline CSS background-image via el.style.backgroundImage.
-//    Parser-created <link rel=preload as=image> hrefs are handled by prehook's
-//    MutationObserver (registered first), so no preload handling is needed
-//    here either.
-//
-//  The old DNR regexSubstitution redirect was removed because DNR cannot
-//  encodeURIComponent the captured URL; content scripts can.
+// The old DNR regexSubstitution redirect was removed because DNR cannot
+// encodeURIComponent the captured URL; content scripts can.
 // ══════════════════════════════════════════════════════════════════════════════
 
 (function () {
@@ -61,10 +57,24 @@
   }
 
   // Anchored tracking-pixel patterns (B13). KEEP IN SYNC with prehook.js.
-  const TRACKING_RE = /(?:\/|\.)pagead(?:[/?#]|$)|(?:pixel|cleardot)\.*\.(?:gif|jpe?g)(?:[?#]|$)|google\.[a-z.]+\/(?:ads|generate_204|.*\/log204)(?:[?#]|$)|google-analytics\.[a-z.]+\/(?:r|collect)(?:[?#]|$)|youtube\.[a-z.]+\/(?:api|ptracking|player_204|live_204)(?:[?#]|$)|doubleclick\.[a-z.]+\/(?:pcs|pixel|r)(?:[?#]|$)|googlesyndication\.[a-z.]+\/ddm(?:[?#]|$)|pixel\.facebook\.[a-z.]+|facebook\.[a-z.]+\/(?:tr|impression\.php)(?:[?#]|$)|ad\.bitmedia\.io(?:[/?#]|$)|yahoo\.[a-z.]+\/pixel(?:[?#]|$)|criteo\.net\/img(?:[?#]|$)|ad\.doubleclick\.net(?:[?#]|$)/i;
+  const TRACKING_RE = /(?:\/|\.)pagead(?:[/?#]|$)|(?:pixel|cleardot)\.*\.(?:gif|jpe?g)(?:[?#]|$)|google\.[a-z.]+\/(?:ads|generate_204|.*\/log204)(?:[?#]|$)|google-analytics\.[a-z.]+\/(?:r|collect)(?:[?#]|$)|youtube\.[a-z.]+\/(?:api|ptracking|player_204|live_204)(?:[?#]|$)|doubleclick\.[a-z.]+\/(?:pcs|pixel|r)(?:[?#]|$)|googlesyndication\.[a-z.]+\/ddm(?:[?#]|$)|pixel\.facebook\.[a-z.]+|facebook\.[a-z.]+\/(?:tr|impression\.php)(?:[?#]|$)|ad\.bitmedia\.io(?:[/?#]|$)|yahoo\.[a-z.]+\/pixel(?:[?#]|$)|criteo\.net\/img(?:[?#]|$)|ad\.doubleclick\.net(?:[/?#]|$)/i;
 
   // Favicons, .ico and .svg are never proxied.
   const SKIP_URL_RE = /favicon|\.(?:ico|svg)(?:[?#]|$)/i;
+
+  // Known lazy-loader attributes. These are signals only: their values are
+  // never changed or proxied directly. The loader's eventual src/srcset write
+  // is intercepted by prehook, after any template tokens have been resolved.
+  const DEFERRED_SOURCE_ATTRS = [
+    "data-src", "data-srcset", "data-lazy-src", "data-lazy-srcset",
+    "data-original", "data-original-src", "data-original-set",
+    "data-image-src", "data-image-srcset", "data-bg", "data-bgset"
+  ];
+  const DEFERRED_URL_ATTRS = {
+    src: ["data-src", "data-lazy-src", "data-original", "data-original-src", "data-image-src"],
+    srcset: ["data-srcset", "data-lazy-srcset", "data-original-set", "data-image-srcset"]
+  };
+  const TEMPLATE_SOURCE_RE = /(?:\$\{[^}]*\}|\{\{?[^}]*\}\}?|%7b[^%]*%7d|__[^_\s]+__)/i;
 
   let opts = null;
   let active = false; // enabled && proxyBase set && !pageExcluded (O1)
@@ -202,6 +212,39 @@
     return out;
   }
 
+  function hasCustomLazySource(el) {
+    return DEFERRED_SOURCE_ATTRS.some(name => {
+      const value = el.getAttribute(name);
+      return typeof value === "string" && value.trim() !== "";
+    });
+  }
+
+  // Return true when an unresolved/custom lazy source should take precedence
+  // over the active src/srcset. This lets us leave a placeholder alone but
+  // still lets prehook proxy the real URL as soon as the site promotes it.
+  // Template values are signals only and are never rewritten.
+  function hasDeferredLazySource(el, kind) {
+    const current = el.getAttribute(kind) || "";
+    const currentUrls = kind === "src"
+      ? new Set([resolveHttp(current)].filter(Boolean))
+      : new Set(parseSrcset(current).map(({ url }) => resolveHttp(url)).filter(Boolean));
+    for (const name of DEFERRED_URL_ATTRS[kind] || []) {
+      const value = String(el.getAttribute(name) || "").trim();
+      if (!value) continue;
+      // The presence of an unresolved template is enough to identify a
+      // placeholder-backed image. Leave the active placeholder untouched;
+      // the site loader will resolve the template before assigning src/srcset.
+      if (TEMPLATE_SOURCE_RE.test(value)) return true;
+      const candidateUrls = kind === "src"
+        ? [resolveHttp(value)]
+        : parseSrcset(value).map(({ url }) => resolveHttp(url));
+      for (const candidate of candidateUrls) {
+        if (candidate && !currentUrls.has(candidate)) return true;
+      }
+    }
+    return false;
+  }
+
   function rewriteSrcsetValue(ss, el) {
     const cached = srcsetCache.get(el);
     if (cached && (cached.input === ss || cached.output === ss)) return cached.output;
@@ -260,14 +303,18 @@
     if (!el || doneImg.has(el) || failedEls.has(el)) return;
     if (!active) return; // R6: single active gate (shouldSkip checks it too)
 
-    // The HTML parser sets loading natively, bypassing prehook's patch.
-    if (el.tagName === "IMG" && !el.hasAttribute("loading")) {
+    // Respect site-owned lazy loaders. For these elements, do not inject native
+    // loading=lazy or proxy the placeholder src/srcset while a separate concrete
+    // data-* candidate is waiting to be promoted. The MAIN-world hook still
+    // intercepts the resolved src/srcset assignment when the loader runs.
+    const customLazy = hasCustomLazySource(el);
+    if (el.tagName === "IMG" && !el.hasAttribute("loading") && !customLazy) {
       el.setAttribute("loading", "lazy");
     }
 
     let rewrote = false;
 
-    if (el.tagName === "IMG") {
+    if (el.tagName === "IMG" && !hasDeferredLazySource(el, "src")) {
       const src = el.getAttribute("src");
       const absoluteSrc = src ? resolveHttp(src) : null;
       if (absoluteSrc && !shouldSkip(absoluteSrc) && nativeImgSrcSetter) {
@@ -277,7 +324,7 @@
       }
     }
 
-    if (el.tagName === "IMG" || el.tagName === "SOURCE") {
+    if ((el.tagName === "IMG" || el.tagName === "SOURCE") && !hasDeferredLazySource(el, "srcset")) {
       const ss = el.getAttribute("srcset");
       if (ss) {
         const output = rewriteSrcsetValue(ss, el);
@@ -299,7 +346,7 @@
     const bg = el.style.backgroundImage;
     if (!bg) return;
 
-    const urlRe = /url\(\s*(?:(["'])(.*?)\1|([^)]*?))\s*\)/gi;
+    const urlRe = /url\(\s*(?:(['"])(.*?)\1|([^)]*?))\s*\)/gi;
     let touched = false;
     const output = bg.replace(urlRe, (full, quote, quoted, bare) => {
       const raw = String(quote ? quoted : bare || "").trim();
@@ -378,7 +425,7 @@
       processCandidate(root);
       root.querySelectorAll(CANDIDATE_SELECTOR).forEach(processCandidate);
       // #17: style-attribute candidates from THIS batch only (R5: nodeType is
-      // always 1 here — it was filtered on push — so no re-checks needed).
+      // always 1 here — it was filtered on push — so no re-checks are needed).
       if (root.hasAttribute("style") && String(root.getAttribute("style")).includes("url(")) {
         rewriteBg(root);
       }
@@ -434,7 +481,8 @@
         attributes:      true,
         // href/rel/as omitted (see review C1): prehook intercepts page-driven
         // preload changes in the MAIN world; parser-created links arrive via
-        // childList. Lazy attributes were removed with rewriteLazy (R1).
+        // childList. Lazy attributes are intentionally not rewritten; actual
+        // src/srcset promotion is caught by prehook (R1 compatibility fix).
         attributeFilter: ["src", "srcset", "style"]
       });
     } catch {}

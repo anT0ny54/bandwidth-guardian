@@ -16,8 +16,6 @@ const excludeBtn  = $("excludeBtn");
 const settingsBtn = $("settingsBtn");
 const presetBtns  = Array.from(document.querySelectorAll("#qualityPresets .preset"));
 
-const PRESETS = [45, 60, 80];
-
 let state = { ...DEFAULTS };
 let currentHost  = "";
 let currentIsWeb = false;
@@ -27,7 +25,7 @@ let currentTabId = null;
 
 function parseDomains(text) {
   return String(text || "")
-    .split(/[,\s]+/)
+    .split(/[ ,\s]+/)
     .map(s => s.trim().toLowerCase()).filter(Boolean)
     .map(s => s.replace(/^https?:\/\//, "").split("/")[0].replace(/\.$/, ""));
 }
@@ -93,7 +91,7 @@ async function load() {
 }
 load();
 
-// ── Enable toggle ─────────────────────────────────────────────────────────────
+// ── Enable toggle ────────────────────────────────────────────────────────────
 
 enabledEl.addEventListener("change", async () => {
   const enabled = enabledEl.checked;
@@ -181,7 +179,7 @@ async function loadSiteUI(d) {
   }
 }
 
-// ── Exclude / re-include current site ────────────────────────────────────────
+// ── Exclude / re-include current site ─────────────────────────────────────────
 
 excludeBtn.addEventListener("click", async () => {
   if (!currentIsWeb || !currentHost) return;
