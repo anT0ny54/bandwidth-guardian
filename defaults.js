@@ -1,11 +1,7 @@
 // Bandwidth Guardian — shared defaults
 // Imported as an ES module by popup.js and options.js only.
-// service-worker.js, content.js and prehook.js inline a copy of DEFAULTS
-// (classic scripts can't import) — search "KEEP IN SYNC" when changing a key.
-//
-// Defaults mirror the original extension (ayastreb/bandwidth-hero):
-//   convertBw: true  → grayscale: true
-//   compressionLevel: 60 → quality: 60
+// service-worker.js and content.js inline copies of DEFAULTS and
+// IMAGE_CONTENT_TYPES (classic scripts can't import) — search "KEEP IN SYNC".
 
 export const DEFAULTS = {
   enabled:        true,
@@ -16,3 +12,7 @@ export const DEFAULTS = {
   maxWidth:       768,   // 0 = no limit; MV3-specific addition
   excludeDomains: "",
 };
+
+// STRICT detected image types: a proxy response is only ever accounted (and
+// treated as an image result) when its Content-Type is one of these.
+export const IMAGE_CONTENT_TYPES = ["image/jpeg", "image/png", "image/webp", "image/gif", "image/tiff", "image/jxl"];

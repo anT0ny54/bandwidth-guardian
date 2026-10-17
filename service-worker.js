@@ -1,24 +1,16 @@
-// Bandwidth Guardian — service worker
-// Save-Data request-header behavior adapted from Daniel Aleksandersen's
-// Save-Data WebExtension (GPL-3.0). See LICENSE-GPL-3.0.
+// Bandwidth Guardian — service worker (Chrome / Chromium-based browsers only)
+//
+// Save-Data is injected with a DNR modifyHeaders rule — the MV3 replacement
+// for webRequestBlocking. This implementation is original to this project.
 //
 // ══ WHY DNR RULE 1 (image redirect) WAS REMOVED ══════════════════════════════
-//
 //  Chrome's DNR regexSubstitution inserts the captured URL RAW — there is no
-//  way to call encodeURIComponent on it. So for any image URL that contains
-//  query parameters the substitution produces a malformed proxy URL:
-//
-//    Original URL:  https://tvguide.com/img/photo.jpg?auto=webp&width=1092
-//    DNR cannot safely encode the captured source URL for its replacement.
-//
-//  Image src rewriting is therefore done in the content scripts, which CAN call
-//  encodeURIComponent. DNR Rule 2 (CSP header stripping) is kept.
-//
+//  way to call encodeURIComponent on it, so any image URL with query params
+//  produces a malformed proxy URL. Image src rewriting is done in the content
+//  scripts instead. DNR Rule 2 (CSP) and Rule 3 (Save-Data) remain.
 // ══════════════════════════════════════════════════════════════════════════════
 
-// Kiwi/Cromite do not support ES module service workers ("type": "module"),
-// so DEFAULTS is inlined here rather than imported from defaults.js.
-// KEEP IN SYNC with defaults.js, prehook.js and content.js.
+// KEEP IN SYNC with defaults.js.
 const DEFAULTS = {
   enabled:         true,
   saveData:        true,
@@ -28,11 +20,17 @@ const DEFAULTS = {
   maxWidth:        768,
   excludeDomains:  "",
 };
+// STRICT detected image types (KEEP IN SYNC with defaults.js).
+const IMAGE_CONTENT_TYPES = new Set(["image/jpeg", "image/png", "image/webp", "image/gif", "image/tiff", "image/jxl"]);
+const ZERO_STATS = { filesProcessed: 0, bytesProcessed: 0, bytesSaved: 0 };
+
 const sameOpts = (a, b) => !!a && !!b && Object.keys(DEFAULTS).every(k => a[k] === b[k]);
 
-const RULE_ID_CSP      = 2;  // strips CSP headers so proxy images can load
-const RULE_ID_SAVE_DATA = 3; // adds Save-Data: on to requests
-const ALL_RULE_IDS     = [RULE_ID_CSP, RULE_ID_SAVE_DATA];
+// Rule 1 is retired but kept in removeRuleIds so very old installs lose the
+// legacy redirect rule (O9). Rule 2 strips CSP; Rule 3 adds Save-Data.
+const RULE_ID_CSP       = 2;
+const RULE_ID_SAVE_DATA = 3;
+const ALL_RULE_IDS      = [1, RULE_ID_CSP, RULE_ID_SAVE_DATA];
 
 // ── Concurrency guard ─────────────────────────────────────────────────────────
 let refreshing     = false;
@@ -40,7 +38,8 @@ let pendingRefresh = false;
 let configuredProxyOrigin = "";
 
 function setProxyOrigin(base) {
-  try { configuredProxyOrigin = new URL(String(base || "").trim()).origin; } catch { configuredProxyOrigin = ""; }
+  try { configuredProxyOrigin = new URL(String(base || "").trim()).origin; }
+  catch { configuredProxyOrigin = ""; }
 }
 
 function refreshRules() {
@@ -48,23 +47,25 @@ function refreshRules() {
   refreshing = true;
   doRefreshRules(function() {
     refreshing = false;
-    if (pendingRefresh) {
-      pendingRefresh = false;
-      refreshRules();
-    }
+    if (pendingRefresh) { pendingRefresh = false; refreshRules(); }
   });
 }
 
 // ── Local settings mirror ─────────────────────────────────────────────────────
-// Content scripts read from storage.local (key "bhOpts") rather than
-// storage.sync. Local reads take ~5 ms vs ~30-80 ms for sync — every ms saved
-// here is a window where the browser might start fetching an original image
-// before prehook can intercept it. The service worker keeps bhOpts current.
+// The service worker is the SOLE writer of the bhOpts mirror (B4): every
+// content script writing it on each sync change produced O(tabs × frames)
+// write/event storms and could clobber the mirror with stale partial state.
 function mirrorToLocal() {
   chrome.storage.sync.get(DEFAULTS, opts => {
     setProxyOrigin(opts.proxyBase);
-    // Only write when different: the worker wakes often, and every write makes
-    // every open tab rebuild its caches via storage.onChanged.
+    // B9: stats events that arrived before the origin was known are queued.
+    if (configuredProxyOrigin && earlyStatsEvents.length) {
+      const queued = earlyStatsEvents.splice(0);
+      queued.forEach(handleProxyCompleted);
+    }
+    updateWebRequestListener(configuredProxyOrigin);
+    // Only write when different: every write makes every open tab rebuild
+    // its caches via storage.onChanged.
     chrome.storage.local.get({ bhOpts: null }, d => {
       if (!sameOpts(d.bhOpts, opts)) chrome.storage.local.set({ bhOpts: opts });
     });
@@ -74,12 +75,6 @@ function mirrorToLocal() {
 // ── Lifecycle ─────────────────────────────────────────────────────────────────
 
 chrome.runtime.onInstalled.addListener(function() {
-  // Top-level mirrorToLocal()/refreshRules()/updateIcon() already ran on this
-  // same worker start; only seed missing sync keys here. Any resulting change
-  // fires storage.onChanged, which refreshes the local mirror.
-  // NOTE: get(null), not get(DEFAULTS, ...) — the latter merges defaults into
-  // the result, making every key "present" and the follow-up set unconditional
-  // (a redundant write + mirror/rules/icon refresh cascade on every install).
   chrome.storage.sync.get(null, function(all) {
     all = all || {};
     var missing = {};
@@ -91,7 +86,8 @@ chrome.runtime.onInstalled.addListener(function() {
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== "sync") return;
   mirrorToLocal();
-  if ("enabled" in changes || "saveData" in changes || "excludeDomains" in changes) refreshRules();
+  // B1: proxyBase gates the CSP rule, so rule refresh must trigger on it too.
+  if ("enabled" in changes || "saveData" in changes || "excludeDomains" in changes || "proxyBase" in changes) refreshRules();
   if ("enabled" in changes) updateIcon();
 });
 
@@ -115,29 +111,24 @@ function updateIcon() {
 }
 
 // ── Stats ─────────────────────────────────────────────────────────────────────
-// Count statistics (images, received bytes, saved bytes) from the configured
-// proxy's completed network response.
-// bhp2 returns x-bh-compressed-size (the exact response-body size), plus the
-// legacy x-compressed-size / x-original-size / x-bytes-saved headers.
-function getHeaderInt(headers, name) {
+function getHeaderValue(headers, name) {
   if (!Array.isArray(headers)) return null;
   const wanted = String(name).toLowerCase();
-  const h = headers.find(h => String(h.name || "").toLowerCase() === wanted);
-  if (!h) return null;
-  const n = Number.parseInt(String(h.value || ""), 10);
+  const h = headers.find(x => String(x.name || "").toLowerCase() === wanted);
+  return h ? String(h.value ?? "") : null;
+}
+function getHeaderInt(headers, name) {
+  const v = getHeaderValue(headers, name);
+  if (v === null) return null;
+  const n = Number.parseInt(v, 10);
   return Number.isFinite(n) && n >= 0 ? n : null;
 }
 
-function proxyOriginMatches(url) {
-  if (!configuredProxyOrigin) return false;
-  try { return new URL(String(url || "")).origin === configuredProxyOrigin; }
-  catch { return false; }
-}
-
 function isGuardianProxyUrl(url) {
+  if (!configuredProxyOrigin) return false;
   try {
     const u = new URL(String(url || ""));
-    return proxyOriginMatches(u.href) && u.searchParams.has("url");
+    return u.origin === configuredProxyOrigin && u.searchParams.has("url"); // R9: parse once
   } catch { return false; }
 }
 
@@ -150,43 +141,39 @@ function getProxyResponseStats(responseHeaders) {
     getHeaderInt(responseHeaders, "x-bytes-saved");
 
   let received = compressed;
-  // `known` tracks whether `received` reflects an actual measurement. Without
-  // it, the content-length fallback (?? 0) made saved = original - 0, i.e. the
-  // ENTIRE image size was reported as saved even when the proxy sent no
-  // size headers at all — a misleading statistic (#22).
   let known = received !== null;
   if (!known && original !== null && savedHeader !== null) {
     received = Math.max(0, original - Math.min(savedHeader, original));
     known = true;
   }
+  // Note: without "extraHeaders", Chromium may withhold Content-Length on
+  // responses; the proxy's x-bh-compressed-size header is authoritative.
   if (!known) received = getHeaderInt(responseHeaders, "content-length") ?? 0;
 
   let saved = savedHeader;
   if (saved === null) saved = known && original !== null ? Math.max(0, original - received) : 0;
-
   return { received, saved };
 }
 
 let pendingStats = { filesProcessed: 0, bytesProcessed: 0, bytesSaved: 0 };
 let statsFlushTimer = null;
 let statsFlushInProgress = false;
+let statsMirrorTimer = null;
 
 function flushStats() {
-  if (statsFlushInProgress || (!pendingStats.filesProcessed && !pendingStats.bytesProcessed && !pendingStats.bytesSaved)) return;
+  if (statsFlushInProgress) { scheduleStatsFlush(); return; }
+  if (!pendingStats.filesProcessed && !pendingStats.bytesProcessed && !pendingStats.bytesSaved) return;
   statsFlushInProgress = true;
   const delta = pendingStats;
   pendingStats = { filesProcessed: 0, bytesProcessed: 0, bytesSaved: 0 };
-  // #6: clear the crash-recovery mirror now that the delta is committed.
-  try { chrome.storage.local.set({ statsPending: pendingStats }); } catch {}
-  chrome.storage.local.get({ stats: { filesProcessed: 0, bytesProcessed: 0, bytesSaved: 0 } }, d => {
-    const s = d.stats || { filesProcessed: 0, bytesProcessed: 0, bytesSaved: 0 };
-    s.filesProcessed = Number(s.filesProcessed) || 0;
-    s.bytesProcessed = Number(s.bytesProcessed) || 0;
-    s.bytesSaved     = Number(s.bytesSaved) || 0;
+  chrome.storage.local.get({ stats: ZERO_STATS }, d => {
+    const s = d.stats || ZERO_STATS;
     s.filesProcessed += delta.filesProcessed;
     s.bytesProcessed += delta.bytesProcessed;
     s.bytesSaved     += delta.bytesSaved;
-    chrome.storage.local.set({ stats: s }, () => {
+    // B8: commit stats and clear the crash mirror in ONE atomic write — a
+    // worker kill between two writes can no longer strand the delta.
+    chrome.storage.local.set({ stats: s, statsPending: ZERO_STATS }, () => {
       statsFlushInProgress = false;
       if (pendingStats.filesProcessed || pendingStats.bytesProcessed || pendingStats.bytesSaved) scheduleStatsFlush();
     });
@@ -195,138 +182,154 @@ function flushStats() {
 
 function scheduleStatsFlush() {
   if (statsFlushTimer) return;
-  statsFlushTimer = setTimeout(() => {
-    statsFlushTimer = null;
-    flushStats();
-  }, 750);
+  statsFlushTimer = setTimeout(() => { statsFlushTimer = null; flushStats(); }, 750);
+}
+
+function mirrorPendingStats() {
+  if (statsMirrorTimer) return; // O2: crash mirror is throttled to ≤1 write/sec
+  statsMirrorTimer = setTimeout(() => {
+    statsMirrorTimer = null;
+    if (pendingStats.filesProcessed || pendingStats.bytesProcessed || pendingStats.bytesSaved) {
+      try { chrome.storage.local.set({ statsPending: pendingStats }); } catch {}
+    }
+  }, 1000);
 }
 
 function recordStats(bytes, saved) {
   pendingStats.filesProcessed += 1;
   pendingStats.bytesProcessed += Math.max(0, Number(bytes) || 0);
   pendingStats.bytesSaved     += Math.max(0, Number(saved) || 0);
-  // #6: MV3 workers can be killed at any moment between record and flush.
-  // Mirror the pending delta to storage.local so the stats survive worker
-  // termination; flushStats clears the scratch key once committed.
-  try { chrome.storage.local.set({ statsPending: pendingStats }); } catch {}
+  mirrorPendingStats(); // #6: MV3 workers can be killed before flushStats runs
   scheduleStatsFlush();
 }
 
-// #6: recover stats stranded by a worker killed between recordStats() and
-// flushStats(), then drop the scratch key.
-chrome.storage.local.get({ statsPending: null }, d => {
+// Startup recovery: merge a stranded crash mirror into stats atomically. The
+// single get of both keys avoids deleting a newer mirror written between the
+// read and the remove (B8 related race).
+chrome.storage.local.get({ stats: ZERO_STATS, statsPending: null }, d => {
   const p = d.statsPending;
-  if (p) try { chrome.storage.local.remove("statsPending"); } catch {}
-  const files = Number(p?.filesProcessed) || 0;
-  const bytes = Math.max(0, Number(p?.bytesProcessed) || 0);
-  const saved = Math.max(0, Number(p?.bytesSaved) || 0);
-  if (!files && !bytes && !saved) return;
-  pendingStats.filesProcessed += files;
-  pendingStats.bytesProcessed += bytes;
-  pendingStats.bytesSaved     += saved;
-  scheduleStatsFlush();
+  if (!p) return;
+  const files = Number(p.filesProcessed) || 0;
+  const bytes = Math.max(0, Number(p.bytesProcessed) || 0);
+  const saved = Math.max(0, Number(p.bytesSaved) || 0);
+  if (!files && !bytes && !saved) { try { chrome.storage.local.remove("statsPending"); } catch {}; return; }
+  const s = d.stats || ZERO_STATS;
+  s.filesProcessed += files;
+  s.bytesProcessed += bytes;
+  s.bytesSaved     += saved;
+  chrome.storage.local.set({ stats: s, statsPending: ZERO_STATS }, () => {
+    // If recordStats() ran while we were reading, re-mirror the fresh delta.
+    if (pendingStats.filesProcessed || pendingStats.bytesProcessed || pendingStats.bytesSaved) mirrorPendingStats();
+  });
 });
 
-// Observe completed image requests and read the response headers.
-// `types: ["image"]` limits listener overhead to image responses only.
-// `extraHeaders` makes the response-header event available consistently on
-// Chromium implementations that gate response headers.
-if (chrome.webRequest) {
-  chrome.webRequest.onCompleted.addListener(
-    onProxyCompleted,
-    { urls: ["<all_urls>"], types: ["image"] },
-    ["responseHeaders", "extraHeaders"]
-  );
+// Observe completed image responses, narrowed to the configured proxy origin
+// (O3) and re-registered whenever proxyBase changes. "extraHeaders" is dropped:
+// custom x-bh-* headers don't need it, and Firefox (which rejects it) is no
+// longer a target (B10).
+let webRequestRegistered = false;
+function updateWebRequestListener(origin) {
+  if (!chrome.webRequest || typeof chrome.webRequest.onCompleted !== "object") return;
+  try {
+    if (webRequestRegistered) chrome.webRequest.onCompleted.removeListener(onProxyCompleted);
+  } catch {}
+  const urls = origin ? [origin + "/*"] : ["https://bandwidth-guardian.invalid/*"]; // never matches
+  try {
+    chrome.webRequest.onCompleted.addListener(
+      onProxyCompleted,
+      { urls: urls, types: ["image"] },
+      ["responseHeaders"]
+    );
+    webRequestRegistered = true;
+  } catch {}
+}
+updateWebRequestListener("");
+
+// B9: events can wake the worker before the async origin lookup finishes.
+const earlyStatsEvents = [];
+function onProxyCompleted(details) {
+  if (!configuredProxyOrigin) {
+    if (earlyStatsEvents.length < 500) earlyStatsEvents.push(details);
+    return;
+  }
+  handleProxyCompleted(details);
 }
 
-function onProxyCompleted(details) {
+function handleProxyCompleted(details) {
   const { url, responseHeaders, fromCache, statusCode } = details || {};
   if (!url || fromCache) return;
   if (typeof statusCode === "number" && (statusCode < 200 || statusCode >= 300)) return;
-  if (!configuredProxyOrigin || !isGuardianProxyUrl(url)) return;
+  if (!isGuardianProxyUrl(url)) return;
 
-  // A successful Guardian proxy response is one processed image. The proxy's
-  // compressed-size header is authoritative for the bytes actually delivered;
-  // original-minus-delivered gives the bytes saved vs. fetching directly.
+  // STRICT detected image types only: count the response only when its actual
+  // Content-Type is one of the supported image types.
+  const contentType = (getHeaderValue(responseHeaders, "content-type") || "")
+    .split(";")[0].trim().toLowerCase();
+  if (!IMAGE_CONTENT_TYPES.has(contentType)) return;
+
   const st = getProxyResponseStats(responseHeaders);
   recordStats(st.received, st.saved);
 }
 
 // ── DNR rules ─────────────────────────────────────────────────────────────────
-// Only Rule 2 (CSP stripping) and Rule 3 (Save-Data) are active. The old
-// Rule 1 (redirect) was removed and its cleanup retired — see top-of-file.
-//
-// Uses callback form throughout — the Promise-returning form of chrome APIs
-// (e.g. await chrome.storage.sync.get()) is not available in classic
-// (non-module) service workers on Kiwi/Cromite and causes Status code: 2.
+function buildRules(opts, noHeaderMatch) {
+  // DNR rejects the whole update on an invalid domain — pass only valid hosts.
+  var excluded = String(opts.excludeDomains || "").split(/[,\s]+/)
+    .map(function(s) { return s.trim().toLowerCase().replace(/^https?:\/\//, "").split("/")[0].replace(/\.$/, ""); })
+    .filter(function(s) { return /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$/.test(s); });
+  var excludedDomains = Array.from(new Set(excluded));
+  var addRules = [];
+
+  // B1: CSP is stripped ONLY when a usable proxy is configured. Chrome 128+
+  // DNR response-header matching narrows the rule to documents whose CSP
+  // actually contains img-src/default-src (falls back to the broad rule on
+  // older Chromium). Report-only CSP is left alone (R15): it blocks nothing.
+  var proxyOk = false;
+  try { proxyOk = /^https?:$/.test(new URL(String(opts.proxyBase || "").trim()).protocol); } catch (e) { proxyOk = false; }
+  if (opts.enabled && proxyOk) {
+    var cspCondition = { resourceTypes: ["main_frame", "sub_frame"] };
+    if (!noHeaderMatch) {
+      cspCondition.responseHeaders = [{ name: "content-security-policy", values: ["/img-src/i", "/default-src/i"] }];
+    }
+    if (excludedDomains.length) cspCondition.excludedRequestDomains = excludedDomains;
+    addRules.push({
+      id: RULE_ID_CSP,
+      priority: 1,
+      action: { type: "modifyHeaders", responseHeaders: [{ header: "content-security-policy", operation: "remove" }] },
+      condition: cspCondition
+    });
+  }
+
+  if (opts.saveData) {
+    var saveDataCondition = {};
+    if (excludedDomains.length) {
+      saveDataCondition.excludedRequestDomains = excludedDomains;
+      saveDataCondition.excludedInitiatorDomains = excludedDomains;
+    }
+    addRules.push({
+      id: RULE_ID_SAVE_DATA,
+      priority: 1,
+      action: { type: "modifyHeaders", requestHeaders: [{ header: "save-data", operation: "set", value: "on" }] },
+      condition: saveDataCondition
+    });
+  }
+  return addRules;
+}
 
 function doRefreshRules(done) {
-  // Cromite/Kiwi-class Chromium builds can lag desktop API surface. DNR is the
-  // only optional dependency here; image URL encoding still happens in content/prehook.
   if (!chrome.declarativeNetRequest || typeof chrome.declarativeNetRequest.updateDynamicRules !== "function") {
     if (typeof done === "function") done();
     return;
   }
   chrome.storage.sync.get(DEFAULTS, function(opts) {
-    var removeRuleIds = ALL_RULE_IDS;
-
-    if (!opts.enabled && !opts.saveData) {
-      chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: removeRuleIds }, done);
-      return;
-    }
-
-    // Excluded sites are never proxied, so they keep their own CSP. DNR rejects the
-    // whole update on an invalid domain, so only well-formed hostnames are passed.
-    var excluded = String(opts.excludeDomains || "").split(/[,\s]+/)
-      .map(function(s) { return s.trim().toLowerCase().replace(/^https?:\/\//, "").split("/")[0].replace(/\.$/, ""); })
-      .filter(function(s) { return /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$/.test(s); });
-    var excludedDomains = Array.from(new Set(excluded));
-    var addRules = [];
-
-    // Rule 2: Strip CSP headers so proxy-domain images aren't blocked by the page.
-    // CSP only matters for top-level/frame documents, so keep this rule narrow.
-    if (opts.enabled) {
-      var cspCondition = { resourceTypes: ["main_frame", "sub_frame"] };
-      if (excludedDomains.length) cspCondition.excludedRequestDomains = excludedDomains;
-      addRules.push({
-        id: RULE_ID_CSP,
-        priority: 1,
-        action: {
-          type: "modifyHeaders",
-          responseHeaders: [
-            { header: "content-security-policy",             operation: "remove" },
-            { header: "content-security-policy-report-only", operation: "remove" }
-          ]
-        },
-        condition: cspCondition
-      });
-    }
-
-    // Save-Data: on — migrated from the original MV2 extension. DNR is used
-    // because MV3 cannot use webRequestBlocking for normal extensions. No
-    // resourceTypes filter is used, matching the original all-requests behavior.
-    if (opts.saveData) {
-      var saveDataCondition = {};
-      if (excludedDomains.length) {
-        // Exclude both the destination itself and subresources initiated by an
-        // excluded site (for example, its CDN/image host).
-        saveDataCondition.excludedRequestDomains = excludedDomains;
-        saveDataCondition.excludedInitiatorDomains = excludedDomains;
+    var addRules = buildRules(opts, false);
+    chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: ALL_RULE_IDS, addRules: addRules }, function() {
+      if (chrome.runtime.lastError && addRules.some(function(r) { return r.condition && r.condition.responseHeaders; })) {
+        addRules = buildRules(opts, true); // retry without response-header matching
+        chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: ALL_RULE_IDS, addRules: addRules }, done);
+        return;
       }
-      addRules.push({
-        id: RULE_ID_SAVE_DATA,
-        priority: 1,
-        action: {
-          type: "modifyHeaders",
-          requestHeaders: [
-            { header: "save-data", operation: "set", value: "on" }
-          ]
-        },
-        condition: saveDataCondition
-      });
-    }
-
-    chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: removeRuleIds, addRules: addRules }, done);
+      if (typeof done === "function") done();
+    });
   });
 }
-

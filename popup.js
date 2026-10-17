@@ -18,12 +18,10 @@ const presetBtns  = Array.from(document.querySelectorAll("#qualityPresets .prese
 
 const PRESETS = [45, 60, 80];
 
-// Full settings state. Storage change events only carry the changed keys, so they
-// must be merged into this — merging into DEFAULTS reset unchanged keys (e.g. a
-// disabled extension appeared enabled after toggling grayscale).
 let state = { ...DEFAULTS };
 let currentHost  = "";
 let currentIsWeb = false;
+let currentTabId = null;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -38,19 +36,33 @@ function findExcludedDomain(host, domains) {
   return domains.find(domain => host === domain || host.endsWith(`.${domain}`)) || "";
 }
 
-function nearestPreset(q) {
-  return PRESETS.reduce((best, v) =>
-    Math.abs(v - q) < Math.abs(best - q) ? v : best, PRESETS[0]);
+// B16: exact-match highlighting. "Nearest" matching lied about custom values
+// (quality 55 highlighted "60"); when nothing matches we show a "Custom" badge.
+let customBadgeEl = null;
+function setCustomBadge(container, show) {
+  if (!container) return;
+  if (show && !customBadgeEl) {
+    customBadgeEl = document.createElement("span");
+    customBadgeEl.textContent = "Custom";
+    customBadgeEl.style.cssText = "font-size:11px;opacity:.65;margin-left:8px;vertical-align:middle;";
+    container.appendChild(customBadgeEl);
+  } else if (!show && customBadgeEl) {
+    customBadgeEl.remove();
+    customBadgeEl = null;
+  }
 }
 
 function setActivePreset(q) {
-  const match = nearestPreset(q);
-  presetBtns.forEach(b => b.classList.toggle("active", Number(b.dataset.q) === match));
+  let matched = false;
+  presetBtns.forEach(b => {
+    const on = Number(b.dataset.q) === Number(q);
+    b.classList.toggle("active", on);
+    if (on) matched = true;
+  });
+  setCustomBadge($("qualityPresets"), !matched);
 }
 
-function showNudge() {
-  nudge.classList.add("show");
-}
+function showNudge() { nudge.classList.add("show"); }
 
 // ── UI state ──────────────────────────────────────────────────────────────────
 
@@ -62,12 +74,14 @@ function applyUI(d) {
 }
 
 function updateEnabledUI(enabled) {
-  // Only the compression-settings card dims — the enable toggle itself is in a
-  // separate card above and stays fully interactive at all times.
   ctrlCard.classList.toggle("card-dim", !enabled);
-  headerSub.textContent = enabled ? "Active" : "Disabled";
-  statusState.classList.toggle("active", enabled);
-  statusText.textContent = enabled ? "Compression active" : "Compression disabled";
+  // B17: an empty proxyBase (the default install) means nothing can compress.
+  const noProxy = !String(state.proxyBase || "").trim();
+  headerSub.textContent = !enabled ? "Disabled" : noProxy ? "No proxy" : "Active";
+  statusState.classList.toggle("active", enabled && !noProxy);
+  statusText.textContent = !enabled
+    ? "Compression disabled"
+    : noProxy ? "No proxy configured" : "Compression active";
 }
 
 // ── Load ──────────────────────────────────────────────────────────────────────
@@ -83,15 +97,15 @@ load();
 
 enabledEl.addEventListener("change", async () => {
   const enabled = enabledEl.checked;
+  state.enabled = enabled;
   await chrome.storage.sync.set({ enabled });
   updateEnabledUI(enabled);
 });
 
 // ── Grayscale ─────────────────────────────────────────────────────────────────
-// Grayscale is applied server-side by the proxy (bw=1 query param). Images already
-// on the page can't change without a reload.
 
 grayscaleEl.addEventListener("change", async () => {
+  state.grayscale = grayscaleEl.checked;
   await chrome.storage.sync.set({ grayscale: grayscaleEl.checked });
   showNudge();
 });
@@ -101,9 +115,8 @@ grayscaleEl.addEventListener("change", async () => {
 presetBtns.forEach(btn => {
   btn.addEventListener("click", async () => {
     const quality = Number(btn.dataset.q);
+    state.quality = quality;
     await chrome.storage.sync.set({ quality });
-    // Single highlight path — the storage.onChanged listener re-renders too,
-    // so the old manual class toggles ran the same work twice.
     setActivePreset(quality);
     try {
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -135,6 +148,8 @@ async function loadSiteUI(d) {
     excludeBtn.disabled = true;
     return;
   }
+
+  currentTabId = tab.id ?? null;
 
   let parsed;
   try { parsed = new URL(tab.url); }
@@ -171,29 +186,45 @@ async function loadSiteUI(d) {
 excludeBtn.addEventListener("click", async () => {
   if (!currentIsWeb || !currentHost) return;
   const d    = await chrome.storage.sync.get(DEFAULTS);
-  const list = new Set(parseDomains(d.excludeDomains));
+  const raw  = String(d.excludeDomains || "");
+  const list = new Set(parseDomains(raw));
   const excludedDomain = findExcludedDomain(currentHost, Array.from(list));
-  if (excludedDomain) list.delete(excludedDomain);
-  else list.add(currentHost);
-  await chrome.storage.sync.set({ excludeDomains: Array.from(list).join(" ") });
+  let next;
+  if (excludedDomain) {
+    // B21: remove only the matching token, preserving the user's separators
+    // and formatting (no lowercase + space-join rewrite of the whole field).
+    next = raw.split(/([,\s]+)/)
+      .filter(tok => /[,\s]/.test(tok) || parseDomains(tok)[0] !== excludedDomain)
+      .join("");
+  } else {
+    list.add(currentHost);
+    next = raw.trim() ? raw.replace(/[\s,]*$/, "") + "\n" + currentHost : currentHost;
+  }
+  state.excludeDomains = next;
+  await chrome.storage.sync.set({ excludeDomains: next });
+  loadSiteUI(state);
   showNudge(); // page must reload for the change to take effect
 });
 
 // ── Open settings page ────────────────────────────────────────────────────────
 // chrome.runtime.openOptionsPage() breaks on Kiwi/Cromite (popup opens as tab).
-// tabs.create() works everywhere.
+// B14: pass the current tab's id so Settings reloads the right tab on save.
 
 settingsBtn.addEventListener("click", () => {
-  chrome.tabs.create({ url: chrome.runtime.getURL("options.html") })
-    .catch(() => chrome.runtime.openOptionsPage?.());
+  let url = chrome.runtime.getURL("options.html");
+  if (currentTabId != null) url += "?tab=" + currentTabId;
+  // B20: some Chromium builds return undefined instead of a promise here.
+  const maybePromise = chrome.tabs.create({ url });
+  if (maybePromise && typeof maybePromise.catch === "function") {
+    maybePromise.catch(() => chrome.runtime.openOptionsPage?.());
+  }
 });
 
 // ── Sync with changes made on the settings page ───────────────────────────────
 
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== "sync") return;
-  // Apply directly from the change payload — no redundant storage re-read.
   for (const [k, v] of Object.entries(changes)) state[k] = v.newValue ?? DEFAULTS[k];
   applyUI(state);
-  if ("excludeDomains" in changes || "enabled" in changes) loadSiteUI(state);
+  if ("excludeDomains" in changes || "enabled" in changes || "proxyBase" in changes) loadSiteUI(state);
 });

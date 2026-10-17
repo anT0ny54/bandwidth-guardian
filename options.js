@@ -15,7 +15,7 @@ const statImagesEl   = $("statImages");
 const statBytesEl    = $("statBytes");
 const statSavedEl    = $("statSaved");
 const toastEl        = $("toast");
-const versionEl       = $("extensionVersion");
+const versionEl      = $("extensionVersion");
 const customQualityEl = $("customQuality");
 const customWidthEl   = $("customWidth");
 
@@ -24,10 +24,18 @@ const widthPresets   = Array.from(document.querySelectorAll("#widthPresets  .pre
 
 const QUALITY_PRESETS = [45, 60, 80];
 const WIDTH_PRESETS   = [768, 1024, 0];
-// Last values loaded from storage, used to restore preset highlights when a
-// custom input is cleared (previously this wrongly restored DEFAULTS).
 let savedQuality = DEFAULTS.quality;
 let savedWidth   = DEFAULTS.maxWidth;
+
+// B2: track fields the user has edited since load/save so incoming sync
+// changes (e.g. the popup's "Exclude this site") never clobber unsaved edits.
+const dirty = { proxyBase: false, excludeDomains: false, quality: false, width: false };
+
+// B14: Settings remembers the tab that opened it (?tab=<id> from the popup).
+const openerTabId = (() => {
+  const v = Number(new URLSearchParams(location.search).get("tab"));
+  return Number.isFinite(v) && v > 0 ? v : null;
+})();
 
 if (versionEl) {
   versionEl.textContent = `v${chrome.runtime.getManifest().version}`;
@@ -55,18 +63,19 @@ function fmtBytes(n) {
 
 async function reloadCurrentPage() {
   const isHttpUrl = url => /^https?:\/\//i.test(String(url || ""));
+  // B14: prefer the tab that opened Settings.
+  if (openerTabId != null) {
+    try { await chrome.tabs.reload(openerTabId); return; } catch {}
+  }
   try {
     const [active] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (active?.id && isHttpUrl(active.url)) {
+    if (active?.id && isHttpUrl(active.url) && !/options\.html$/.test(String(active.url))) {
       await chrome.tabs.reload(active.id);
       return;
     }
-
-    // When settings are opened in a new tab, the settings tab itself is active.
-    // Prefer the most recently accessed HTTP(S) tab in the same window.
     const tabs = await chrome.tabs.query({ currentWindow: true });
     const page = tabs
-      .filter(tab => tab.id != null && isHttpUrl(tab.url))
+      .filter(tab => tab.id != null && isHttpUrl(tab.url) && !/options\.html$/.test(String(tab.url)))
       .sort((a, b) => Number(b.lastAccessed || 0) - Number(a.lastAccessed || 0))[0];
     if (page?.id) await chrome.tabs.reload(page.id);
   } catch {}
@@ -74,41 +83,50 @@ async function reloadCurrentPage() {
 
 // ── Preset helpers ────────────────────────────────────────────────────────────
 
-// Quality presets: highlight the button whose value matches, or none for custom.
+// B16: exact match, or a visible "Custom" badge — the popup and options page
+// now agree, and custom values no longer highlight a nearby preset.
+let customBadgeEl = null;
+function setCustomBadge(container, show) {
+  if (!container) return;
+  if (show && !customBadgeEl) {
+    customBadgeEl = document.createElement("span");
+    customBadgeEl.textContent = "Custom";
+    customBadgeEl.style.cssText = "font-size:11px;opacity:.65;margin-left:8px;vertical-align:middle;";
+    container.appendChild(customBadgeEl);
+  } else if (!show && customBadgeEl) {
+    customBadgeEl.remove();
+    customBadgeEl = null;
+  }
+}
+
 function setQualityUI(q) {
+  q = Number(q);
+  const matched = QUALITY_PRESETS.includes(q);
   qualityPresets.forEach(b => b.classList.toggle("active", Number(b.dataset.q) === q));
-  // Keep custom field in sync
-  if (!QUALITY_PRESETS.includes(q)) {
-    customQualityEl.value = q;
-  } else {
-    customQualityEl.value = "";
-  }
+  setCustomBadge($("qualityPresets"), !matched);
+  customQualityEl.value = matched ? "" : String(q ?? "");
 }
 
-// Width presets: same pattern.
 function setWidthUI(w) {
-  widthPresets.forEach(b => b.classList.toggle("active", Number(b.dataset.w) === w));
-  if (!WIDTH_PRESETS.includes(w)) {
-    customWidthEl.value = w;
-  } else {
-    customWidthEl.value = "";
-  }
+  w = Number(w) || 0;
+  const matched = WIDTH_PRESETS.includes(w);
+  widthPresets.forEach(b => b.classList.toggle("active", Number(b.dataset.w ?? b.dataset.width) === w));
+  setCustomBadge($("widthPresets"), !matched);
+  customWidthEl.value = matched ? "" : String(w);
 }
 
-// Read the currently selected quality value (preset or custom).
 function readQuality() {
-  const custom = parseInt(customQualityEl.value, 10);
-  if (!isNaN(custom) && custom >= 1 && custom <= 100) return custom;
+  const v = parseInt(customQualityEl.value, 10);
+  if (!isNaN(v) && v >= 1 && v <= 100) return v;
   const active = qualityPresets.find(b => b.classList.contains("active"));
-  return active ? Number(active.dataset.q) : DEFAULTS.quality;
+  return active ? Number(active.dataset.q) : savedQuality;
 }
 
-// Read the currently selected width value (preset or custom).
 function readWidth() {
-  const custom = parseInt(customWidthEl.value, 10);
-  if (!isNaN(custom) && custom >= 0) return custom;
+  const v = parseInt(customWidthEl.value, 10);
+  if (!isNaN(v) && v >= 0) return v;
   const active = widthPresets.find(b => b.classList.contains("active"));
-  return active ? Number(active.dataset.w) : DEFAULTS.maxWidth;
+  return active ? Number(active.dataset.w ?? active.dataset.width ?? 0) : savedWidth;
 }
 
 // ── Load ──────────────────────────────────────────────────────────────────────
@@ -118,18 +136,18 @@ async function load() {
     chrome.storage.sync.get(DEFAULTS),
     chrome.storage.local.get({ stats: { filesProcessed: 0, bytesProcessed: 0, bytesSaved: 0 } })
   ]);
-  enabledEl.checked   = !!d.enabled;
-  grayscaleEl.checked = !!d.grayscale;
+  enabledEl.checked    = !!d.enabled;
+  grayscaleEl.checked  = !!d.grayscale;
   saveDataEl.checked   = !!d.saveData;
-  proxyBaseEl.value   = d.proxyBase || "";
+  proxyBaseEl.value    = d.proxyBase || "";
   proxyBaseEl.classList.remove("invalid");
-  excludeEl.value     = d.excludeDomains || "";
+  excludeEl.value      = d.excludeDomains || "";
   savedQuality = d.quality  ?? DEFAULTS.quality;
   savedWidth   = d.maxWidth ?? DEFAULTS.maxWidth;
   setQualityUI(savedQuality);
   setWidthUI(savedWidth);
-
   renderStats(s.stats);
+  for (const k in dirty) dirty[k] = false;
 }
 load();
 
@@ -140,53 +158,83 @@ function renderStats(st) {
   statSavedEl.textContent  = fmtBytes(Number(st.bytesSaved || 0));
 }
 
-// Keep the counters live while this page is open (the service worker flushes in batches).
+// Live stats counter while this page is open (worker flushes in batches).
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area === "local" && changes.stats) renderStats(changes.stats.newValue);
 });
 
-// ── Quality preset buttons ────────────────────────────────────────────────────
+// B2: stay in sync with changes made elsewhere (popup toggles, popup
+// exclusions, second Settings window). Fields with unsaved edits win.
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== "sync") return;
+  if (changes.enabled)    enabledEl.checked   = !!changes.enabled.newValue;
+  if (changes.grayscale)  grayscaleEl.checked = !!changes.grayscale.newValue;
+  if (changes.saveData)   saveDataEl.checked  = !!changes.saveData.newValue;
+  if (changes.proxyBase && !dirty.proxyBase) {
+    proxyBaseEl.value = changes.proxyBase.newValue || "";
+    proxyBaseEl.classList.remove("invalid");
+  }
+  if (changes.excludeDomains && !dirty.excludeDomains) {
+    excludeEl.value = changes.excludeDomains.newValue || "";
+  }
+  if (changes.quality && !dirty.quality && !dirty.width) {
+    savedQuality = changes.quality.newValue ?? DEFAULTS.quality;
+    setQualityUI(savedQuality);
+  }
+  if (changes.maxWidth && !dirty.width && !dirty.quality) {
+    savedWidth = changes.maxWidth.newValue ?? DEFAULTS.maxWidth;
+    setWidthUI(savedWidth);
+  }
+});
+
+// ── Preset buttons ────────────────────────────────────────────────────────────
 
 qualityPresets.forEach(btn => {
   btn.addEventListener("click", () => {
     qualityPresets.forEach(b => b.classList.remove("active"));
     btn.classList.add("active");
     customQualityEl.value = ""; // preset takes priority; clear custom
+    setCustomBadge($("qualityPresets"), false);
   });
 });
 
-// Custom quality input — deselects all presets when user types a value.
 customQualityEl.addEventListener("input", () => {
+  dirty.quality = true;
   const v = parseInt(customQualityEl.value, 10);
   if (!isNaN(v) && v >= 1 && v <= 100) {
     qualityPresets.forEach(b => b.classList.remove("active"));
+    setCustomBadge($("qualityPresets"), true);
   } else if (customQualityEl.value === "") {
-    // Restore the saved value's highlight when field is cleared
+    dirty.quality = false;
     setQualityUI(savedQuality);
   }
 });
-
-// ── Max-width preset buttons ──────────────────────────────────────────────────
 
 widthPresets.forEach(btn => {
   btn.addEventListener("click", () => {
     widthPresets.forEach(b => b.classList.remove("active"));
     btn.classList.add("active");
     customWidthEl.value = "";
+    setCustomBadge($("widthPresets"), false);
   });
 });
 
 customWidthEl.addEventListener("input", () => {
+  dirty.width = true;
   const v = parseInt(customWidthEl.value, 10);
   if (!isNaN(v) && v >= 0) {
     widthPresets.forEach(b => b.classList.remove("active"));
+    setCustomBadge($("widthPresets"), true);
   } else if (customWidthEl.value === "") {
+    dirty.width = false;
     setWidthUI(savedWidth);
   }
 });
 
-// ── Auto-save: enable + grayscale ────────────────────────────────────────────
-// These two feel like instant switches; everything else uses the Save button.
+proxyBaseEl.addEventListener("input", () => { dirty.proxyBase = true; proxyBaseEl.classList.remove("invalid"); });
+excludeEl.addEventListener("input", () => { dirty.excludeDomains = true; });
+
+// ── Auto-save: enable + grayscale + saveData ──────────────────────────────────
 
 enabledEl.addEventListener("change", async () => {
   await chrome.storage.sync.set({ enabled: !!enabledEl.checked });
@@ -206,7 +254,6 @@ saveDataEl.addEventListener("change", async () => {
 // ── Save ──────────────────────────────────────────────────────────────────────
 
 async function save() {
-  // Reject invalid custom values instead of silently falling back to a preset.
   const cq = customQualityEl.value.trim();
   const cw = customWidthEl.value.trim();
   if (cq !== "" && !(/^\d+$/.test(cq) && +cq >= 1 && +cq <= 100)) {
@@ -218,33 +265,27 @@ async function save() {
     return;
   }
   const proxyBase = (proxyBaseEl.value || "").trim();
-  // Fully parse the URL — a scheme-prefix check let values like "https://not a url"
-  // through, which every downstream consumer then choked on (empty derived proxy
-  // host, never-matching already-proxied guard, broken image URLs).
-  try {
-    const parsedProxy = new URL(proxyBase);
-    if (parsedProxy.protocol !== "http:" && parsedProxy.protocol !== "https:") throw new Error("bad protocol");
-  } catch {
-    proxyBaseEl.classList.add("invalid");
-    showToast("Proxy URL must be a valid http:// or https:// URL", "err");
-    proxyBaseEl.focus();
-    return;
+  // B3: an empty proxyBase is allowed — it means "proxying disabled". Validate
+  // only when a value was entered, so quality/width/exclusions are savable
+  // without a proxy and the proxy can actually be cleared.
+  if (proxyBase !== "") {
+    try {
+      const parsedProxy = new URL(proxyBase);
+      if (parsedProxy.protocol !== "http:" && parsedProxy.protocol !== "https:") throw new Error("bad protocol");
+    } catch {
+      proxyBaseEl.classList.add("invalid");
+      showToast("Proxy URL must be a valid http:// or https:// URL", "err");
+      proxyBaseEl.focus();
+      return;
+    }
   }
   const quality = readQuality();
   const maxWidth = readWidth();
   const excludeDomains = (excludeEl.value || "").trim();
   const current = await chrome.storage.sync.get(DEFAULTS);
 
-  await chrome.storage.sync.set({
-    proxyBase,
-    quality,
-    maxWidth,
-    excludeDomains,
-  });
+  await chrome.storage.sync.set({ proxyBase, quality, maxWidth, excludeDomains });
 
-  // Reload whenever a URL-shaping setting changed — including excluded
-  // domains, whose effect is only visible after a reload restores the page's
-  // already-proxied images (or stops proxying a newly excluded site).
   if (proxyBase !== String(current.proxyBase || "") ||
       quality  !== Number(current.quality  ?? DEFAULTS.quality) ||
       maxWidth !== Number(current.maxWidth ?? DEFAULTS.maxWidth) ||
@@ -252,11 +293,11 @@ async function save() {
     await reloadCurrentPage();
   }
 
-  // Keep the "restore on clear" values and preset highlights in step with storage.
   savedQuality = quality;
   savedWidth   = maxWidth;
   setQualityUI(quality);
   setWidthUI(maxWidth);
+  for (const k in dirty) dirty[k] = false;
   showToast("Saved", "ok");
 }
 
@@ -268,38 +309,38 @@ async function testProxy() {
   } catch { showToast("Enter a valid proxy URL first", "err"); return; }
   const orig = testProxyBtn.textContent;
   testProxyBtn.textContent = "Testing…"; testProxyBtn.disabled = true;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 8000);
   try {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 8000);
     const res = await fetch(url, { signal: ctrl.signal });
-    clearTimeout(timer);
     const body = await res.text();
     if (res.ok && body.trim() === "bandwidth-hero-proxy") showToast("Proxy is working ✓", "ok");
     else if (res.ok) showToast(`Proxy responded (${res.status})`, "warn");
     else showToast(`Proxy returned HTTP ${res.status}`, "err");
   } catch (e) {
-    showToast(e?.name === "AbortError" ? "Timed out — proxy not reachable" : "Connection failed — check URL and CORS", "err");
+    // B18: extension pages with <all_urls> are not CORS-restricted — say what
+    // actually went wrong.
+    showToast(e?.name === "AbortError" ? "Timed out — proxy not reachable" : "Connection failed — check the URL and that the proxy is running", "err");
   } finally {
+    // B18: clear the timeout even on slow bodies and thrown errors.
+    clearTimeout(timer);
     testProxyBtn.textContent = orig; testProxyBtn.disabled = false;
   }
 }
 
 testProxyBtn.addEventListener("click", testProxy);
-proxyBaseEl.addEventListener("input", () => proxyBaseEl.classList.remove("invalid"));
 
 // ── Reset ─────────────────────────────────────────────────────────────────────
 
 async function resetAll() {
   await chrome.storage.sync.set(DEFAULTS);
   await load();
-  // Resetting clears the proxy URL; without a reload the current page keeps
-  // serving proxied images from the old proxy until manually refreshed.
   await reloadCurrentPage();
   showToast("Reset to defaults");
 }
 
 async function resetStats() {
-  // Only touch the stats: load() would also overwrite unsaved edits in the form.
+  // Only touch the stats: load() would also overwrite unsaved form edits.
   await chrome.storage.local.set({ stats: { filesProcessed: 0, bytesProcessed: 0, bytesSaved: 0 } });
   renderStats(null);
   showToast("Stats cleared");
@@ -311,7 +352,8 @@ saveBtn.addEventListener("click", save);
 resetAllBtn.addEventListener("click", resetAll);
 resetStatsBtn.addEventListener("click", resetStats);
 
-
-[proxyBaseEl, excludeEl, customQualityEl, customWidthEl].forEach(el => {
+// B19: Enter in the excluded-domains textarea inserts a newline; only the
+// single-line fields submit the form.
+[proxyBaseEl, customQualityEl, customWidthEl].forEach(el => {
   el.addEventListener("keydown", e => { if (e.key === "Enter") { e.preventDefault(); save(); } });
 });

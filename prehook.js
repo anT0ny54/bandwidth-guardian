@@ -1,34 +1,64 @@
-// Bandwidth Guardian — prehook (runs at document_start, in the page's MAIN world
-// via manifest "world": "MAIN", so page JavaScript actually hits these patches)
-// Intercepts <img src>, srcset, and new Image() assignments to prevent the
-// original full-resolution images from ever being downloaded.
+// Bandwidth Guardian — prehook (document_start, page MAIN world).
+// Patches HTMLImageElement/HTMLSourceElement/HTMLLinkElement setters and
+// Element.prototype.setAttribute before page JS runs, so JS-assigned image
+// URLs (including every lazy loader's img.src = dataset.src) are proxied
+// before any network request fires. Chrome-based browsers only.
 (() => {
-  // KEEP IN SYNC WITH defaults.js, content.js and service-worker.js.
-  // Bandwidth Guardian uses its configurable custom image-proxy contract.
-  const defaults = {
-    enabled: true, saveData: true, proxyBase: "", quality: 60, grayscale: true,
-    maxWidth: 768, excludeDomains: ""
-  };
+  "use strict";
 
-  let opts = null;        // loaded options (null until storage responds)
-  let ready = false;      // true once options have loaded
+  // KEEP IN SYNC WITH content.js: FAILED_ATTR / RESTORED_ATTR, event contract.
+  const DEFAULT_SETTINGS_EVENT = "bh-settings-update";
+
+  let opts = null;
+  let ready = false;
+  let active = false; // ready && enabled && proxyBase set && !pageExcluded (O1)
   let excludedDomains = new Set();
   let proxyConfig = null;
+  let proxyOrigin = "";
   const proxyUrlCache = new Map();
   const PROXY_CACHE_LIMIT = 512;
   const pageHost = location.hostname.toLowerCase();
-  let pageExcluded = false;   // cached excludedHost(pageHost), rebuilt on settings change
-  const pending = new Set(); // <img>/<source> elements waiting for opts to be ready
-  // #7: without a bound, every new element on a long-running SPA piles into
-  // `pending` forever if the settings event never arrives (extension error,
-  // storage failure, race) — an unbounded memory leak.
+  let pageExcluded = false;
+
+  const pending = new Set(); // elements waiting for opts; bounded (see #7)
   const MAX_PENDING = 1000;
-  function queuePending(el) {
-    if (pending.size >= MAX_PENDING) return; // bounded; watchdog releases the rest
-    pending.add(el);
-  }
+  function queuePending(el) { if (pending.size < MAX_PENDING) pending.add(el); }
+
   const fallbackHandlers = new WeakSet();
   const fallbackMeta = new WeakMap();
+
+  const FAILED_ATTR = "data-bh-failed";
+  const RESTORED_ATTR = "data-bh-restored"; // cross-world one-shot restore dedupe (B5)
+  const isFailed = el => !!el && el.nodeType === 1 && el.hasAttribute(FAILED_ATTR);
+  const markFailed = el => { try { el.setAttribute(FAILED_ATTR, ""); } catch {} };
+
+  const safeURL = (u, base = document.baseURI) => { try { return new URL(u, base); } catch { return null; } };
+  const resolveHttp = u => {
+    const r = safeURL(u);
+    return r && /^https?:$/.test(r.protocol) ? r.href : null;
+  };
+  const isHttp = u => /^https?:\/\//i.test(u);
+  const toDomainSet = text => new Set(
+    String(text || "").split(/[, \n\r\t]+/)
+      .map(s => s.trim().toLowerCase()).filter(Boolean)
+      .map(s => s.replace(/^https?:\/\//, "").split("/")[0].replace(/\.$/, ""))
+  );
+
+  // Anchored tracking-pixel patterns (B13): boundaries prevent false hits like
+  // facebook.com/tracy.jpg or /products/pagead-banner.jpg; the useless `(…)+`
+  // quantifiers are gone. KEEP IN SYNC with content.js.
+  const SKIP_URL_RE = /favicon|\.(?:ico|svg)(?:[?#]|$)/i;
+  const TRACKING_RE = /(?:\/|\.)pagead(?:[/?#]|$)|(?:pixel|cleardot)\.*\.(?:gif|jpe?g)(?:[?#]|$)|google\.[a-z.]+\/(?:ads|generate_204|.*\/log204)(?:[?#]|$)|google-analytics\.[a-z.]+\/(?:r|collect)(?:[?#]|$)|youtube\.[a-z.]+\/(?:api|ptracking|player_204|live_204)(?:[?#]|$)|doubleclick\.[a-z.]+\/(?:pcs|pixel|r)(?:[?#]|$)|googlesyndication\.[a-z.]+\/ddm(?:[?#]|$)|pixel\.facebook\.[a-z.]+|facebook\.[a-z.]+\/(?:tr|impression\.php)(?:[?#]|$)|ad\.bitmedia\.io(?:[/?#]|$)|yahoo\.[a-z.]+\/pixel(?:[?#]|$)|criteo\.net\/img(?:[?#]|$)|ad\.doubleclick\.net(?:[/?#]|$)/i;
+
+  // C2: proxy identity is ORIGIN-based, matching the service worker.
+  const isConfiguredProxyUrl = u => {
+    try { return !!proxyOrigin && new URL(u).origin === proxyOrigin; } catch { return false; }
+  };
+
+  let srcsetCache = new WeakMap();
+  let destroyed = false;
+  let preloadObserver = null;
+  let linkAttrObserver = null;
 
   function armProxyFallback(el, originalSrc, originalSrcset) {
     if (!el || !(el instanceof HTMLImageElement) || isFailed(el)) return;
@@ -41,53 +71,24 @@
     if (fallbackHandlers.has(el)) return;
     fallbackHandlers.add(el);
     el.addEventListener("error", () => {
+      // B5: restore ONLY when the URL that failed is actually a proxy URL.
+      const cur = el.currentSrc || el.src || "";
+      if (!isConfiguredProxyUrl(cur)) return;
+      if (el.hasAttribute(RESTORED_ATTR)) return; // the other world already restored
       const meta = fallbackMeta.get(el);
       if (!meta) return;
       fallbackMeta.delete(el);
-      // Never proxy this element again, otherwise content.js re-proxies the
-      // restored original and a failing proxy is hammered in an endless loop.
+      try { el.setAttribute(RESTORED_ATTR, ""); } catch {}
+      // Never proxy this element again, otherwise the restored original is
+      // re-proxied and a failing proxy is hit in an endless loop.
       markFailed(el);
-      try {
-        if (meta.originalSrcset) nativeSetSrcset(el, meta.originalSrcset);
-      } catch {}
-      try {
-        if (meta.originalSrc) nativeSetSrc(el, meta.originalSrc);
-      } catch {}
+      try { if (meta.originalSrcset) nativeSetSrcset(el, meta.originalSrcset); } catch {}
+      try { if (meta.originalSrc) nativeSetSrc(el, meta.originalSrc); } catch {}
     }, true);
+    // B5: a successful load disarms the fallback (a later, unrelated failing
+    // src must not trigger a restore).
+    el.addEventListener("load", () => fallbackMeta.delete(el), { capture: true, once: true });
   }
-  let srcsetCache = new WeakMap();
-  let destroyed = false; // true once the page is navigating away; stop all DOM work
-  let preloadObserver = null; // declared up front; stop() references it
-
-  const safeURL = (u, base = document.baseURI) => {
-    try { return new URL(u, base); } catch { return null; }
-  };
-  const resolveHttp = u => {
-    const resolved = safeURL(u);
-    return resolved && /^https?:$/.test(resolved.protocol) ? resolved.href : null;
-  };
-  const toDomainSet = text => new Set(
-    String(text || "")
-      .split(/[, \n\r\t]+/)
-      .map(s => s.trim().toLowerCase())
-      .filter(Boolean)
-      .map(s => s.replace(/^https?:\/\//, "").split("/")[0].replace(/\.$/, ""))
-  );
-  const isHttp = u => /^https?:\/\//i.test(u);
-  // Parity with content.js (KEEP IN SYNC): favicons/.ico/.svg and known ad/tracking URLs.
-  const SKIP_URL_RE = /favicon|\.(?:ico|svg)(?:[?#]|$)/i;
-  // prehook.js runs in the page's MAIN world while content.js runs in the
-  // extension's isolated world, so JS objects cannot be shared between them.
-  // Elements whose proxy load failed are flagged with a DOM attribute that
-  // both worlds can read (and neither MutationObserver watches it).
-  const FAILED_ATTR = "data-bh-failed";
-  const isFailed = el => !!el && el.nodeType === 1 && el.hasAttribute(FAILED_ATTR);
-  const markFailed = el => { try { el.setAttribute(FAILED_ATTR, ""); } catch {} };
-  const TRACKING_RE = /pagead|(?:pixel|cleardot)\.*\.(?:gif|jpg|jpeg)|google\.(?:[a-z.]+)\/(?:ads|generate_204|.*\/log204)+|google-analytics\.(?:[a-z.]+)\/(?:r|collect)+|youtube\.(?:[a-z.]+)\/(?:api|ptracking|player_204|live_204)+|doubleclick\.(?:[a-z.]+)\/(?:pcs|pixel|r)+|googlesyndication\.(?:[a-z.]+)\/ddm|pixel\.facebook\.(?:[a-z.]+)|facebook\.(?:[a-z.]+)\/(?:impression\.php|tr)+|ad\.bitmedia\.io|yahoo\.(?:[a-z.]+)\/pixel|criteo\.net\/img|ad\.doubleclick\.net/i;
-  let proxyHost = "";
-  const isConfiguredProxyUrl = u => {
-    try { return !!proxyHost && new URL(u).hostname.toLowerCase() === proxyHost; } catch { return false; }
-  };
 
   function updateProxyConfig(next) {
     opts = next;
@@ -96,10 +97,9 @@
     const maxWidth = Number(opts.maxWidth) || 0;
     proxyConfig = { base, sep: base.includes("?") ? "&" : "?", quality,
       maxWidth: maxWidth > 0 ? maxWidth : 0, grayscale: !!opts.grayscale };
-    try { proxyHost = new URL(base).hostname.toLowerCase(); } catch { proxyHost = ""; }
+    try { proxyOrigin = new URL(base).origin; } catch { proxyOrigin = ""; }
   }
 
-  // Single place that (re)builds every derived value from a settings object.
   function applyOpts(next) {
     updateProxyConfig(next);
     srcsetCache = new WeakMap();
@@ -107,25 +107,22 @@
     proxyUrlCache.clear();
     pageExcluded = excludedHost(pageHost);
     ready = true;
+    active = !!opts.enabled && !!proxyConfig.base && !pageExcluded;
   }
-
-  const sameOpts = (a, b) => !!a && !!b && Object.keys(defaults).every(k => a[k] === b[k]);
 
   function buildProxyUrl(orig) {
     if (!proxyConfig || !proxyConfig.base || !isHttp(orig)) return orig;
     const cached = proxyUrlCache.get(orig);
     if (cached !== undefined) {
-      // True LRU: refresh insertion order on hit (same fix as content.js).
-      proxyUrlCache.delete(orig);
+      proxyUrlCache.delete(orig); // true LRU: refresh insertion order on hit
       proxyUrlCache.set(orig, cached);
       return cached;
     }
     const { base, sep, quality, maxWidth, grayscale } = proxyConfig;
-    const bw = grayscale ? "1" : "0";
     const parts = [
       "url=" + encodeURIComponent(orig),
       "jpeg=0", // every supported browser handles WebP
-      "bw=" + bw,
+      "bw=" + (grayscale ? "1" : "0"),
       "quality=" + quality
     ];
     if (maxWidth) parts.push("max_width=" + encodeURIComponent(String(maxWidth)));
@@ -146,73 +143,68 @@
     return false;
   }
 
-  // Navigation hard-stop: once the user leaves the page, do not keep queuing
-  // microtasks or rewriting DOM in the outgoing document. This prevents heavy
-  // MutationObserver work from starving Chrome's navigation commit.
   function stop() {
     if (destroyed) return;
     destroyed = true;
     try { preloadObserver && preloadObserver.disconnect(); } catch {}
+    try { linkAttrObserver && linkAttrObserver.disconnect(); } catch {}
     try { pending.clear(); } catch {}
     try { proxyUrlCache.clear(); } catch {}
     srcsetCache = new WeakMap();
   }
 
-  // Flush image/source/link elements queued while settings were loading.
   function flushPending() {
     if (destroyed) return;
     for (const el of pending) {
       pending.delete(el);
       try {
-        // <link rel="preload" as="image"> queued with a stashed original href.
         if (el instanceof HTMLLinkElement) { processPreloadLink(el); continue; }
-        // <img>.loading values set before settings were known.
         if (el instanceof HTMLImageElement && loadingDesc && loadingDesc.set) {
           const pendingLoading = el.dataset.bhPendingLoading;
           if (pendingLoading !== undefined) {
             el.removeAttribute("data-bh-pending-loading");
-            if (!opts.enabled || !opts.proxyBase || pageExcluded) {
-              loadingDesc.set.call(el, pendingLoading);
-            } else {
-              loadingDesc.set.call(el, pendingLoading === "eager" ? "eager" : "lazy");
-            }
+            loadingDesc.set.call(el, (!opts.enabled || !opts.proxyBase || pageExcluded)
+              ? pendingLoading
+              : (pendingLoading === "eager" ? "eager" : "lazy"));
           }
         }
         const pendingSrc = el.dataset.bhPendingSrc;
         if (pendingSrc && el instanceof HTMLImageElement) {
           el.removeAttribute("data-bh-pending-src");
-          nativeSetSrc(el, decideSrc(pendingSrc) ?? pendingSrc);
+          const decided = decideSrc(pendingSrc);
+          // B7: queued values get the same treatment as live-set ones,
+          // including an armed fallback.
+          if (decided !== null && decided !== pendingSrc) {
+            armProxyFallback(el, resolveHttp(pendingSrc) || pendingSrc, el.getAttribute("srcset") || "");
+          }
+          nativeSetSrc(el, decided ?? pendingSrc);
         }
         const pendingSrcset = el.dataset.bhPendingSrcset;
         if (pendingSrcset) {
           el.removeAttribute("data-bh-pending-srcset");
-          const rewritten = rewriteSrcset(pendingSrcset, el);
-          if (el instanceof HTMLImageElement) {
-            nativeSetSrcset(el, rewritten);
-          } else if (sourceProto && el instanceof HTMLSourceElement) {
-            nativeSourceSetSrcset(el, rewritten);
+          if (!opts.enabled || !opts.proxyBase || pageExcluded) { // B7: honor `enabled`
+            if (el instanceof HTMLImageElement) nativeSetSrcset(el, pendingSrcset);
+            else if (sourceProto && el instanceof HTMLSourceElement) nativeSourceSetSrcset(el, pendingSrcset);
+          } else {
+            const rewritten = rewriteSrcset(pendingSrcset, el);
+            if (el instanceof HTMLImageElement) {
+              if (rewritten !== pendingSrcset) armProxyFallback(el, "", pendingSrcset);
+              nativeSetSrcset(el, rewritten);
+            } else if (sourceProto && el instanceof HTMLSourceElement) {
+              nativeSourceSetSrcset(el, rewritten);
+            }
           }
         }
       } catch {}
     }
   }
 
-  // Settings arrive from content.js through a JSON-serialized DOM event.
-  // This script runs in the page MAIN world, so it must not access extension
-  // APIs such as chrome.storage. content.js owns storage access and publishes
-  // only the small, non-secret settings object needed by this interceptor.
-  const SETTINGS_EVENT = "bh-settings-update";
-  // #7: watchdog — if content.js never publishes settings (extension error,
-  // storage failure, race), fall back to defaults after a grace period so the
-  // queued elements are released and `pending` cannot grow without bound.
-  const SETTINGS_WATCHDOG_MS = 5000;
-  setTimeout(() => {
-    if (!destroyed && !ready) {
-      applyOpts({ ...defaults });
-      flushPending();
-    }
-  }, SETTINGS_WATCHDOG_MS);
-  document.addEventListener(SETTINGS_EVENT, event => {
+  // ── Settings channel ────────────────────────────────────────────────────────
+  // O7: use a per-load random event name so page scripts cannot forge settings
+  // updates over a well-known channel. The name is exposed through a DOM
+  // attribute set at document_start; content.js reads it at publish time.
+  // Falls back to the default name when documentElement does not exist yet.
+  function onSettings(event) {
     if (destroyed) return;
     try {
       const raw = event?.detail;
@@ -228,9 +220,48 @@
       });
       flushPending();
     } catch {}
-  });
+  }
 
-  // Capture native property descriptors BEFORE we patch them
+  const RANDOM_SETTINGS_EVENT = "bh-settings-" + Math.random().toString(36).slice(2, 10);
+  let settingsEvent = DEFAULT_SETTINGS_EVENT;
+  let settingsRetryMo = null;
+  try {
+    if (document.documentElement) {
+      document.documentElement.dataset.bhSettingsEvent = RANDOM_SETTINGS_EVENT;
+      settingsEvent = RANDOM_SETTINGS_EVENT;
+    }
+  } catch {}
+  document.addEventListener(settingsEvent, onSettings);
+  if (settingsEvent === DEFAULT_SETTINGS_EVENT) {
+    // documentElement not parsed yet at injection: switch to the random name
+    // as soon as <html> appears (always before content.js's first publish,
+    // which is behind an async storage read).
+    settingsRetryMo = new MutationObserver(() => {
+      try {
+        if (document.documentElement) {
+          document.documentElement.dataset.bhSettingsEvent = RANDOM_SETTINGS_EVENT;
+          document.removeEventListener(DEFAULT_SETTINGS_EVENT, onSettings);
+          document.addEventListener(RANDOM_SETTINGS_EVENT, onSettings);
+          settingsEvent = RANDOM_SETTINGS_EVENT;
+          settingsRetryMo.disconnect();
+        }
+      } catch {}
+    });
+    settingsRetryMo.observe(document, { childList: true });
+  }
+
+  // #7: watchdog — if settings never arrive, release queued elements with
+  // proxying OFF (previously this applied the install defaults, which have
+  // enabled:true). R4: no full `defaults` object is kept for this.
+  const SETTINGS_WATCHDOG_MS = 5000;
+  setTimeout(() => {
+    if (!destroyed && !ready) {
+      applyOpts({ enabled: false, proxyBase: "", quality: 60, grayscale: true, maxWidth: 768, excludeDomains: "" });
+      flushPending();
+    }
+  }, SETTINGS_WATCHDOG_MS);
+
+  // ── Capture native property descriptors BEFORE patching ────────────────────
   const imgProto = HTMLImageElement.prototype;
   const srcDesc = Object.getOwnPropertyDescriptor(imgProto, "src");
   const srcsetDesc = Object.getOwnPropertyDescriptor(imgProto, "srcset");
@@ -243,13 +274,10 @@
 
   function nativeSetSrc(el, v) { srcDesc.set.call(el, v); }
   function nativeSetSrcset(el, v) { srcsetDesc?.set?.call(el, v); }
-
-  // Native setters are captured independently in this world. Failed elements
-  // are shared through the data-bh-failed DOM attribute instead of JS objects.
   function nativeSourceSetSrcset(el, v) { sourceSrcsetDesc?.set?.call(el, v); }
 
-  // Spec-style srcset parser: a comma inside a URL (e.g. Cloudinary "w_400,h_300")
-  // is part of the URL; only trailing commas or a comma after descriptors end a candidate.
+  // Spec-style srcset parser (KEEP IN SYNC with content.js): commas inside a
+  // URL (Cloudinary "w_400,h_300") belong to the URL, not the candidate list.
   function parseSrcset(ss) {
     const out = [];
     const n = ss.length;
@@ -261,19 +289,13 @@
       while (i < n && !/\s/.test(ss[i])) i++;
       let url = ss.slice(s, i);
       let desc = "";
-      if (url.endsWith(",")) {
-        url = url.replace(/,+$/, "");
-      } else {
-        const d = i;
-        while (i < n && ss[i] !== ",") i++;
-        desc = ss.slice(d, i).trim();
-      }
+      if (url.endsWith(",")) { url = url.replace(/,+$/, ""); }
+      else { const d = i; while (i < n && ss[i] !== ",") i++; desc = ss.slice(d, i).trim(); }
       if (url) out.push({ url, desc });
     }
     return out;
   }
 
-  // Shared skip decision for a resolved absolute http(s) URL (srcset + src).
   function skipAbsolute(absolute) {
     if (isConfiguredProxyUrl(absolute) || SKIP_URL_RE.test(absolute) ||
         TRACKING_RE.test(absolute)) return true;
@@ -284,12 +306,10 @@
   function rewriteSrcset(ss, el) {
     if (!ss) return ss;
     if (pageExcluded) return ss;
-
     if (el) {
       const cached = srcsetCache.get(el);
       if (cached && (cached.input === ss || cached.output === ss)) return cached.output;
     }
-
     const cands = parseSrcset(ss);
     let touched = false;
     const parts = cands.map(({ url, desc }) => {
@@ -304,14 +324,10 @@
   }
 
   function decideSrc(original) {
-    // img.src = "" is used by pages to clear an image; never proxy the page URL.
-    if (!original || !String(original).trim()) return original;
+    if (!original || !String(original).trim()) return original; // clearing src
     const absolute = resolveHttp(original);
     if (!absolute) return original;
-    // Never proxy a URL that is already produced by configured proxy. This is important
-    // because content.js also rewrites parser-created images; without this guard
-    // the prehook wraps the configured proxy URL a second time.
-    if (isConfiguredProxyUrl(absolute)) return original;
+    if (isConfiguredProxyUrl(absolute)) return original; // don't double-wrap
     if (!ready || !opts) return null; // queue until settings are known
     if (!opts.enabled || !opts.proxyBase) return original;
     if (pageExcluded) return original;
@@ -319,37 +335,30 @@
     return buildProxyUrl(absolute);
   }
 
-  // ── <link rel="preload" as="image"> support ────────────────────────────────
-  // A preload hint makes the browser download the full-resolution image URL
-  // directly — bypassing every <img> patch. We therefore rewrite the preload's
-  // href to the proxy URL (or stash and blank it until settings are known).
+  // ── <link rel="preload" as="image"> ─────────────────────────────────────────
   const isImagePreloadLink = el =>
     el instanceof HTMLLinkElement &&
     /(?:^|\s)preload(?:\s|$)/i.test(el.rel || "") &&
     (String(el.getAttribute("as") || "").toLowerCase() === "image" ||
      /^image\//i.test(el.getAttribute("type") || ""));
 
-  // Called from the setAttribute patch, the link.href property patch, the
-  // MutationObserver, and flushPending. Idempotent: re-running it on a link
-  // whose href is already a proxy URL is a no-op.
   function processPreloadLink(el) {
     try {
       if (destroyed) return;
       if (!isImagePreloadLink(el)) return;
       const stashed = el.dataset.bhPreloadHref;
       const current = el.getAttribute("href");
-      // decideSrc must see the ORIGINAL url, never "about:blank".
       const original = stashed || current;
-      if (!original || original === "about:blank") return;
+      if (!original) return;
       const decided = decideSrc(original);
       if (decided === null) {
         // Settings not loaded yet: stash the original and drop href so the
         // browser cannot start downloading the full-resolution image.
         if (!stashed) el.dataset.bhPreloadHref = original;
         queuePending(el);
-        // Never write the same value from inside an observed attribute callback;
-        // same-value setAttribute can still enqueue a mutation in some engines.
-        if (current !== "about:blank") setAttr.call(el, "href", "about:blank");
+        // B6: remove the attribute instead of writing about:blank — no fake
+        // error event, and reads see "absent" rather than a bogus URL.
+        if (current !== null) el.removeAttribute("href");
       } else {
         if (stashed) el.removeAttribute("data-bh-preload-href");
         if (current !== decided) setAttr.call(el, "href", decided);
@@ -357,7 +366,7 @@
     } catch {}
   }
 
-  // ── Patch <img>.src ────────────────────────────────────────────────────────
+  // ── Patch <img>.src ─────────────────────────────────────────────────────────
   Object.defineProperty(imgProto, "src", {
     configurable: true,
     enumerable: srcDesc.enumerable,
@@ -368,18 +377,16 @@
         if (decided === null) {
           this.dataset.bhPendingSrc = String(value);
           queuePending(this);
-          nativeSetSrc(this, "about:blank");
+          // B6: write nothing while pending — no about:blank fake error.
         } else {
           if (decided !== String(value)) armProxyFallback(this, resolveHttp(String(value)), this.getAttribute("srcset") || "");
           nativeSetSrc(this, decided);
         }
-      } catch {
-        nativeSetSrc(this, value);
-      }
+      } catch { nativeSetSrc(this, value); }
     }
   });
 
-  // ── Patch <img>.srcset ─────────────────────────────────────────────────────
+  // ── Patch <img>.srcset ──────────────────────────────────────────────────────
   if (srcsetDesc && srcsetDesc.set) {
     Object.defineProperty(imgProto, "srcset", {
       configurable: true,
@@ -391,7 +398,7 @@
           if (!ready || !opts) {
             this.dataset.bhPendingSrcset = v;
             queuePending(this);
-            nativeSetSrcset(this, "");
+            // B6: no native write while pending.
           } else if (!opts.enabled || !opts.proxyBase) {
             nativeSetSrcset(this, v);
           } else {
@@ -399,14 +406,12 @@
             if (rewritten !== v) armProxyFallback(this, "", v);
             nativeSetSrcset(this, rewritten);
           }
-        } catch {
-          nativeSetSrcset(this, value);
-        }
+        } catch { nativeSetSrcset(this, value); }
       }
     });
   }
 
-  // ── Patch <source>.srcset inside <picture> ────────────────────────────────
+  // ── Patch <source>.srcset inside <picture> ──────────────────────────────────
   if (sourceProto && sourceSrcsetDesc && sourceSrcsetDesc.set) {
     Object.defineProperty(sourceProto, "srcset", {
       configurable: true,
@@ -418,23 +423,17 @@
           if (!ready || !opts) {
             this.dataset.bhPendingSrcset = v;
             queuePending(this);
-            nativeSourceSetSrcset(this, "");
           } else if (!opts.enabled || !opts.proxyBase) {
             nativeSourceSetSrcset(this, v);
           } else {
             nativeSourceSetSrcset(this, rewriteSrcset(v, this));
           }
-        } catch {
-          nativeSourceSetSrcset(this, value);
-        }
+        } catch { nativeSourceSetSrcset(this, value); }
       }
     });
   }
 
-  // ── Patch <img>.loading ──────────────────────────────────────────────────────
-  // Force lazy loading while the extension is active so offscreen images are
-  // never downloaded. Explicit eager requests from the page are respected so
-  // carousels / above-the-fold logic keep working.
+  // ── Patch <img>.loading (force lazy while active) ───────────────────────────
   if (loadingDesc && loadingDesc.set) {
     Object.defineProperty(imgProto, "loading", {
       configurable: true,
@@ -452,15 +451,12 @@
           } else {
             loadingDesc.set.call(this, v === "eager" ? "eager" : "lazy");
           }
-        } catch {
-          loadingDesc.set.call(this, value);
-        }
+        } catch { loadingDesc.set.call(this, value); }
       }
     });
   }
 
-  // ── Patch <link>.href property for image preloads ──────────────────────────
-  // Direct property assignment (link.href = "...") bypasses setAttribute.
+  // ── Patch <link>.href property for image preloads ───────────────────────────
   if (linkHrefDesc && linkHrefDesc.set) {
     Object.defineProperty(linkProto, "href", {
       configurable: true,
@@ -473,8 +469,7 @@
             if (decided === null) {
               this.dataset.bhPreloadHref = String(value);
               queuePending(this);
-              linkHrefDesc.set.call(this, "about:blank");
-              return;
+              return; // B6: leave href unset instead of about:blank
             }
             linkHrefDesc.set.call(this, decided);
             return;
@@ -485,22 +480,18 @@
     });
   }
 
-  // ── Patch Element.prototype.setAttribute for attribute-based assignment ────
+  // ── Patch Element.prototype.setAttribute ────────────────────────────────────
   Element.prototype.setAttribute = function(name, value) {
     try {
       if (destroyed) return setAttr.call(this, name, value);
       const n = String(name).toLowerCase();
 
-      // #21: fast path first. The overwhelming majority of setAttribute calls
-      // (class, data-*, aria-*, id, …) hit this gate and return with zero
-      // instanceof checks. Only src/srcset/loading/href/rel/as/type fall
-      // through to the per-tag branches below.
+      // #21: fast path first — class/data-*/aria-*/id/etc. return immediately.
       if (n !== "src" && n !== "srcset" && n !== "loading" &&
           n !== "href" && n !== "rel" && n !== "as" && n !== "type") {
         return setAttr.call(this, name, value);
       }
 
-      // <link rel="preload"> attributes must land before inspection.
       if (this instanceof HTMLLinkElement) {
         setAttr.call(this, name, value);
         processPreloadLink(this);
@@ -524,29 +515,29 @@
           if (decided === null) {
             this.dataset.bhPendingSrc = String(value);
             queuePending(this);
-            return setAttr.call(this, "src", "about:blank");
+            return; // B6: write nothing while pending
           }
           if (decided !== String(value)) armProxyFallback(this, resolveHttp(String(value)), this.getAttribute("srcset") || "");
           return setAttr.call(this, "src", decided);
-        } else if (n === "srcset") {
-          const v = String(value || "");
-          if (!ready || !opts) {
-            this.dataset.bhPendingSrcset = v;
-            queuePending(this);
-            return setAttr.call(this, "srcset", "");
-          }
-          if (!opts.enabled || !opts.proxyBase) return setAttr.call(this, "srcset", v);
-          const rewritten = rewriteSrcset(v, this);
-          if (rewritten !== v) armProxyFallback(this, "", v);
-          return setAttr.call(this, "srcset", rewritten);
         }
+        const v = String(value || "");
+        if (!ready || !opts) {
+          this.dataset.bhPendingSrcset = v;
+          queuePending(this);
+          return; // B6
+        }
+        if (!opts.enabled || !opts.proxyBase) return setAttr.call(this, "srcset", v);
+        const rewritten = rewriteSrcset(v, this);
+        if (rewritten !== v) armProxyFallback(this, "", v);
+        return setAttr.call(this, "srcset", rewritten);
       }
+
       if (this instanceof HTMLSourceElement && n === "srcset") {
         const v = String(value || "");
         if (!ready || !opts) {
           this.dataset.bhPendingSrcset = v;
           queuePending(this);
-          return setAttr.call(this, "srcset", "");
+          return; // B6
         }
         if (!opts.enabled || !opts.proxyBase) return setAttr.call(this, "srcset", v);
         return setAttr.call(this, "srcset", rewriteSrcset(v, this));
@@ -555,39 +546,40 @@
     return setAttr.call(this, name, value);
   };
 
-  // ── MutationObserver for <link rel="preload" as="image"> ──────────────────
-  // The HTML parser sets attributes natively, bypassing our JS patches. Watch
-  // for link elements added to the DOM and for rel/as/href/type changes.
+  // ── MutationObservers for parser-created preload links ──────────────────────
+  // C1/O5: two observers. (1) childList catches parser-inserted links — the
+  // HTML parser bypasses all JS patches. (2) attribute watching is limited to
+  // rel/as on <link> elements: relList.add() is unpatchable, while href changes
+  // made by JS already flow through the patched href setter / setAttribute.
+  // Document-wide <a href> observation (the old cost) is gone.
+  const linkObserverGuard = () => destroyed || (ready && !active);
   preloadObserver = new MutationObserver(mutations => {
-    if (destroyed) return;
+    if (linkObserverGuard()) return;
     for (const m of mutations) {
-      if (m.type === "childList") {
-        m.addedNodes.forEach(n => {
-          if (n.nodeType !== 1) return;
-          if (n instanceof HTMLLinkElement) processPreloadLink(n);
-          if (n.querySelectorAll) {
-            n.querySelectorAll('link[rel~="preload"]').forEach(processPreloadLink);
-          }
-        });
-      } else {
-        processPreloadLink(m.target);
-      }
+      if (m.type !== "childList") continue;
+      m.addedNodes.forEach(n => {
+        if (n.nodeType !== 1) return;
+        if (n instanceof HTMLLinkElement) processPreloadLink(n);
+        if (n.querySelectorAll) n.querySelectorAll('link[rel~="preload"]').forEach(processPreloadLink);
+      });
     }
   });
-  // document exists at document_start even before documentElement is parsed;
-  // observing it with subtree covers the parser-created links that follow.
-  preloadObserver.observe(document, {
-    childList: true,
+  preloadObserver.observe(document, { childList: true, subtree: true });
+
+  linkAttrObserver = new MutationObserver(mutations => {
+    if (linkObserverGuard()) return;
+    for (const m of mutations) {
+      if (m.target instanceof HTMLLinkElement) processPreloadLink(m.target);
+    }
+  });
+  linkAttrObserver.observe(document, {
     subtree: true,
     attributes: true,
-    attributeFilter: ["href", "rel", "as", "type"]
+    attributeFilter: ["rel", "as"]
   });
 
-  // Free the outgoing page immediately on normal navigation. Skip persisted
-  // pageshow/bfcache restores so back/forward keeps working.
   window.addEventListener("pagehide", e => {
     if (e.persisted) return;
     stop();
   });
-
 })();
