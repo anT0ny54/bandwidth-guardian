@@ -1,7 +1,5 @@
 // Bandwidth Guardian — shared defaults
-// Imported as an ES module by popup.js, options.js and service-worker.js
-// ("type": "module"). content.js and prehook.js inline copies of DEFAULTS and
-// IMAGE_CONTENT_TYPES (classic scripts can't import) — search "KEEP IN SYNC".
+// Imported as an ES module by popup.js and options.js only.
 // service-worker.js and content.js inline copies of DEFAULTS and
 // IMAGE_CONTENT_TYPES (classic scripts can't import) — search "KEEP IN SYNC".
 

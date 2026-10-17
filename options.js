@@ -17,33 +17,29 @@ const statSavedEl    = $("statSaved");
 const toastEl        = $("toast");
 const versionEl      = $("extensionVersion");
 const customQualityEl = $("customQuality");
-const customWidthEl  = $("customWidth");
+const customWidthEl   = $("customWidth");
 
 const qualityPresets = Array.from(document.querySelectorAll("#qualityPresets .preset"));
 const widthPresets   = Array.from(document.querySelectorAll("#widthPresets  .preset"));
 
 const QUALITY_PRESETS = [45, 60, 80];
 const WIDTH_PRESETS   = [768, 1024, 0];
-const WIDTH_MAX       = 16384; // mirrors the customWidth input's max attribute
 let savedQuality = DEFAULTS.quality;
 let savedWidth   = DEFAULTS.maxWidth;
 
 // B2: track fields the user has edited since load/save so incoming sync
 // changes (e.g. the popup's "Exclude this site") never clobber unsaved edits.
-// quality and maxWidth gate ONLY on their own dirty flag — they are
-// independent fields, and an unsaved width edit must not block an incoming
-// quality change (or vice versa).
 const dirty = { proxyBase: false, excludeDomains: false, quality: false, width: false };
 
 // B14: Settings remembers the tab that opened it (?tab=<id> from the popup).
-// Number.isInteger rejects values like "1.5" that Number() would pass.
 const openerTabId = (() => {
-  const raw = new URLSearchParams(location.search).get("tab");
-  const v = Number(raw);
-  return raw !== null && Number.isInteger(v) && v > 0 ? v : null;
+  const v = Number(new URLSearchParams(location.search).get("tab"));
+  return Number.isFinite(v) && v > 0 ? v : null;
 })();
 
-versionEl.textContent = `v${chrome.runtime.getManifest().version}`;
+if (versionEl) {
+  versionEl.textContent = `v${chrome.runtime.getManifest().version}`;
+}
 
 // ── Toast ─────────────────────────────────────────────────────────────────────
 
@@ -66,24 +62,20 @@ function fmtBytes(n) {
 }
 
 async function reloadCurrentPage() {
-  const own = chrome.runtime.getURL(""); // this extension's own pages
-  // Own pages (options.html) are skipped by PREFIX, not by a bare
-  // /options\.html$/ suffix — a real website ending in options.html must
-  // still reload.
-  const isHttpPage = url => /^https?:\/\//i.test(String(url || "")) && !String(url || "").startsWith(own);
+  const isHttpUrl = url => /^https?:\/\//i.test(String(url || ""));
   // B14: prefer the tab that opened Settings.
   if (openerTabId != null) {
-    try {
-      const t = await chrome.tabs.get(openerTabId);
-      if (t?.id != null && isHttpPage(t.url)) { await chrome.tabs.reload(t.id); return; }
-    } catch {}
+    try { await chrome.tabs.reload(openerTabId); return; } catch {}
   }
   try {
     const [active] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (active?.id && isHttpPage(active.url)) { await chrome.tabs.reload(active.id); return; }
+    if (active?.id && isHttpUrl(active.url) && !/options\.html$/.test(String(active.url))) {
+      await chrome.tabs.reload(active.id);
+      return;
+    }
     const tabs = await chrome.tabs.query({ currentWindow: true });
     const page = tabs
-      .filter(tab => tab.id != null && isHttpPage(tab.url))
+      .filter(tab => tab.id != null && isHttpUrl(tab.url) && !/options\.html$/.test(String(tab.url)))
       .sort((a, b) => Number(b.lastAccessed || 0) - Number(a.lastAccessed || 0))[0];
     if (page?.id) await chrome.tabs.reload(page.id);
   } catch {}
@@ -91,22 +83,19 @@ async function reloadCurrentPage() {
 
 // ── Preset helpers ────────────────────────────────────────────────────────────
 
-// B16: exact match, or a visible "Custom" badge. One badge PER CONTAINER via a
-// WeakMap: the quality row and the width row each keep their own badge, and
-// clearing one never removes the other's.
-const badges = new WeakMap();
+// B16: exact match, or a visible "Custom" badge — the popup and options page
+// now agree, and custom values no longer highlight a nearby preset.
+let customBadgeEl = null;
 function setCustomBadge(container, show) {
   if (!container) return;
-  const badge = badges.get(container);
-  if (show && !badge) {
-    const el = document.createElement("span");
-    el.textContent = "Custom";
-    el.style.cssText = "font-size:11px;opacity:.65;margin-left:8px;vertical-align:middle;";
-    container.appendChild(el);
-    badges.set(container, el);
-  } else if (!show && badge) {
-    badge.remove();
-    badges.delete(container);
+  if (show && !customBadgeEl) {
+    customBadgeEl = document.createElement("span");
+    customBadgeEl.textContent = "Custom";
+    customBadgeEl.style.cssText = "font-size:11px;opacity:.65;margin-left:8px;vertical-align:middle;";
+    container.appendChild(customBadgeEl);
+  } else if (!show && customBadgeEl) {
+    customBadgeEl.remove();
+    customBadgeEl = null;
   }
 }
 
@@ -121,7 +110,7 @@ function setQualityUI(q) {
 function setWidthUI(w) {
   w = Number(w) || 0;
   const matched = WIDTH_PRESETS.includes(w);
-  widthPresets.forEach(b => b.classList.toggle("active", Number(b.dataset.w) === w));
+  widthPresets.forEach(b => b.classList.toggle("active", Number(b.dataset.w ?? b.dataset.width) === w));
   setCustomBadge($("widthPresets"), !matched);
   customWidthEl.value = matched ? "" : String(w);
 }
@@ -135,21 +124,18 @@ function readQuality() {
 
 function readWidth() {
   const v = parseInt(customWidthEl.value, 10);
-  if (!isNaN(v) && v >= 0 && v <= WIDTH_MAX) return v;
+  if (!isNaN(v) && v >= 0) return v;
   const active = widthPresets.find(b => b.classList.contains("active"));
-  return active ? Number(active.dataset.w ?? 0) : savedWidth;
+  return active ? Number(active.dataset.w ?? active.dataset.width ?? 0) : savedWidth;
 }
 
 // ── Load ──────────────────────────────────────────────────────────────────────
 
 async function load() {
-  let d, s;
-  try {
-    [d, s] = await Promise.all([
-      chrome.storage.sync.get(DEFAULTS),
-      chrome.storage.local.get({ stats: { filesProcessed: 0, bytesProcessed: 0, bytesSaved: 0 } })
-    ]);
-  } catch { showToast("Could not load settings", "err"); return; }
+  const [d, s] = await Promise.all([
+    chrome.storage.sync.get(DEFAULTS),
+    chrome.storage.local.get({ stats: { filesProcessed: 0, bytesProcessed: 0, bytesSaved: 0 } })
+  ]);
   enabledEl.checked    = !!d.enabled;
   grayscaleEl.checked  = !!d.grayscale;
   saveDataEl.checked   = !!d.saveData;
@@ -178,8 +164,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
 });
 
 // B2: stay in sync with changes made elsewhere (popup toggles, popup
-// exclusions, second Settings window). Fields with unsaved edits win; each
-// field gates ONLY on its own dirty flag (quality vs. width are independent).
+// exclusions, second Settings window). Fields with unsaved edits win.
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== "sync") return;
   if (changes.enabled)    enabledEl.checked   = !!changes.enabled.newValue;
@@ -192,11 +177,11 @@ chrome.storage.onChanged.addListener((changes, area) => {
   if (changes.excludeDomains && !dirty.excludeDomains) {
     excludeEl.value = changes.excludeDomains.newValue || "";
   }
-  if (changes.quality && !dirty.quality) {
+  if (changes.quality && !dirty.quality && !dirty.width) {
     savedQuality = changes.quality.newValue ?? DEFAULTS.quality;
     setQualityUI(savedQuality);
   }
-  if (changes.maxWidth && !dirty.width) {
+  if (changes.maxWidth && !dirty.width && !dirty.quality) {
     savedWidth = changes.maxWidth.newValue ?? DEFAULTS.maxWidth;
     setWidthUI(savedWidth);
   }
@@ -239,7 +224,7 @@ widthPresets.forEach(btn => {
 customWidthEl.addEventListener("input", () => {
   dirty.width = true;
   const v = parseInt(customWidthEl.value, 10);
-  if (!isNaN(v) && v >= 0 && v <= WIDTH_MAX) {
+  if (!isNaN(v) && v >= 0) {
     widthPresets.forEach(b => b.classList.remove("active"));
     setCustomBadge($("widthPresets"), true);
   } else if (customWidthEl.value === "") {
@@ -251,28 +236,20 @@ customWidthEl.addEventListener("input", () => {
 proxyBaseEl.addEventListener("input", () => { dirty.proxyBase = true; proxyBaseEl.classList.remove("invalid"); });
 excludeEl.addEventListener("input", () => { dirty.excludeDomains = true; });
 
-// Surface the tracked dirty flag as an unsaved-changes warning.
-window.addEventListener("beforeunload", e => {
-  if (Object.values(dirty).some(Boolean)) { e.preventDefault(); e.returnValue = ""; }
-});
-
 // ── Auto-save: enable + grayscale + saveData ──────────────────────────────────
 
 enabledEl.addEventListener("change", async () => {
-  try { await chrome.storage.sync.set({ enabled: !!enabledEl.checked }); }
-  catch { showToast("Save failed", "err"); return; }
+  await chrome.storage.sync.set({ enabled: !!enabledEl.checked });
   showToast(enabledEl.checked ? "Compression enabled" : "Compression disabled", "ok");
 });
 
 grayscaleEl.addEventListener("change", async () => {
-  try { await chrome.storage.sync.set({ grayscale: !!grayscaleEl.checked }); }
-  catch { showToast("Save failed", "err"); return; }
+  await chrome.storage.sync.set({ grayscale: !!grayscaleEl.checked });
   showToast("Reload the page to apply", "warn");
 });
 
 saveDataEl.addEventListener("change", async () => {
-  try { await chrome.storage.sync.set({ saveData: !!saveDataEl.checked }); }
-  catch { showToast("Save failed", "err"); return; }
+  await chrome.storage.sync.set({ saveData: !!saveDataEl.checked });
   showToast(saveDataEl.checked ? "Save-Data header enabled" : "Save-Data header disabled", "ok");
 });
 
@@ -285,8 +262,8 @@ async function save() {
     showToast("Quality must be 1–100", "err");
     return;
   }
-  if (cw !== "" && (!/^\d+$/.test(cw) || +cw < 0 || +cw > WIDTH_MAX)) {
-    showToast(`Width must be 0–${WIDTH_MAX}`, "err");
+  if (cw !== "" && !/^\d+$/.test(cw)) {
+    showToast("Width must be 0 or a positive number", "err");
     return;
   }
   const proxyBase = (proxyBaseEl.value || "").trim();
@@ -307,12 +284,9 @@ async function save() {
   const quality = readQuality();
   const maxWidth = readWidth();
   const excludeDomains = (excludeEl.value || "").trim();
-  let current;
-  try { current = await chrome.storage.sync.get(DEFAULTS); }
-  catch { showToast("Save failed", "err"); return; }
+  const current = await chrome.storage.sync.get(DEFAULTS);
 
-  try { await chrome.storage.sync.set({ proxyBase, quality, maxWidth, excludeDomains }); }
-  catch { showToast("Save failed", "err"); return; }
+  await chrome.storage.sync.set({ proxyBase, quality, maxWidth, excludeDomains });
 
   if (proxyBase !== String(current.proxyBase || "") ||
       quality  !== Number(current.quality  ?? DEFAULTS.quality) ||
@@ -341,19 +315,7 @@ async function testProxy() {
   const timer = setTimeout(() => ctrl.abort(), 8000);
   try {
     const res = await fetch(url, { signal: ctrl.signal });
-    // Read with a hard 64 KB cap: the probe only needs the marker string, and
-    // an unbounded res.text() would download whatever the server streams.
-    let body = "";
-    const reader = res.body?.getReader?.();
-    if (reader) {
-      const dec = new TextDecoder();
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        body += dec.decode(value, { stream: true });
-        if (body.length > 65536) { try { await reader.cancel(); } catch {} break; }
-      }
-    }
+    const body = await res.text();
     if (res.ok && body.trim() === "bandwidth-hero-proxy") showToast("Proxy is working ✓", "ok");
     else if (res.ok) showToast(`Proxy responded (${res.status})`, "warn");
     else showToast(`Proxy returned HTTP ${res.status}`, "err");
@@ -373,21 +335,15 @@ testProxyBtn.addEventListener("click", testProxy);
 // ── Reset ────────────────────────────────────────────────────────────────────
 
 async function resetAll() {
-  if (!confirm("Reset ALL settings to defaults?")) return;
-  try {
-    await chrome.storage.sync.set(DEFAULTS);
-    await load();
-    await reloadCurrentPage();
-  } catch { showToast("Reset failed", "err"); return; }
+  await chrome.storage.sync.set(DEFAULTS);
+  await load();
+  await reloadCurrentPage();
   showToast("Reset to defaults");
 }
 
 async function resetStats() {
-  if (!confirm("Clear all saved-bandwidth statistics?")) return;
   // Only touch the stats: load() would also overwrite unsaved form edits.
-  try {
-    await chrome.storage.local.set({ stats: { filesProcessed: 0, bytesProcessed: 0, bytesSaved: 0 } });
-  } catch { showToast("Clear failed", "err"); return; }
+  await chrome.storage.local.set({ stats: { filesProcessed: 0, bytesProcessed: 0, bytesSaved: 0 } });
   renderStats(null);
   showToast("Stats cleared");
 }

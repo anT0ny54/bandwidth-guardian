@@ -70,12 +70,6 @@ once and before Chrome starts it.
    rule could not be installed, it falls back to rewriting every eligible URL
    itself (the pre-0.1.9 behaviour).
 
-   While compression is active, the DOM layer also forces
-   `loading="lazy"` onto any `<img>` that has no `loading` attribute
-   (known lazy-loader placeholders with `data-*` sources are left alone, and
-   a site's explicit `loading="eager"` is preserved). Pages therefore defer
-   offscreen image fetches even if the site never opted in.
-
 ### Fallback, loops and the circuit breaker
 
 - A proxied request that fails (HTTP error, wrong type, network error) is

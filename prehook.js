@@ -31,12 +31,10 @@
   const pageHost = location.hostname.toLowerCase();
   let pageExcluded = false;
 
-  // Keep every element waiting for settings. The queue is intentionally
-  // UNBOUNDED (a Set): settings normally arrive quickly, the watchdog
-  // releases the queue after five seconds, and the burst test (2,005 images)
-  // proves it drains fully — a hard cap would strand later parser-created
-  // images with their original URL (and setter-queued images could remain
-  // blank forever).
+  // Keep every element waiting for settings. A hard queue cap lets later
+  // parser-created images fall through with their original URL (and setter-
+  // queued images can remain blank forever). The queue is temporary: settings
+  // normally arrive quickly, and the watchdog releases it after five seconds.
   const pending = new Set();
   function queuePending(el) {
     if (el) pending.add(el);
@@ -60,7 +58,7 @@
   const toDomainSet = text => new Set(
     String(text || "").split(/[, \n\r\t]+/)
       .map(s => s.trim().toLowerCase()).filter(Boolean)
-      .map(s => s.replace(/^https?:\/\//, "").split("/")[0].replace(/:\d+$/, "").replace(/\.$/, ""))
+      .map(s => s.replace(/^https?:\/\//, "").split("/")[0].replace(/\.$/, ""))
   );
 
   // Anchored tracking-pixel patterns (B13): boundaries prevent false hits like
@@ -92,11 +90,10 @@
     if (!el || !(el instanceof HTMLImageElement) || isFailed(el)) return;
     // Merge: src and srcset are armed by separate calls; one must not erase the other.
     const prev = fallbackMeta.get(el) || {};
-    const meta = {
+    fallbackMeta.set(el, {
       originalSrc: originalSrc || prev.originalSrc || "",
       originalSrcset: originalSrcset || prev.originalSrcset || ""
-    };
-    fallbackMeta.set(el, meta);
+    });
     if (fallbackHandlers.has(el)) return;
     fallbackHandlers.add(el);
     el.addEventListener("error", () => {
@@ -104,27 +101,25 @@
       const cur = el.currentSrc || el.src || "";
       if (!isConfiguredProxyUrl(cur)) return;
       if (el.hasAttribute(RESTORED_ATTR)) return; // the other world already restored
-      const m = fallbackMeta.get(el);
-      if (!m) return;
+      const meta = fallbackMeta.get(el);
+      if (!meta) return;
       fallbackMeta.delete(el);
       try { el.setAttribute(RESTORED_ATTR, ""); } catch {}
       // Never proxy this element again, otherwise the restored original is
       // re-proxied and a failing proxy is hit in an endless loop.
       markFailed(el);
-      try { if (m.originalSrcset) nativeSetSrcset(el, m.originalSrcset); } catch {}
-      try { if (m.originalSrc) nativeSetSrc(el, m.originalSrc); } catch {}
+      try { if (meta.originalSrcset) nativeSetSrcset(el, meta.originalSrcset); } catch {}
+      try { if (meta.originalSrc) nativeSetSrc(el, meta.originalSrc); } catch {}
     }, true);
-    // B5: a successful load disarms the fallback — but only THIS arm: compare
-    // by identity so the one-shot listener can't erase a newer arm's meta.
-    el.addEventListener("load", () => {
-      if (fallbackMeta.get(el) === meta) fallbackMeta.delete(el);
-    }, { capture: true, once: true });
+    // B5: a successful load disarms the fallback (a later, unrelated failing
+    // src must not trigger a restore).
+    el.addEventListener("load", () => fallbackMeta.delete(el), { capture: true, once: true });
   }
 
   function updateProxyConfig(next) {
     opts = next;
     const base = String(opts.proxyBase || "").trim();
-    const quality = Math.max(1, Math.min(100, Number(opts.quality ?? 60)));
+    const quality = Math.max(1, Math.min(100, Number(opts.quality ?? 60) || 60));
     const maxWidth = Number(opts.maxWidth) || 0;
     proxyConfig = { base, sep: base.includes("?") ? "&" : "?", quality,
       maxWidth: maxWidth > 0 ? maxWidth : 0, grayscale: !!opts.grayscale };
@@ -138,10 +133,7 @@
     proxyUrlCache.clear();
     pageExcluded = excludedHost(pageHost);
     redirectLive = next.redirect !== false;
-    // Absent = unchanged: content.js omits `failed` from settings publishes
-    // that didn't change the list, so retry entries collected here survive
-    // those publishes.
-    if (Array.isArray(next.failed)) failedUrls = new Set(next.failed);
+    failedUrls = new Set(Array.isArray(next.failed) ? next.failed : []);
     suspended = !!next.suspended;
     ready = true;
     active = !!opts.enabled && !!proxyConfig.base && !pageExcluded && !suspended;
@@ -261,7 +253,7 @@
         excludeDomains: typeof next.excludeDomains === "string" ? next.excludeDomains : "",
         redirect: next.redirect !== false,
         suspended: !!next.suspended,
-        failed: Array.isArray(next.failed) ? next.failed.filter(u => typeof u === "string") : undefined
+        failed: Array.isArray(next.failed) ? next.failed.filter(u => typeof u === "string") : []
       });
       flushPending();
     } catch {}
@@ -355,10 +347,7 @@
     if (pageExcluded) return ss;
     if (el) {
       const cached = srcsetCache.get(el);
-      if (cached) {
-        if (cached.output === ss) return cached.output; // our own write: no-op
-        if (cached.input === ss) return ss;             // site restored the original: leave it
-      }
+      if (cached && (cached.input === ss || cached.output === ss)) return cached.output;
     }
     const cands = parseSrcset(ss);
     let touched = false;
@@ -610,13 +599,6 @@
         setAttr.call(this, name, value);
         processPreloadLink(this);
         return;
-      }
-
-      // href/rel/as/type on anything but <link> can never be an image URL
-      // (<a>, <use>, <base>, SVG elements) — bail before the remaining
-      // instanceof chain. Hot on link-heavy pages.
-      if (n === "href" || n === "rel" || n === "as" || n === "type") {
-        return setAttr.call(this, name, value);
       }
 
       if (this instanceof HTMLImageElement && n === "loading") {

@@ -29,12 +29,18 @@
 //  DNR Rule 2 (CSP) and Rule 3 (Save-Data) are unchanged in purpose.
 // ══════════════════════════════════════════════════════════════════════════════
 
-// Shared defaults: this worker is an ES module ("type": "module" in
-// manifest.json), so DEFAULTS comes from the single source of truth instead
-// of a hand-duplicated inline copy.
-import { DEFAULTS, IMAGE_CONTENT_TYPES } from "./defaults.js";
-// STRICT detected image types (a Set for O(1) membership tests).
-const IMAGE_CONTENT_TYPE_SET = new Set(IMAGE_CONTENT_TYPES);
+// KEEP IN SYNC with defaults.js.
+const DEFAULTS = {
+  enabled:         true,
+  saveData:        true,
+  proxyBase:       "",
+  quality:         60,
+  grayscale:       true,
+  maxWidth:        768,
+  excludeDomains:  "",
+};
+// STRICT detected image types (KEEP IN SYNC with defaults.js).
+const IMAGE_CONTENT_TYPES = new Set(["image/jpeg", "image/png", "image/webp", "image/gif", "image/tiff", "image/jxl"]);
 const ZERO_STATS = { filesProcessed: 0, bytesProcessed: 0, bytesSaved: 0 };
 
 const sameOpts = (a, b) => !!a && !!b && Object.keys(DEFAULTS).every(k => a[k] === b[k]);
@@ -244,10 +250,7 @@ function flushStats() {
     s.bytesProcessed += delta.bytesProcessed;
     s.bytesSaved     += delta.bytesSaved;
     // B8: commit stats and clear the crash mirror in ONE atomic write — a
-    // worker kill between two writes can no longer strand the delta. This
-    // does NOT serialize against the startup recovery's own read-modify-write:
-    // a true overlap is last-writer-wins and can drop or double-count one
-    // delta (counters only, self-healing via Reset stats).
+    // worker kill between two writes can no longer strand the delta.
     chrome.storage.local.set({ stats: s, statsPending: ZERO_STATS }, () => {
       statsFlushInProgress = false;
       if (pendingStats.filesProcessed || pendingStats.bytesProcessed || pendingStats.bytesSaved) scheduleStatsFlush();
@@ -360,7 +363,7 @@ function handleProxyCompleted(details) {
 
   // STRICT detected image types only: count the response only when its actual
   // Content-Type is one of the supported image types.
-  if (!IMAGE_CONTENT_TYPE_SET.has(contentType)) return;
+  if (!IMAGE_CONTENT_TYPES.has(contentType)) return;
 
   const st = getProxyResponseStats(responseHeaders);
   recordStats(st.received, st.saved);
@@ -446,12 +449,7 @@ function bypassReady() {
 const BYPASSABLE_URL_RE = /^https?:\/\/[\x21-\x7b\x7d\x7e]+$/;
 
 function addBypass(tabId, urls) {
-  // A failure with no associated tab (tabId < 0) must NOT become a global
-  // exemption: a session rule without tabIds would allow the URL in EVERY
-  // tab, while flushFallbacks skips the page notification for that same
-  // batch — so the URL would be exempted everywhere with no page told why.
-  if (!Number.isInteger(tabId) || tabId < 0) return Promise.resolve();
-  const tab = tabId;
+  const tab = Number.isInteger(tabId) && tabId >= 0 ? tabId : -1;
   bypassChain = bypassReady().then(async () => {
     const addRules = [];
     for (const url of urls) {
@@ -460,7 +458,8 @@ function addBypass(tabId, urls) {
       if (bypassRules.has(key)) continue;
       const id = bypassNextId++;
       bypassRules.set(key, id);
-      const condition = { urlFilter: "|" + url + "|", resourceTypes: PROXY_REQUEST_TYPES, tabIds: [tab] };
+      const condition = { urlFilter: "|" + url + "|", resourceTypes: PROXY_REQUEST_TYPES };
+      if (tab >= 0) condition.tabIds = [tab];
       addRules.push({ id, priority: PRIORITY_BYPASS, action: { type: "allow" }, condition });
     }
     if (!addRules.length) return;
@@ -597,7 +596,7 @@ function usableProxyBase(proxyBase) {
 // the proxy reads the original URL verbatim to the end of the query string.
 // Exported shape (KEEP IN SYNC with tests): base[?|&]jpeg=0&bw=N&quality=N[&max_width=N]&url=\0
 function redirectSubstitution(opts, base) {
-  const quality = Math.max(1, Math.min(100, Number(opts.quality ?? DEFAULTS.quality)));
+  const quality = Math.max(1, Math.min(100, Number(opts.quality ?? 60) || 60));
   const maxWidth = Number(opts.maxWidth) || 0;
   const parts = ["jpeg=0", "bw=" + (opts.grayscale ? "1" : "0"), "quality=" + quality];
   if (maxWidth > 0) parts.push("max_width=" + maxWidth);
