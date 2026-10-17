@@ -604,7 +604,7 @@ function redirectSubstitution(opts, base) {
   const maxWidth = Number(opts.maxWidth) || 0;
   const parts = ["jpeg=0", "bw=" + (opts.grayscale ? "1" : "0"), "quality=" + quality];
   if (maxWidth > 0) parts.push("max_width=" + maxWidth);
-  // In regexSubstitution "\\" introduces a group reference; escape literals.
+  // In regexSubstitution "\" introduces a group reference; escape literals.
   const safeBase = base.replace(/\\/g, "\\\\");
   return safeBase + (base.includes("?") ? "&" : "?") + parts.join("&") + "&url=\\0";
 }
