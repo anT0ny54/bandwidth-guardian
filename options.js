@@ -191,6 +191,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
 
 qualityPresets.forEach(btn => {
   btn.addEventListener("click", () => {
+    dirty.quality = true; // Preset changes are unsaved edits too.
     qualityPresets.forEach(b => b.classList.remove("active"));
     btn.classList.add("active");
     customQualityEl.value = ""; // preset takes priority; clear custom
@@ -212,6 +213,7 @@ customQualityEl.addEventListener("input", () => {
 
 widthPresets.forEach(btn => {
   btn.addEventListener("click", () => {
+    dirty.width = true; // Preset changes are unsaved edits too.
     widthPresets.forEach(b => b.classList.remove("active"));
     btn.classList.add("active");
     customWidthEl.value = "";
@@ -330,7 +332,7 @@ async function testProxy() {
 
 testProxyBtn.addEventListener("click", testProxy);
 
-// ── Reset ─────────────────────────────────────────────────────────────────────
+// ── Reset ────────────────────────────────────────────────────────────────────
 
 async function resetAll() {
   await chrome.storage.sync.set(DEFAULTS);

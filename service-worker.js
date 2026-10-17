@@ -274,7 +274,7 @@ function handleProxyCompleted(details) {
 // ── DNR rules ─────────────────────────────────────────────────────────────────
 function buildRules(opts, noHeaderMatch) {
   // DNR rejects the whole update on an invalid domain — pass only valid hosts.
-  var excluded = String(opts.excludeDomains || "").split(/[,\s]+/)
+  var excluded = String(opts.excludeDomains || "").split(/[ ,\s]+/)
     .map(function(s) { return s.trim().toLowerCase().replace(/^https?:\/\//, "").split("/")[0].replace(/\.$/, ""); })
     .filter(function(s) { return /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$/.test(s); });
   var excludedDomains = Array.from(new Set(excluded));
@@ -289,7 +289,10 @@ function buildRules(opts, noHeaderMatch) {
   if (opts.enabled && proxyOk) {
     var cspCondition = { resourceTypes: ["main_frame", "sub_frame"] };
     if (!noHeaderMatch) {
-      cspCondition.responseHeaders = [{ name: "content-security-policy", values: ["/img-src/i", "/default-src/i"] }];
+      // DNR HeaderInfo.values uses case-insensitive wildcard patterns, not
+      // regular expressions. The old "/img-src/i" strings never matched CSP
+      // header values reliably, leaving eligible image policies in force.
+      cspCondition.responseHeaders = [{ name: "content-security-policy", values: ["*img-src*", "*default-src*"] }];
     }
     if (excludedDomains.length) cspCondition.excludedRequestDomains = excludedDomains;
     addRules.push({

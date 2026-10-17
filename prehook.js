@@ -1,7 +1,7 @@
 // Bandwidth Guardian — prehook (document_start, page MAIN world).
 // Patches HTMLImageElement/HTMLSourceElement/HTMLLinkElement setters and
 // Element.prototype.setAttribute before page JS runs, so JS-assigned image
-// URLs (including every lazy loader's img.src = dataset.src) are proxied
+// URLs (including every lazy-loader's img.src = dataset.src) are proxied
 // before any network request fires. Chrome-based browsers only.
 (() => {
   "use strict";
@@ -22,7 +22,12 @@
 
   const pending = new Set(); // elements waiting for opts; bounded (see #7)
   const MAX_PENDING = 1000;
-  function queuePending(el) { if (pending.size < MAX_PENDING) pending.add(el); }
+  function queuePending(el) {
+    if (pending.has(el)) return true;
+    if (pending.size >= MAX_PENDING) return false;
+    pending.add(el);
+    return true;
+  }
 
   const fallbackHandlers = new WeakSet();
   const fallbackMeta = new WeakMap();
@@ -366,6 +371,59 @@
     } catch {}
   }
 
+  // HTML parsing bypasses JavaScript property setters. Watch inserted media
+  // nodes in MAIN world as early as possible; while settings are pending, stash
+  // and remove their URLs so the normal queue can apply the final settings.
+  // MutationObserver delivery is asynchronous, so this only narrows the race:
+  // it cannot guarantee that the parser has not already started a DNS lookup.
+  function processParserImage(el) {
+    try {
+      if (destroyed || isFailed(el)) return;
+      const isImg = el instanceof HTMLImageElement;
+      const isSource = !!sourceProto && el instanceof HTMLSourceElement;
+      if (!isImg && !isSource) return;
+
+      if (!ready || !opts) {
+        if (isImg) {
+          const src = el.getAttribute("src");
+          if (src && el.dataset.bhPendingSrc === undefined && (pending.has(el) || pending.size < MAX_PENDING)) {
+            queuePending(el);
+            el.dataset.bhPendingSrc = src;
+            el.removeAttribute("src");
+          }
+        }
+        const srcset = el.getAttribute("srcset");
+        if (srcset && el.dataset.bhPendingSrcset === undefined && (pending.has(el) || pending.size < MAX_PENDING)) {
+          queuePending(el);
+          el.dataset.bhPendingSrcset = srcset;
+          el.removeAttribute("srcset");
+        }
+        return;
+      }
+
+      if (!active) return;
+      if (isImg) {
+        const src = el.getAttribute("src");
+        if (src && el.dataset.bhPendingSrc === undefined) {
+          const decided = decideSrc(src);
+          if (decided !== null && decided !== src) {
+            armProxyFallback(el, resolveHttp(src) || src, el.getAttribute("srcset") || "");
+            nativeSetSrc(el, decided);
+          }
+        }
+      }
+      const srcset = el.getAttribute("srcset");
+      if (srcset && el.dataset.bhPendingSrcset === undefined) {
+        const rewritten = rewriteSrcset(srcset, el);
+        if (rewritten !== srcset) {
+          if (isImg) armProxyFallback(el, "", srcset);
+          if (isImg) nativeSetSrcset(el, rewritten);
+          else nativeSourceSetSrcset(el, rewritten);
+        }
+      }
+    } catch {}
+  }
+
   // ── Patch <img>.src ─────────────────────────────────────────────────────────
   Object.defineProperty(imgProto, "src", {
     configurable: true,
@@ -456,7 +514,7 @@
     });
   }
 
-  // ── Patch <link>.href property for image preloads ───────────────────────────
+  // ── Patch <link>.href property for image preloads ────────────────────────────
   if (linkHrefDesc && linkHrefDesc.set) {
     Object.defineProperty(linkProto, "href", {
       configurable: true,
@@ -546,12 +604,11 @@
     return setAttr.call(this, name, value);
   };
 
-  // ── MutationObservers for parser-created preload links ──────────────────────
-  // C1/O5: two observers. (1) childList catches parser-inserted links — the
-  // HTML parser bypasses all JS patches. (2) attribute watching is limited to
-  // rel/as on <link> elements: relList.add() is unpatchable, while href changes
-  // made by JS already flow through the patched href setter / setAttribute.
-  // Document-wide <a href> observation (the old cost) is gone.
+  // ── MutationObservers for parser-created media and preload links ──────────────
+  // C1/O5: childList catches parser-inserted links, images and sources — the
+  // parser bypasses JavaScript setters. Attribute watching is limited to rel/as
+  // on <link> elements: relList.add() is unpatchable, while href changes made by
+  // JS already flow through the patched href setter / setAttribute.
   const linkObserverGuard = () => destroyed || (ready && !active);
   preloadObserver = new MutationObserver(mutations => {
     if (linkObserverGuard()) return;
@@ -559,8 +616,13 @@
       if (m.type !== "childList") continue;
       m.addedNodes.forEach(n => {
         if (n.nodeType !== 1) return;
+        processParserImage(n);
+        if (n.querySelectorAll) {
+          n.querySelectorAll("img,source").forEach(processParserImage);
+          if (n instanceof HTMLLinkElement) processPreloadLink(n);
+          n.querySelectorAll('link[rel~="preload"]').forEach(processPreloadLink);
+        }
         if (n instanceof HTMLLinkElement) processPreloadLink(n);
-        if (n.querySelectorAll) n.querySelectorAll('link[rel~="preload"]').forEach(processPreloadLink);
       });
     }
   });
