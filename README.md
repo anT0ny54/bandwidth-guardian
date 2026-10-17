@@ -47,7 +47,8 @@ once and before Chrome starts it.
    the original host**. It covers every way a page can ask for an image:
    `<img>`, `srcset`/`<picture>`, preload links, lazy loaders, all CSS
    (inline, same-origin, cross-origin, `@import`, pseudo-elements,
-   `image-set()`), shadow roots, SVG `<image>`, video posters, `new Image()`.
+   `image-set()`), shadow roots, SVG `<image>`, video posters, `new Image()`
+   attached to the document.
    The raw `url=` form relies on the bandwidth-hero-proxy2 contract: an
    unencoded `url` starting with `http` is taken verbatim up to the first
    `&quality=`, `&l=`, `&bw=`, `&jpeg=` or `&max_width=`.

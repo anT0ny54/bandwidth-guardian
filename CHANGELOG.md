@@ -4,6 +4,11 @@
 
 ### Fixed
 
+- Dead code and stale comments removed: the popup defined a `--warn` CSS
+  variable nothing read (its reload bar uses `--warn-text`/`--warn-border`),
+  the Test button carried a `test` class with no matching CSS rule, and the
+  prehook's settings-queue comment described a hard queue cap that no longer
+  exists (the queue is unbounded and released by the watchdog).
 - Preload `<link>` elements created by the HTML parser were inspected twice by
   the preload observer. The second call was harmless (processing is
   idempotent) but wasted work on every page load.
@@ -61,4 +66,3 @@
 - Exemptions for localhost, `*.local`, single-label and private-IP hosts.
 - Real-Chrome test suite (`tests/browser/`, 17 tests) and extended simulation
   tests; the CI build runs them before packaging.
-
