@@ -11,6 +11,8 @@ const ROOT = path.resolve(__dirname, '..');
 const prehook = fs.readFileSync(path.join(ROOT, 'prehook.js'), 'utf8');
 const contentPath = path.join(ROOT, 'content.js');
 const content = fs.existsSync(contentPath) ? fs.readFileSync(contentPath, 'utf8') : null;
+const swPath = path.join(ROOT, 'service-worker.js');
+const serviceWorker = fs.existsSync(swPath) ? fs.readFileSync(swPath, 'utf8') : null;
 
 function extractFunction(source, name) {
   const marker = new RegExp(`function\\s+${name}\\s*\\(`);
@@ -154,11 +156,13 @@ function createDomHarness() {
   const context = {
     document, window, location: { hostname: 'page.example' },
     Element, HTMLImageElement, HTMLSourceElement, HTMLLinkElement, MutationObserver,
-    URL, setTimeout: () => 1, clearTimeout() {}, console, Math
+    URL, setTimeout: () => 1, clearTimeout() {}, console, Math, WeakRef
   };
   vm.createContext(context);
   vm.runInContext(prehook, context, { filename: 'prehook.js' });
 
+  // redirect:false = the network redirect is NOT installed, so the DOM layer
+  // proxies everything (the pre-0.1.9 behaviour). Default: redirect live.
   function publishSettings(overrides = {}) {
     const type = documentElement.dataset.bhSettingsEvent || 'bh-settings-update';
     document.dispatchEvent({
@@ -215,9 +219,9 @@ test('srcset parser preserves descriptors and commas inside image URLs', () => {
   }
 });
 
-test('prehook property setters, setAttribute, and srcset route URLs through the configured proxy', () => {
+test('DOM-fallback mode (no network redirect): setters, setAttribute and srcset route URLs through the proxy', () => {
   const h = createDomHarness();
-  h.publishSettings();
+  h.publishSettings({ redirect: false });
   const img = new h.HTMLImageElement();
   const src = 'https://cdn.example/images/cover.jpg?size=large&v=2';
   img.src = src;
@@ -238,27 +242,71 @@ test('prehook property setters, setAttribute, and srcset route URLs through the 
   assertProxied(candidates[1], b);
 });
 
-test('parser-created images, picture sources, preload links, and 2,005 queued images recover after settings arrive', () => {
+test('redirect live: the DOM layer leaves ordinary URLs alone (no double proxying) and proxies only conflict URLs', () => {
+  const h = createDomHarness();
+  h.publishSettings();
+  const plain = new h.HTMLImageElement();
+  plain.src = 'https://cdn.example/a.jpg?x=1&y=2';
+  assert.equal(plain.getAttribute('src'), 'https://cdn.example/a.jpg?x=1&y=2', 'network redirect owns it');
+  const plainSet = new h.HTMLImageElement();
+  plainSet.srcset = 'https://cdn.example/a.jpg 1x, https://cdn.example/b.jpg 2x';
+  assert.equal(plainSet.getAttribute('srcset'), 'https://cdn.example/a.jpg 1x, https://cdn.example/b.jpg 2x');
+  const conflict = new h.HTMLImageElement();
+  const c = 'https://cdn.example/c.jpg?w=10&quality=80';
+  conflict.src = c;
+  assertProxied(conflict.getAttribute('src'), c);
+  const mixed = new h.HTMLImageElement();
+  mixed.setAttribute('srcset', `https://cdn.example/m.jpg 1x, ${c} 2x`);
+  const parts = mixed.getAttribute('srcset').split(', ').map(x => x.split(' '));
+  assert.equal(parts[0][0], 'https://cdn.example/m.jpg');
+  assert.equal(parts[0][1], '1x');
+  assertProxied(parts[1][0], c);
+  assert.equal(parts[1][1], '2x', 'descriptor preserved');
+  // Already-proxied URLs are never wrapped again.
+  const again = new h.HTMLImageElement();
+  again.src = conflict.getAttribute('src');
+  assert.equal(again.getAttribute('src'), conflict.getAttribute('src'));
+  // A URL whose proxy request already failed in this tab stays direct.
+  h.publishSettings({ failed: [c] });
+  const failed = new h.HTMLImageElement();
+  failed.src = c;
+  assert.equal(failed.getAttribute('src'), c);
+});
+
+test('before settings arrive only conflict URLs are held; ordinary URLs are never delayed', () => {
+  const h = createDomHarness();
+  const plain = new h.HTMLImageElement();
+  plain.src = 'https://cdn.example/plain.jpg';
+  assert.equal(plain.getAttribute('src'), 'https://cdn.example/plain.jpg');
+  const root = new h.Element('div');
+  const parserPlain = new h.HTMLImageElement();
+  parserPlain._attrs.set('src', 'https://cdn.example/parser-plain.jpg');
+  root.appendChild(parserPlain);
+  h.notifyAdded(root);
+  assert.equal(parserPlain.getAttribute('src'), 'https://cdn.example/parser-plain.jpg');
+});
+
+test('parser-created conflict images, picture sources, preload links, and 2,005 queued images recover after settings arrive', () => {
   const h = createDomHarness();
   const root = new h.Element('div');
   const allImages = [];
   for (let i = 0; i < 2005; i++) {
     const img = new h.HTMLImageElement();
-    img._attrs.set('src', `https://cdn.example/parser/${i}.jpg?width=640`); // parser bypasses JS setters
+    img._attrs.set('src', `https://cdn.example/parser/${i}.jpg?width=640&quality=90`); // parser bypasses JS setters
     root.appendChild(img);
     allImages.push(img);
   }
 
   const pictureSource = new h.HTMLSourceElement();
-  const sourceA = 'https://cdn.example/picture/a.webp';
-  const sourceB = 'https://cdn.example/picture/b.webp';
+  const sourceA = 'https://cdn.example/picture/a.webp?x=1&bw=0';
+  const sourceB = 'https://cdn.example/picture/b.webp?x=1&bw=0';
   pictureSource._attrs.set('srcset', `${sourceA} 1x, ${sourceB} 2x`);
   root.appendChild(pictureSource);
 
   const preload = new h.HTMLLinkElement();
   preload._attrs.set('rel', 'preload');
   preload._attrs.set('as', 'image');
-  const preloadUrl = 'https://cdn.example/preload/cover.jpg';
+  const preloadUrl = 'https://cdn.example/preload/cover.jpg?v=1&max_width=900';
   preload._attrs.set('href', preloadUrl);
   root.appendChild(preload);
 
@@ -269,7 +317,7 @@ test('parser-created images, picture sources, preload links, and 2,005 queued im
 
   h.publishSettings();
   for (let i = 0; i < allImages.length; i++) {
-    assertProxied(allImages[i].getAttribute('src'), `https://cdn.example/parser/${i}.jpg?width=640`);
+    assertProxied(allImages[i].getAttribute('src'), `https://cdn.example/parser/${i}.jpg?width=640&quality=90`);
   }
   const rewrittenSources = pictureSource.getAttribute('srcset').split(', ').map(part => part.split(' ')[0]);
   assertProxied(rewrittenSources[0], sourceA);
@@ -280,7 +328,7 @@ test('parser-created images, picture sources, preload links, and 2,005 queued im
 test('content script rewrites URLs in inline CSS background-image', { skip: !content }, () => {
   const rewriteBgSource = extractFunction(content, 'rewriteBg');
   const sandbox = {
-    doneBg: new WeakSet(), active: true,
+    doneBg: new WeakSet(), active: true, failedEls: { has: () => false },
     shouldSkip(url) { try { return !/^https?:$/.test(new URL(url).protocol) || new URL(url).origin === 'https://proxy.example'; } catch { return true; } },
     resolveHttp(url) { try { const u = new URL(url, 'https://page.example/'); return /^https?:$/.test(u.protocol) ? u.href : null; } catch { return null; } },
     buildProxyUrl(url) { return 'https://proxy.example/convert?url=' + encodeURIComponent(url); }
@@ -293,16 +341,69 @@ test('content script rewrites URLs in inline CSS background-image', { skip: !con
   assert.equal((el.style.backgroundImage.match(/https:\/\/proxy\.example\/convert/g) || []).length, 2);
 });
 
-test('coverage report documents known boundaries rather than claiming universal interception', () => {
-  assert.match(prehook, /processParserImage/);
-  assert.match(prehook, /processPreloadLink/);
-  assert.match(prehook, /Object\.defineProperty\(imgProto, "src"/);
-  assert.match(prehook, /Object\.defineProperty\(imgProto, "srcset"/);
-  if (content) {
-    assert.match(content, /function rewriteImg\(/);
-    assert.match(content, /function rewriteBg\(/);
-    assert.match(content, /attributeFilter:\s*\["src",\s*"srcset",\s*"style"\]/);
-    assert.doesNotMatch(content, /SVGImageElement|HTMLVideoElement|CSS\.escape\(/);
+test('duplicated patterns stay in sync across prehook, content script and service worker', { skip: !content || !serviceWorker }, () => {
+  const grab = (src, name) => {
+    const m = new RegExp(`const ${name} = (\/.*\/)([a-z]*);`).exec(src);
+    assert.ok(m, `${name} present`);
+    return new RegExp(m[1].slice(1, -1), m[2]);
+  };
+  for (const name of ['TRACKING_RE', 'SKIP_URL_RE', 'CONFLICT_RE']) {
+    assert.equal(grab(prehook, name).source, grab(content, name).source, `${name} prehook vs content`);
+  }
+  const sb = {};
+  vm.createContext(sb);
+  const consts = serviceWorker.slice(serviceWorker.indexOf('const TRACKING_PATTERNS'), serviceWorker.indexOf('const ALL_RULE_IDS'));
+  vm.runInContext(consts.replace(/^const /gm, 'var '), sb);
+  assert.equal(sb.TRACKING_PATTERNS.join('|'), grab(prehook, 'TRACKING_RE').source, 'DNR tracking rules == TRACKING_RE');
+  assert.equal(sb.SKIP_PATTERN, grab(prehook, 'SKIP_URL_RE').source);
+  assert.equal(sb.CONFLICT_PATTERN, grab(prehook, 'CONFLICT_RE').source);
+});
+
+test('service worker: raw redirect target round-trips through the proxy contract; recovery mirrors getImageUrl', { skip: !serviceWorker }, () => {
+  const sb = { URL, decodeURIComponent };
+  vm.createContext(sb);
+  const consts = serviceWorker.slice(serviceWorker.indexOf('const TRACKING_PATTERNS'), serviceWorker.indexOf('const ALL_RULE_IDS'));
+  vm.runInContext(consts.replace(/^const /gm, 'var ') + '\nvar configuredProxyOrigin = "https://proxy.example";\nvar PROXY_PARAMETER_RE = new RegExp(CONFLICT_PATTERN);\n' +
+    extractFunction(serviceWorker, 'redirectSubstitution') + '\n' + extractFunction(serviceWorker, 'originalFromProxyUrl') +
+    '\nthis.rs = redirectSubstitution; this.orig = originalFromProxyUrl;', sb);
+  const sub = sb.rs({ quality: 55, grayscale: true, maxWidth: 1024 }, 'https://proxy.example/api/index');
+  assert.equal(sub, 'https://proxy.example/api/index?jpeg=0&bw=1&quality=55&max_width=1024&url=\\0');
+  assert.equal(sb.rs({ quality: 60, grayscale: false, maxWidth: 0 }, 'https://proxy.example/x?key=k'), 'https://proxy.example/x?key=k&jpeg=0&bw=0&quality=60&url=\\0');
+  const conflict = new RegExp(sb.CONFLICT_PATTERN);
+  const samples = [
+    'https://cdn.example/a.jpg',
+    'https://cdn.example/a.jpg?x=1&y=2',
+    'https://cdn.example/a%20b+c.jpg?q=%26%3D&z=a+b',
+    'https://cdn.example/a,w_400,h_300/b.webp?url=nested&u=1',
+    'http://cdn.example:8080/p/?a=1&quality_x=2&ql=3'
+  ];
+  for (const original of samples) {
+    assert.ok(!conflict.test(original), `${original} must be raw-safe`);
+    const redirected = sub.replace('\\0', original); // what Chrome builds
+    assert.equal(sb.orig(redirected), original, 'raw form');
+    assert.equal(sb.orig('https://proxy.example/api/index?url=' + encodeURIComponent(original) + '&jpeg=0&bw=0&quality=60'), original, 'encoded form');
+  }
+  for (const bad of ['https://cdn.example/a.jpg?w=1&quality=80', 'https://cdn.example/a.jpg?x&l=2', 'https://cdn.example/a?x=1&bw=1', 'https://cdn.example/a?x=1&jpeg=1', 'https://cdn.example/a?x=1&max_width=5']) {
+    assert.ok(conflict.test(bad), `${bad} must be exempted from the raw redirect`);
+  }
+  assert.equal(sb.orig('https://other.example/api/index?url=https://cdn.example/a.jpg'), null, 'foreign origin ignored');
+  const privRes = sb.PRIVATE_HOST_PATTERNS.map(p => new RegExp(p, 'i'));
+  const priv = { test: u => privRes.some(r => r.test(u)) };
+  for (const u of ['http://localhost/a.png', 'http://localhost:3000/a.png', 'http://app.localhost/a', 'http://nas/photo.jpg', 'http://nas:8080/x', 'http://printer.local/x.png',
+    'http://127.0.0.1/a', 'http://10.1.2.3:81/a', 'http://192.168.0.5/a', 'http://172.16.0.1/a', 'http://172.31.9.9/a', 'http://169.254.1.1/a', 'http://[::1]/a', 'http://[fd00::1]:8080/a', 'http://[fe80::1]/a']) {
+    assert.ok(priv.test(u), `${u} is private`);
+  }
+  for (const u of ['https://cdn.example/a.png', 'https://172.32.0.1/a', 'https://11.0.0.1/a', 'https://example.com/localhost/a.png', 'https://local.example.com/a', 'https://[2001:db8::1]/a', 'https://a.b/10.0.0.1']) {
+    assert.ok(!priv.test(u), `${u} is public`);
   }
 });
-                   
+
+test('architecture markers: network redirect is the primary layer, DOM layers defer to it', { skip: !content || !serviceWorker }, () => {
+  assert.match(serviceWorker, /type: "redirect", redirect: \{ regexSubstitution: substitution \}/);
+  assert.match(serviceWorker, /RULE_ID_ALLOW_PROXY/);
+  assert.match(serviceWorker, /updateSessionRules/);
+  assert.match(serviceWorker, /header: "content-security-policy", values:/, 'HeaderInfo uses `header`, not `name`');
+  assert.match(prehook, /const domHandles = absolute => !redirectLive \|\| CONFLICT_RE\.test\(absolute\)/);
+  assert.match(content, /runtime\.redirect !== false && !CONFLICT_RE\.test\(absolute\)/);
+  assert.match(prehook, /function retryFailed\(/);
+});
