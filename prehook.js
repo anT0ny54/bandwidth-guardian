@@ -31,14 +31,15 @@
   const pageHost = location.hostname.toLowerCase();
   let pageExcluded = false;
 
-  // Keep every element waiting for settings. A hard queue cap lets later
-  // parser-created images fall through with their original URL (and setter-
-  // queued images can remain blank forever). The queue is temporary: settings
-  // normally arrive quickly, and the watchdog releases it after five seconds.
+  // Keep every element waiting for settings. The queue is intentionally
+  // UNBOUNDED (a Set): settings normally arrive quickly, the watchdog
+  // releases the queue after five seconds, and the burst test (2,005 images)
+  // proves it drains fully — a hard cap would strand later parser-created
+  // images with their original URL (and setter-queued images could remain
+  // blank forever).
   const pending = new Set();
   function queuePending(el) {
     if (el) pending.add(el);
-    return true;
   }
 
   const fallbackHandlers = new WeakSet();
@@ -58,7 +59,7 @@
   const toDomainSet = text => new Set(
     String(text || "").split(/[, \n\r\t]+/)
       .map(s => s.trim().toLowerCase()).filter(Boolean)
-      .map(s => s.replace(/^https?:\/\//, "").split("/")[0].replace(/\.$/, ""))
+      .map(s => s.replace(/^https?:\/\//, "").split("/")[0].replace(/:\d+$/, "").replace(/\.$/, ""))
   );
 
   // Anchored tracking-pixel patterns (B13): boundaries prevent false hits like
@@ -90,10 +91,11 @@
     if (!el || !(el instanceof HTMLImageElement) || isFailed(el)) return;
     // Merge: src and srcset are armed by separate calls; one must not erase the other.
     const prev = fallbackMeta.get(el) || {};
-    fallbackMeta.set(el, {
+    const meta = {
       originalSrc: originalSrc || prev.originalSrc || "",
       originalSrcset: originalSrcset || prev.originalSrcset || ""
-    });
+    };
+    fallbackMeta.set(el, meta);
     if (fallbackHandlers.has(el)) return;
     fallbackHandlers.add(el);
     el.addEventListener("error", () => {
@@ -101,25 +103,34 @@
       const cur = el.currentSrc || el.src || "";
       if (!isConfiguredProxyUrl(cur)) return;
       if (el.hasAttribute(RESTORED_ATTR)) return; // the other world already restored
-      const meta = fallbackMeta.get(el);
-      if (!meta) return;
+      const m = fallbackMeta.get(el);
+      if (!m) return;
       fallbackMeta.delete(el);
       try { el.setAttribute(RESTORED_ATTR, ""); } catch {}
       // Never proxy this element again, otherwise the restored original is
       // re-proxied and a failing proxy is hit in an endless loop.
       markFailed(el);
-      try { if (meta.originalSrcset) nativeSetSrcset(el, meta.originalSrcset); } catch {}
-      try { if (meta.originalSrc) nativeSetSrc(el, meta.originalSrc); } catch {}
+      try { if (m.originalSrcset) nativeSetSrcset(el, m.originalSrcset); } catch {}
+      try { if (m.originalSrc) nativeSetSrc(el, m.originalSrc); } catch {}
     }, true);
-    // B5: a successful load disarms the fallback (a later, unrelated failing
-    // src must not trigger a restore).
-    el.addEventListener("load", () => fallbackMeta.delete(el), { capture: true, once: true });
+    // B5: a successful load disarms the fallback — but only THIS arm: compare
+    // by identity so the one-shot listener can't erase a newer arm's meta.
+    el.addEventListener("load", () => {
+      if (fallbackMeta.get(el) === meta) fallbackMeta.delete(el);
+    }, { capture: true, once: true });
+  }
+
+  // KEEP IN SYNC with normQuality in content.js / service-worker.js (pinned by a
+  // test): clamp to 1–100, missing or non-numeric falls back to the default.
+  function normQuality(v) {
+    const n = v == null || v === "" ? NaN : Number(v);
+    return Number.isFinite(n) ? Math.max(1, Math.min(100, n)) : 60;
   }
 
   function updateProxyConfig(next) {
     opts = next;
     const base = String(opts.proxyBase || "").trim();
-    const quality = Math.max(1, Math.min(100, Number(opts.quality ?? 60) || 60));
+    const quality = normQuality(opts.quality);
     const maxWidth = Number(opts.maxWidth) || 0;
     proxyConfig = { base, sep: base.includes("?") ? "&" : "?", quality,
       maxWidth: maxWidth > 0 ? maxWidth : 0, grayscale: !!opts.grayscale };
@@ -133,7 +144,10 @@
     proxyUrlCache.clear();
     pageExcluded = excludedHost(pageHost);
     redirectLive = next.redirect !== false;
-    failedUrls = new Set(Array.isArray(next.failed) ? next.failed : []);
+    // Absent = unchanged: content.js omits `failed` from settings publishes
+    // that didn't change the list, so retry entries collected here survive
+    // those publishes.
+    if (Array.isArray(next.failed)) failedUrls = new Set(next.failed);
     suspended = !!next.suspended;
     ready = true;
     active = !!opts.enabled && !!proxyConfig.base && !pageExcluded && !suspended;
@@ -253,7 +267,7 @@
         excludeDomains: typeof next.excludeDomains === "string" ? next.excludeDomains : "",
         redirect: next.redirect !== false,
         suspended: !!next.suspended,
-        failed: Array.isArray(next.failed) ? next.failed.filter(u => typeof u === "string") : []
+        failed: Array.isArray(next.failed) ? next.failed.filter(u => typeof u === "string") : undefined
       });
       flushPending();
     } catch {}
@@ -347,7 +361,10 @@
     if (pageExcluded) return ss;
     if (el) {
       const cached = srcsetCache.get(el);
-      if (cached && (cached.input === ss || cached.output === ss)) return cached.output;
+      if (cached) {
+        if (cached.output === ss) return cached.output; // our own write: no-op
+        if (cached.input === ss) return ss;             // site restored the original: leave it
+      }
     }
     const cands = parseSrcset(ss);
     let touched = false;
@@ -601,6 +618,13 @@
         return;
       }
 
+      // href/rel/as/type on anything but <link> can never be an image URL
+      // (<a>, <use>, <base>, SVG elements) — bail before the remaining
+      // instanceof chain. Hot on link-heavy pages.
+      if (n === "href" || n === "rel" || n === "as" || n === "type") {
+        return setAttr.call(this, name, value);
+      }
+
       if (this instanceof HTMLImageElement && n === "loading") {
         const v = String(value || "").toLowerCase();
         if (!ready || !opts) {
@@ -753,29 +777,26 @@
   // them — now bypassing the proxy.
   function retryRules(container, base, has, seen) {
     let rules;
-    try { rules = container.cssRules; } catch { return false; } // cross-origin
-    let hit = false;
+    try { rules = container.cssRules; } catch { return; } // cross-origin
     for (let i = rules.length - 1; i >= 0; i--) {
       const r = rules[i];
       try {
         if (r.styleSheet) { // @import
-          if (!seen.has(r.styleSheet)) { seen.add(r.styleSheet); hit = retryRules(r.styleSheet, r.styleSheet.href || base, has, seen) || hit; }
+          if (!seen.has(r.styleSheet)) { seen.add(r.styleSheet); retryRules(r.styleSheet, r.styleSheet.href || base, has, seen); }
           continue;
         }
         const text = r.cssText;
         if (!text || text.indexOf("url(") < 0) continue;
         if (r.constructor && r.constructor.name !== "CSSStyleRule" && r.cssRules) {
-          hit = retryRules(r, base, has, seen) || hit;
+          retryRules(r, base, has, seen);
           continue;
         }
         if (cssUrls(text, base).some(has)) {
           container.deleteRule(i);
           container.insertRule(text, i);
-          hit = true;
         }
       } catch {}
     }
-    return hit;
   }
 
   function retryFailed(items) {
@@ -794,7 +815,6 @@
     const has = abs => { if (!abs || !originals.has(abs)) return false; matched.add(abs); return true; };
     const hasRel = (v, base) => { const r = v ? safeURL(v, base || document.baseURI) : null; if (!r) return false; r.hash = ""; return has(r.href); };
     const reset = (el, name) => { const v = el.getAttribute(name); if (v !== null) setAttr.call(el, name, v); };
-    let found = 0;
     const crossOrigin = [];
 
     for (const root of collectRoots()) {
@@ -820,19 +840,18 @@
             markFailed(el);
             if (ss !== null) setAttr.call(el, "srcset", ss);
             if (src !== null) setAttr.call(el, "src", src);
-            found++;
           } else if (tag === "video") {
-            if (hasRel(el.getAttribute("poster"), el.baseURI) && !el.hasAttribute(FAILED_ATTR)) { markFailed(el); reset(el, "poster"); found++; }
+            if (hasRel(el.getAttribute("poster"), el.baseURI) && !el.hasAttribute(FAILED_ATTR)) { markFailed(el); reset(el, "poster"); }
           } else if (tag === "image" && el.namespaceURI === "http://www.w3.org/2000/svg") {
             if (el.hasAttribute(FAILED_ATTR)) continue;
             const XLINK = "http://www.w3.org/1999/xlink";
             const href = el.getAttribute("href");
             const xhref = el.getAttributeNS(XLINK, "href");
-            if (href && hasRel(href, el.baseURI)) { markFailed(el); setAttr.call(el, "href", href); found++; }
-            else if (xhref && hasRel(xhref, el.baseURI)) { markFailed(el); el.setAttributeNS(XLINK, "xlink:href", xhref); found++; }
+            if (href && hasRel(href, el.baseURI)) { markFailed(el); setAttr.call(el, "href", href); }
+            else if (xhref && hasRel(xhref, el.baseURI)) { markFailed(el); el.setAttributeNS(XLINK, "xlink:href", xhref); }
           } else if (tag === "object" || tag === "embed" || tag === "input") {
             const name = tag === "object" ? "data" : "src";
-            if (hasRel(el.getAttribute(name), el.baseURI) && !el.hasAttribute(FAILED_ATTR)) { markFailed(el); reset(el, name); found++; }
+            if (hasRel(el.getAttribute(name), el.baseURI) && !el.hasAttribute(FAILED_ATTR)) { markFailed(el); reset(el, name); }
           }
           // Inline styles (any element, including the ones above).
           const style = el.getAttribute("style");
@@ -846,7 +865,6 @@
               // insignificant trailing whitespace to force fresh image values.
               if (next === style) next = /\s$/.test(style) ? style.replace(/\s+$/, "") : style + " ";
               setAttr.call(el, "style", next); // re-parse → fresh request
-              found++;
             }
           }
         } catch {}
@@ -861,7 +879,7 @@
         let readable = true;
         try { void sh.cssRules; } catch { readable = false; }
         if (!readable) { crossOrigin.push(sh); continue; }
-        if (retryRules(sh, sh.href || document.baseURI, has, seen)) found++;
+        retryRules(sh, sh.href || document.baseURI, has, seen);
       }
     }
 

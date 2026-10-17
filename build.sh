@@ -105,12 +105,15 @@ def collect(v):
         for x in v.values(): collect(x)
     elif isinstance(v, list):
         for x in v: collect(x)
-collect({k: v for k, v in manifest.items() if k != 'browser_specific_settings'})
+collect(manifest)
 for ref in sorted(refs):
     if not os.path.exists(os.path.join(root, ref)):
         raise SystemExit(f'Manifest references missing file: {ref}')
 PY
 
+# Normalise modes so the zip does not depend on the builder's umask / checkout.
+find "$STAGING" -type d -exec chmod 755 {} +
+find "$STAGING" -type f -exec chmod 644 {} +
 find "$STAGING" -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} +
 rm -f "$ZIPFILE"
 (

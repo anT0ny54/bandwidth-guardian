@@ -22,7 +22,6 @@
       --accent-soft: rgba(8,145,178,.13);
       --ok: #22c55e;
       --ok-soft: rgba(34,197,94,.12);
-      --warn: #f59e0b;
       --warn-soft: rgba(245,158,11,.12);
       --danger: #ef4444;
       --danger-soft: rgba(239,68,68,.12);
@@ -324,7 +323,6 @@
       background: var(--brand-grad);
       color: #fff;
     }
-    .btn.full { width: 100%; }
 
     details { margin: 0; }
     summary {
@@ -550,12 +548,12 @@
           <label class="field-label" for="proxyBase">Proxy URL</label>
           <div class="proxy-row">
             <input id="proxyBase" class="input" type="text" inputmode="url" placeholder="https://your-proxy.example.com" autocomplete="url" spellcheck="false" autocorrect="off" autocapitalize="off">
-            <button id="testProxy" class="btn test" type="button">Test</button>
+            <button id="testProxy" class="btn" type="button">Test</button>
           </div>
           <div class="hint">
             Need a proxy? →
             <a href="https://github.com/anT0ny54/bhp2" target="_blank" rel="noopener">bandwidth-hero-proxy2</a><br>
-            Expects <code>?url=…&amp;quality=…&amp;bw=1&amp;jpeg=0</code>
+            Requests look like <code>?jpeg=0&amp;bw=1&amp;quality=60&amp;max_width=768&amp;url=…</code>
           </div>
         </div>
       </div>
@@ -610,7 +608,7 @@
             </div>
             <div class="advanced-item">
               <div class="advanced-label">Custom max width (px, 0 = no limit)</div>
-              <input id="customWidth" class="input" type="number" min="0" step="10" placeholder="e.g. 1440" inputmode="numeric">
+              <input id="customWidth" class="input" type="number" min="0" max="16384" step="10" placeholder="e.g. 1440" inputmode="numeric">
               <div class="hint">Overrides the width preset when a valid value is entered.</div>
             </div>
           </div>

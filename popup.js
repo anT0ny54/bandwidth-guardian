@@ -23,11 +23,13 @@ let currentTabId = null;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+// Ports are stripped like every other domain normalizer in the project
+// (prehook/content/worker) — "example.com:8080" would never match a hostname.
 function parseDomains(text) {
   return String(text || "")
-    .split(/[ ,\s]+/)
+    .split(/[,\s]+/)
     .map(s => s.trim().toLowerCase()).filter(Boolean)
-    .map(s => s.replace(/^https?:\/\//, "").split("/")[0].replace(/\.$/, ""));
+    .map(s => s.replace(/^https?:\/\//, "").split("/")[0].replace(/:\d+$/, "").replace(/\.$/, ""));
 }
 
 function findExcludedDomain(host, domains) {
@@ -36,17 +38,21 @@ function findExcludedDomain(host, domains) {
 
 // B16: exact-match highlighting. "Nearest" matching lied about custom values
 // (quality 55 highlighted "60"); when nothing matches we show a "Custom" badge.
-let customBadgeEl = null;
+// One badge PER CONTAINER (WeakMap) — quality and width rows can never steal
+// each other's badge.
+const badges = new WeakMap();
 function setCustomBadge(container, show) {
   if (!container) return;
-  if (show && !customBadgeEl) {
-    customBadgeEl = document.createElement("span");
-    customBadgeEl.textContent = "Custom";
-    customBadgeEl.style.cssText = "font-size:11px;opacity:.65;margin-left:8px;vertical-align:middle;";
-    container.appendChild(customBadgeEl);
-  } else if (!show && customBadgeEl) {
-    customBadgeEl.remove();
-    customBadgeEl = null;
+  const badge = badges.get(container);
+  if (show && !badge) {
+    const el = document.createElement("span");
+    el.textContent = "Custom";
+    el.style.cssText = "font-size:11px;opacity:.65;margin-left:8px;vertical-align:middle;";
+    container.appendChild(el);
+    badges.set(container, el);
+  } else if (!show && badge) {
+    badge.remove();
+    badges.delete(container);
   }
 }
 
@@ -61,6 +67,27 @@ function setActivePreset(q) {
 }
 
 function showNudge() { nudge.classList.add("show"); }
+
+// One reload pattern everywhere: settings show the "reload to apply" nudge;
+// nothing auto-reloads. This helper is used by the nudge's Reload button and
+// refuses non-web pages (chrome://, the Web Store, …), where a reload either
+// silently no-ops or throws.
+async function reloadActiveTab() {
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tab?.id) return;
+    let proto = "";
+    try { proto = new URL(tab.url).protocol; } catch { return; }
+    if (proto !== "http:" && proto !== "https:") return;
+    await chrome.tabs.reload(tab.id);
+  } catch {}
+}
+
+// A storage failure must not leave the popup blank with no feedback.
+function reportStorageError() {
+  showNudge();
+  statusText.textContent = "Storage error — retry";
+}
 
 // ── UI state ──────────────────────────────────────────────────────────────────
 
@@ -85,7 +112,9 @@ function updateEnabledUI(enabled) {
 // ── Load ──────────────────────────────────────────────────────────────────────
 
 async function load() {
-  state = await chrome.storage.sync.get(DEFAULTS);
+  try {
+    state = await chrome.storage.sync.get(DEFAULTS);
+  } catch { reportStorageError(); return; }
   applyUI(state);
   loadSiteUI(state);
 }
@@ -95,16 +124,20 @@ load();
 
 enabledEl.addEventListener("change", async () => {
   const enabled = enabledEl.checked;
+  try { await chrome.storage.sync.set({ enabled }); }
+  catch { enabledEl.checked = !enabled; reportStorageError(); return; } // switch must not show an unsaved value
   state.enabled = enabled;
-  await chrome.storage.sync.set({ enabled });
   updateEnabledUI(enabled);
+  showNudge(); // same "reload to apply" pattern as every other setting
 });
 
 // ── Grayscale ─────────────────────────────────────────────────────────────────
 
 grayscaleEl.addEventListener("change", async () => {
-  state.grayscale = grayscaleEl.checked;
-  await chrome.storage.sync.set({ grayscale: grayscaleEl.checked });
+  const grayscale = grayscaleEl.checked;
+  try { await chrome.storage.sync.set({ grayscale }); }
+  catch { grayscaleEl.checked = !grayscale; reportStorageError(); return; }
+  state.grayscale = grayscale;
   showNudge();
 });
 
@@ -113,24 +146,19 @@ grayscaleEl.addEventListener("change", async () => {
 presetBtns.forEach(btn => {
   btn.addEventListener("click", async () => {
     const quality = Number(btn.dataset.q);
-    state.quality = quality;
-    await chrome.storage.sync.set({ quality });
+    if (quality === Number(state.quality)) return; // unchanged: nothing to apply
+    try { await chrome.storage.sync.set({ quality }); }
+    catch { reportStorageError(); return; }
+    state.quality = quality; // only after a successful write: a failed click stays retryable
     setActivePreset(quality);
-    try {
-      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-      if (tab?.id) await chrome.tabs.reload(tab.id);
-    } catch {}
-    window.close();
+    showNudge(); // unified pattern: no unconditional auto-reload
   });
 });
 
-// ── Reload current tab ────────────────────────────────────────────────────────
+// ── Reload current tab (nudge button) ─────────────────────────────────────────
 
 reloadBtn.addEventListener("click", async () => {
-  try {
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (tab?.id) chrome.tabs.reload(tab.id);
-  } catch {}
+  await reloadActiveTab();
   window.close();
 });
 
@@ -170,7 +198,7 @@ async function loadSiteUI(d) {
   const excluded = parseDomains(d.excludeDomains);
   if (findExcludedDomain(currentHost, excluded)) {
     sitePillEl.textContent = "Excluded";
-    sitePillEl.className   = "site-pill excluded";
+    sitePillEl.className   = "site-pill"; // the "excluded" class had no CSS
     sitePillEl.style.display = "";
     excludeBtn.textContent = "✕ Remove exclusion";
   } else {
@@ -183,10 +211,11 @@ async function loadSiteUI(d) {
 
 excludeBtn.addEventListener("click", async () => {
   if (!currentIsWeb || !currentHost) return;
-  const d    = await chrome.storage.sync.get(DEFAULTS);
+  let d;
+  try { d = await chrome.storage.sync.get(DEFAULTS); }
+  catch { reportStorageError(); return; }
   const raw  = String(d.excludeDomains || "");
-  const list = new Set(parseDomains(raw));
-  const excludedDomain = findExcludedDomain(currentHost, Array.from(list));
+  const excludedDomain = findExcludedDomain(currentHost, parseDomains(raw));
   let next;
   if (excludedDomain) {
     // B21: remove only the matching token, preserving the user's separators
@@ -195,11 +224,11 @@ excludeBtn.addEventListener("click", async () => {
       .filter(tok => /[,\s]/.test(tok) || parseDomains(tok)[0] !== excludedDomain)
       .join("");
   } else {
-    list.add(currentHost);
     next = raw.trim() ? raw.replace(/[\s,]*$/, "") + "\n" + currentHost : currentHost;
   }
   state.excludeDomains = next;
-  await chrome.storage.sync.set({ excludeDomains: next });
+  try { await chrome.storage.sync.set({ excludeDomains: next }); }
+  catch { reportStorageError(); return; }
   loadSiteUI(state);
   showNudge(); // page must reload for the change to take effect
 });
@@ -224,5 +253,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== "sync") return;
   for (const [k, v] of Object.entries(changes)) state[k] = v.newValue ?? DEFAULTS[k];
   applyUI(state);
-  if ("excludeDomains" in changes || "enabled" in changes || "proxyBase" in changes) loadSiteUI(state);
+  // The site card depends only on the exclusion list; enabled/proxyBase are
+  // already rendered by applyUI() above.
+  if ("excludeDomains" in changes) loadSiteUI(state);
 });

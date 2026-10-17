@@ -17,15 +17,18 @@
 //   loader promotes them to a real src/srcset URL.
 //
 // Layer 2 — THIS FILE (document_start, isolated world, async after storage)
-//   Catches what prehook cannot:
+//   Backstop for what prehook's setters cannot see:
 //   A) HTML-parser-created <img>/<source> nodes — the C++ parser bypasses JS
-//      setters; rewriting cancels the in-flight original request.
-//   B) Inline CSS background-image via el.style.backgroundImage.
+//      setters. prehook's MutationObserver (processParserImage) normally gets
+//      there first; this pass catches anything it missed, and skips elements
+//      prehook already pointed at the proxy.
+//   B) Inline CSS background-image via el.style.backgroundImage (prehook has
+//      no equivalent, so this layer is the only DOM handler for it).
 //   Parser-created <link rel=preload as=image> hrefs are handled by prehook's
 //   MutationObserver (registered first), so no preload handling is needed here.
 //
-// The old DNR regexSubstitution redirect was removed because DNR cannot
-// encodeURIComponent the captured URL; content scripts can.
+// Layer 0 carries plain URLs raw because DNR cannot encodeURIComponent a
+// capture group; the DOM layers URL-encode the conflict URLs it exempts.
 // ══════════════════════════════════════════════════════════════════════════════
 
 (function () {
@@ -57,41 +60,47 @@
   // prehook.js runs in the page MAIN world and cannot use extension APIs.
   // O7: publish ONLY the fields prehook needs, on a per-load random event name
   // (falling back to the default name when prehook could not expose one).
+  // quality/maxWidth go out PRE-CLAMPED (updateProxyConfig always runs first
+  // and is the single source of truth, so proxyConfig is never null here); `failed` is omitted entirely when unchanged so a
+  // settings publish can never stomp retry entries prehook collected itself.
+  let lastFailedSig = "";
   function publishPrehookSettings(next) {
-    sendToPrehook({
+    const sig = failedUrls.size ? Array.from(failedUrls).sort().join("\n") : "";
+    const payload = {
       enabled: next?.enabled !== false,
       proxyBase: typeof next?.proxyBase === "string" ? next.proxyBase : "",
-      quality: next?.quality,
+      quality: proxyConfig.quality,
       grayscale: !!next?.grayscale,
-      maxWidth: next?.maxWidth,
+      maxWidth: proxyConfig.maxWidth,
       excludeDomains: typeof next?.excludeDomains === "string" ? next.excludeDomains : "",
       redirect: runtime.redirect !== false,
-      suspended: !!runtime.suspended,
-      failed: Array.from(failedUrls)
-    });
+      suspended: !!runtime.suspended
+    };
+    if (sig !== lastFailedSig) payload.failed = Array.from(failedUrls);
+    lastFailedSig = sig;
+    sendToPrehook(payload);
   }
 
   // Anchored tracking-pixel patterns (B13). KEEP IN SYNC with prehook.js.
   const TRACKING_RE = /(?:\/|\.)pagead(?:[/?#]|$)|(?:pixel|cleardot)\.*\.(?:gif|jpe?g)(?:[?#]|$)|google\.[a-z.]+\/(?:ads|generate_204|.*\/log204)(?:[?#]|$)|google-analytics\.[a-z.]+\/(?:r|collect)(?:[?#]|$)|youtube\.[a-z.]+\/(?:api|ptracking|player_204|live_204)(?:[?#]|$)|doubleclick\.[a-z.]+\/(?:pcs|pixel|r)(?:[?#]|$)|googlesyndication\.[a-z.]+\/ddm(?:[?#]|$)|pixel\.facebook\.[a-z.]+|facebook\.[a-z.]+\/(?:tr|impression\.php)(?:[?#]|$)|ad\.bitmedia\.io(?:[/?#]|$)|yahoo\.[a-z.]+\/pixel(?:[?#]|$)|criteo\.net\/img(?:[?#]|$)|ad\.doubleclick\.net(?:[/?#]|$)/i;
 
-  // Favicons, .ico and .svg are never proxied.
+  // Favicons, .ico and .svg are never proxied. KEEP IN SYNC with prehook.js
+  // and SKIP_PATTERN in service-worker.js.
   const SKIP_URL_RE = /favicon|\.(?:ico|svg)(?:[?#]|$)/i;
   // URLs the raw-URL network redirect cannot carry. KEEP IN SYNC with prehook.js
   // and CONFLICT_PATTERN in service-worker.js.
   const CONFLICT_RE = /&(?:quality|l|bw|jpeg|max_width)=/;
 
-  // Known lazy-loader attributes. These are signals only: their values are
-  // never changed or proxied directly. The loader's eventual src/srcset write
-  // is intercepted by prehook, after any template tokens have been resolved.
-  const DEFERRED_SOURCE_ATTRS = [
-    "data-src", "data-srcset", "data-lazy-src", "data-lazy-srcset",
-    "data-original", "data-original-src", "data-original-set",
-    "data-image-src", "data-image-srcset", "data-bg", "data-bgset"
-  ];
+  // Known lazy-loader attributes (KEEP IN SYNC with prehook.js). Signals only:
+  // their values are never changed or proxied directly. The loader's eventual
+  // src/srcset write is intercepted by prehook, after any template tokens have
+  // been resolved. DEFERRED_SOURCE_ATTRS is the union of DEFERRED_URL_ATTRS'
+  // values — one definition, no hand-kept duplicate list.
   const DEFERRED_URL_ATTRS = {
     src: ["data-src", "data-lazy-src", "data-original", "data-original-src", "data-image-src"],
     srcset: ["data-srcset", "data-lazy-srcset", "data-original-set", "data-image-srcset"]
   };
+  const DEFERRED_SOURCE_ATTRS = [...new Set([...DEFERRED_URL_ATTRS.src, ...DEFERRED_URL_ATTRS.srcset])];
   const TEMPLATE_SOURCE_RE = /(?:\$\{[^}]*\}|\{\{?[^}]*\}\}?|%7b[^%]*%7d|__[^_\s]+__)/i;
 
   let opts = null;
@@ -108,7 +117,7 @@
   const fallbackMeta = new WeakMap();
   // prehook lives in the MAIN world; failed elements are flagged with a DOM
   // attribute both worlds can read. This duck-typed set mirrors WeakSet.
-  const FAILED_ATTR = "data-bh-failed";
+  const FAILED_ATTR = "data-bh-failed"; // KEEP IN SYNC with prehook.js
   const RESTORED_ATTR = "data-bh-restored"; // KEEP IN SYNC with prehook.js (B5)
   const failedEls = {
     has: el => !!el && el.nodeType === 1 && el.hasAttribute(FAILED_ATTR),
@@ -122,16 +131,19 @@
 
   // ── Helpers ────────────────────────────────────────────────────────────────
   const safeURL = (u, base = document.baseURI) => { try { return new URL(u, base); } catch { return null; } };
-  const resolveHttp = u => {
+  // Parsed once on the hot path: callers that need a string take .href (O4 —
+  // resolveHttp previously built a URL here and shouldSkip() re-parsed it).
+  const resolveHttpURL = u => {
     const r = safeURL(u);
-    return r && /^https?:$/.test(r.protocol) ? r.href : null;
+    return r && /^https?:$/.test(r.protocol) ? r : null;
   };
+  const resolveHttp = u => { const r = resolveHttpURL(u); return r ? r.href : null; };
 
   function domainSet(text) {
     return new Set(
       String(text || "").split(/[,\s]+/)
         .map(s => s.trim().toLowerCase()).filter(Boolean)
-        .map(s => s.replace(/^https?:\/\//, "").split("/")[0].replace(/\.$/, ""))
+        .map(s => s.replace(/^https?:\/\//, "").split("/")[0].replace(/:\d+$/, "").replace(/\.$/, ""))
     );
   }
 
@@ -146,25 +158,33 @@
     return false;
   }
 
-  // Skip decision for a RESOLVED absolute http(s) URL (O4: parsed once here).
-  function shouldSkip(absolute) {
+  // Skip decision for an already-resolved absolute http(s) URL object.
+  function shouldSkipURL(u) {
     if (!active) return true;
-    const u = safeURL(absolute);
-    if (!u) return true;
-    if (SKIP_URL_RE.test(absolute) || TRACKING_RE.test(absolute)) return true;
+    if (SKIP_URL_RE.test(u.href) || TRACKING_RE.test(u.href)) return true;
     if (u.origin === proxyOrigin) return true; // already proxied
-    if (failedUrls.size && failedUrls.has(stripHash(absolute))) return true; // proxy failed before
+    if (failedUrls.size) {
+      const h = u.hash ? u.href.slice(0, u.href.length - u.hash.length) : u.href;
+      if (failedUrls.has(h)) return true; // proxy failed before
+    }
     // The network redirect owns every non-conflict URL; rewriting it here too
     // would proxy the same image twice.
-    if (runtime.redirect !== false && !CONFLICT_RE.test(absolute)) return true;
+    if (runtime.redirect !== false && !CONFLICT_RE.test(u.href)) return true;
     if (excludedHost(u.hostname)) return true;
     return false;
+  }
+
+  // KEEP IN SYNC with normQuality in prehook.js / service-worker.js (pinned by a
+  // test): clamp to 1–100, missing or non-numeric falls back to the default.
+  function normQuality(v) {
+    const n = v == null || v === "" ? NaN : Number(v);
+    return Number.isFinite(n) ? Math.max(1, Math.min(100, n)) : DEFAULTS.quality;
   }
 
   function updateProxyConfig(next) {
     opts = next;
     const base = String(opts.proxyBase || "").trim();
-    const quality = Math.max(1, Math.min(100, Number(opts.quality ?? 60) || 60));
+    const quality = normQuality(opts.quality);
     const maxWidth = Number(opts.maxWidth) || 0;
     proxyConfig = { base, sep: base.includes("?") ? "&" : "?", quality,
       maxWidth: maxWidth > 0 ? maxWidth : 0, grayscale: !!opts.grayscale };
@@ -174,17 +194,28 @@
   }
 
   function applyOpts(next) {
+    const prev = opts;
+    const wasActive = active;
+    updateProxyConfig(next);       // first: publishes read the clamped config
     publishPrehookSettings(next);
-    updateProxyConfig(next);
-    srcsetCache = new WeakMap();
-    proxyUrlCache.clear();
-    excludedDomains = domainSet(opts.excludeDomains);
-    pageExcluded = excludedHost(pageHost);
+    // Rebuild caches/exclusions only when a Layer-2-relevant field changed.
+    // A saveData-only sync change triggers no observer restart and no rescan
+    // (this layer never reads saveData).
+    const relevant = !prev ||
+      prev.proxyBase !== opts.proxyBase || prev.quality !== opts.quality ||
+      prev.grayscale !== opts.grayscale || prev.maxWidth !== opts.maxWidth ||
+      prev.excludeDomains !== opts.excludeDomains || prev.enabled !== opts.enabled;
+    if (relevant) {
+      srcsetCache = new WeakMap();
+      proxyUrlCache.clear();
+      excludedDomains = domainSet(opts.excludeDomains);
+      pageExcluded = excludedHost(pageHost);
+    }
     active = !!opts.enabled && !!proxyConfig.base && !pageExcluded && !runtime.suspended;
     if (destroyed) return;
     if (active) {
       ensureObserver();
-      scheduleInitialRewrite();
+      if (relevant || !wasActive) scheduleInitialRewrite();
     } else if (mo) {
       mo.disconnect(); // O1: do no work at all while idle
     }
@@ -269,13 +300,16 @@
 
   function rewriteSrcsetValue(ss, el) {
     const cached = srcsetCache.get(el);
-    if (cached && (cached.input === ss || cached.output === ss)) return cached.output;
+    if (cached) {
+      if (cached.output === ss) return cached.output; // our own write: no-op
+      if (cached.input === ss) return ss;             // site restored the original: leave it
+    }
     let touched = false;
     const parts = parseSrcset(ss).map(({ url, desc }) => {
-      const absolute = resolveHttp(url);
-      if (!absolute || shouldSkip(absolute)) return url + (desc ? " " + desc : "");
+      const u = resolveHttpURL(url);
+      if (!u || shouldSkipURL(u)) return url + (desc ? " " + desc : "");
       touched = true;
-      return buildProxyUrl(absolute) + (desc ? " " + desc : "");
+      return buildProxyUrl(u.href) + (desc ? " " + desc : "");
     });
     const output = touched ? parts.join(", ") : ss;
     srcsetCache.set(el, { input: ss, output });
@@ -290,13 +324,15 @@
     Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, "srcset")?.set;
 
   // Restore the original URL once when the PROXY load fails (B5).
+  // Both callers already filter for IMG, so no tag check here.
   function armProxyFallback(el, originalSrc, originalSrcset) {
-    if (!el || el.tagName !== "IMG" || failedEls.has(el)) return;
+    if (!el || failedEls.has(el)) return;
     const prev = fallbackMeta.get(el) || {};
-    fallbackMeta.set(el, {
+    const meta = {
       originalSrc: originalSrc || prev.originalSrc || "",
       originalSrcset: originalSrcset || prev.originalSrcset || ""
-    });
+    };
+    fallbackMeta.set(el, meta);
     if (fallbackHandlers.has(el)) return;
     fallbackHandlers.add(el);
     el.addEventListener("error", () => {
@@ -305,19 +341,23 @@
       try { curURL = new URL(cur); } catch { return; }
       if (!proxyOrigin || curURL.origin !== proxyOrigin) return; // B5
       if (el.hasAttribute(RESTORED_ATTR)) return; // prehook already restored
-      const meta = fallbackMeta.get(el);
-      if (!meta) return;
+      const m = fallbackMeta.get(el);
+      if (!m) return;
       fallbackMeta.delete(el);
       try { el.setAttribute(RESTORED_ATTR, ""); } catch {}
-      failedEls.add(el);
+      failedEls.add(el); // parity with prehook's markFailed: never re-proxy
       try {
-        if (meta.originalSrcset && proxyHost && (el.getAttribute("srcset") || "").includes(proxyHost)) {
-          nativeImgSrcsetSetter?.call(el, meta.originalSrcset);
+        if (m.originalSrcset && proxyHost && (el.getAttribute("srcset") || "").includes(proxyHost)) {
+          nativeImgSrcsetSetter?.call(el, m.originalSrcset);
         }
       } catch {}
-      try { if (meta.originalSrc) nativeImgSrcSetter?.call(el, meta.originalSrc); } catch {}
+      try { if (m.originalSrc) nativeImgSrcSetter?.call(el, m.originalSrc); } catch {}
     }, true);
-    el.addEventListener("load", () => fallbackMeta.delete(el), { capture: true, once: true });
+    // A successful load disarms only THIS arm: compare by identity so the
+    // one-shot listener can't erase the meta of a newer arm (B5 follow-up).
+    el.addEventListener("load", () => {
+      if (fallbackMeta.get(el) === meta) fallbackMeta.delete(el);
+    }, { capture: true, once: true });
   }
 
   // ── A) Parser-created <img src> / <source srcset> ──────────────────────────
@@ -338,10 +378,10 @@
 
     if (el.tagName === "IMG" && !hasDeferredLazySource(el, "src")) {
       const src = el.getAttribute("src");
-      const absoluteSrc = src ? resolveHttp(src) : null;
-      if (absoluteSrc && !shouldSkip(absoluteSrc) && nativeImgSrcSetter) {
-        armProxyFallback(el, absoluteSrc, "");
-        nativeImgSrcSetter.call(el, buildProxyUrl(absoluteSrc));
+      const u = src ? resolveHttpURL(src) : null;
+      if (u && !shouldSkipURL(u) && nativeImgSrcSetter) {
+        armProxyFallback(el, u.href, "");
+        nativeImgSrcSetter.call(el, buildProxyUrl(u.href));
         rewrote = true;
       }
     }
@@ -366,16 +406,16 @@
     if (!el || doneBg.has(el) || failedEls.has(el)) return;
     if (!active) return;
     const bg = el.style.backgroundImage;
-    if (!bg) return;
+    if (!bg || bg === "none") return; // "none" is truthy but can never match url()
 
     const urlRe = /url\(\s*(?:(['"])(.*?)\1|([^)]*?))\s*\)/gi;
     let touched = false;
     const output = bg.replace(urlRe, (full, quote, quoted, bare) => {
       const raw = String(quote ? quoted : bare || "").trim();
-      const absolute = raw ? resolveHttp(raw) : null;
-      if (!absolute || shouldSkip(absolute)) return full;
+      const u = raw ? resolveHttpURL(raw) : null;
+      if (!u || shouldSkipURL(u)) return full;
       touched = true;
-      return `url("${buildProxyUrl(absolute)}")`;
+      return `url("${buildProxyUrl(u.href)}")`;
     });
     if (!touched || output === bg) return;
     el.style.backgroundImage = output;
@@ -391,11 +431,13 @@
   // #17: the [style*='url(' i] scan is kept out of the per-flush hot path; the
   // full-page scan and added-subtree checks below scope it to real candidates.
   const STYLE_SELECTOR = "[style*='url(' i]";
+  // One combined traversal per rescan instead of two (doneImg/doneBg make any
+  // overlap a cheap no-op).
+  const FULL_SELECTOR = CANDIDATE_SELECTOR + "," + STYLE_SELECTOR;
 
   function rewriteAll() {
     if (destroyed || !active) return;
-    document.querySelectorAll(CANDIDATE_SELECTOR).forEach(processCandidate);
-    document.querySelectorAll(STYLE_SELECTOR).forEach(rewriteBg);
+    document.querySelectorAll(FULL_SELECTOR).forEach(processCandidate);
   }
 
   function scheduleInitialRewrite() {
@@ -421,7 +463,15 @@
 
     for (const m of mutations) {
       if (m.type === "childList") {
-        m.addedNodes.forEach(n => { if (n.nodeType === 1) addedRoots.push(n); });
+        m.addedNodes.forEach(n => {
+          if (n.nodeType === 1) {
+            addedRoots.push(n);
+          } else if (n.nodeType === 11) {
+            // DocumentFragment (the standard batch-insert pattern): the
+            // fragment itself is inert — scan its element children.
+            n.childNodes.forEach(c => { if (c.nodeType === 1) addedRoots.push(c); });
+          }
+        });
       } else if (m.type === "attributes") {
         const t = m.target;
         if (!t) continue;
@@ -431,8 +481,8 @@
           if (m.attributeName === "src") {
             // Ignore mutations produced by our own proxy writes.
             const cur = t.getAttribute("src");
-            const abs = cur ? resolveHttp(cur) : null;
-            if (abs && !shouldSkip(abs)) { doneImg.delete(t); imageTargets.add(t); }
+            const u = cur ? resolveHttpURL(cur) : null;
+            if (u && !shouldSkipURL(u)) { doneImg.delete(t); imageTargets.add(t); }
           } else {
             doneImg.delete(t);
             imageTargets.add(t);
@@ -474,12 +524,13 @@
       if (destroyed) return;
       const batch = pendingMutations;
       pendingMutations = [];
-      processMutations(batch);
-      // O6/B15: on overflow, one full rescan recovers the dropped records
-      // instead of leaving those images unproxied.
-      if (mutationOverflow && !destroyed && active) {
+      if (mutationOverflow) {
+        // O6/B15: a full rescan recovers the dropped records — and subsumes
+        // the partial batch work, so skip straight to the rescan.
         mutationOverflow = false;
-        rewriteAll();
+        if (active) rewriteAll();
+      } else {
+        processMutations(batch);
       }
     };
     setTimeout(flush, 0); // macrotask: never starve navigation commit
@@ -521,7 +572,11 @@
     try {
       chrome.runtime.sendMessage({ type: "bh-failed-list" }, res => {
         void chrome.runtime.lastError;
-        if (res && Array.isArray(res.urls)) failedUrls = new Set(res.urls.filter(u => typeof u === "string"));
+        if (res && Array.isArray(res.urls)) {
+          // Merge, don't replace: bh-retry messages may have arrived while
+          // this request was in flight — replacing the Set would drop them.
+          for (const u of res.urls) if (typeof u === "string") failedUrls.add(stripHash(u));
+        }
         clearTimeout(timer); resolve();
       });
     } catch { clearTimeout(timer); resolve(); }
@@ -532,13 +587,22 @@
     if (d.bhOpts) {
       applyOpts(d.bhOpts);
     } else {
-      chrome.storage.sync.get(DEFAULTS, synced => {
-        if (destroyed) return;
-        applyOpts(synced);
-        try { chrome.storage.local.set({ bhOpts: synced }); } catch {}
-      });
+      loadOptsFromSync(true);
     }
   }));
+
+  // Cold-path sync read, shared by both entry points. The mirror write is
+  // wanted only on the very first load; the storage.onChanged sync path
+  // applies in memory only (B4: the worker owns the mirror in steady state).
+  function loadOptsFromSync(writeMirror) {
+    chrome.storage.sync.get(DEFAULTS, synced => {
+      if (destroyed) return;
+      applyOpts(synced);
+      if (writeMirror) {
+        try { chrome.storage.local.set({ bhOpts: synced }); } catch {}
+      }
+    });
+  }
 
   chrome.storage.onChanged.addListener((changes, area) => {
     if (destroyed) return;

@@ -29,19 +29,33 @@
 //  DNR Rule 2 (CSP) and Rule 3 (Save-Data) are unchanged in purpose.
 // ══════════════════════════════════════════════════════════════════════════════
 
-// KEEP IN SYNC with defaults.js.
-const DEFAULTS = {
-  enabled:         true,
-  saveData:        true,
-  proxyBase:       "",
-  quality:         60,
-  grayscale:       true,
-  maxWidth:        768,
-  excludeDomains:  "",
-};
-// STRICT detected image types (KEEP IN SYNC with defaults.js).
-const IMAGE_CONTENT_TYPES = new Set(["image/jpeg", "image/png", "image/webp", "image/gif", "image/tiff", "image/jxl"]);
-const ZERO_STATS = { filesProcessed: 0, bytesProcessed: 0, bytesSaved: 0 };
+// Shared defaults: this worker is an ES module ("type": "module" in
+// manifest.json), so DEFAULTS comes from the single source of truth instead
+// of a hand-duplicated inline copy.
+import { DEFAULTS, IMAGE_CONTENT_TYPES } from "./defaults.js";
+// STRICT detected image types (a Set for O(1) membership tests).
+const IMAGE_CONTENT_TYPE_SET = new Set(IMAGE_CONTENT_TYPES);
+const ZERO_STATS = Object.freeze({ filesProcessed: 0, bytesProcessed: 0, bytesSaved: 0 });
+// Always returns a FRESH, numeric stats object. Storage can hand back null, a
+// partial object or non-numeric values (a failed read passes `undefined`); the
+// old `d.stats || ZERO_STATS` fallback then mutated the shared constant.
+function normStats(v) {
+  return {
+    filesProcessed: Math.max(0, Number(v?.filesProcessed) || 0),
+    bytesProcessed: Math.max(0, Number(v?.bytesProcessed) || 0),
+    bytesSaved:     Math.max(0, Number(v?.bytesSaved) || 0)
+  };
+}
+
+// KEEP IN SYNC with normQuality in prehook.js / content.js (pinned by a test).
+// Quality is clamped to 1–100; a missing or non-numeric value falls back to the
+// default. Before this helper a garbage value became `quality=NaN` in the
+// redirect, while prehook (via JSON null) silently used 60 — two layers, two
+// different requests for the same image.
+function normQuality(v) {
+  const n = v == null || v === "" ? NaN : Number(v);
+  return Number.isFinite(n) ? Math.max(1, Math.min(100, n)) : DEFAULTS.quality;
+}
 
 const sameOpts = (a, b) => !!a && !!b && Object.keys(DEFAULTS).every(k => a[k] === b[k]);
 
@@ -133,6 +147,9 @@ function refreshRules() {
 // write/event storms and could clobber the mirror with stale partial state.
 function mirrorToLocal() {
   chrome.storage.sync.get(DEFAULTS, opts => {
+    // A failed read hands the callback `undefined`; keep the previous origin
+    // and mirror instead of throwing.
+    if (!opts) return;
     setProxyOrigin(opts.proxyBase);
     // B9: stats events that arrived before the origin was known are queued.
     if (configuredProxyOrigin && earlyStatsEvents.length) {
@@ -143,7 +160,7 @@ function mirrorToLocal() {
     // Only write when different: every write makes every open tab rebuild
     // its caches via storage.onChanged.
     chrome.storage.local.get({ bhOpts: null }, d => {
-      if (!sameOpts(d.bhOpts, opts)) chrome.storage.local.set({ bhOpts: opts });
+      if (!sameOpts(d?.bhOpts, opts)) chrome.storage.local.set({ bhOpts: opts });
     });
   });
 }
@@ -177,6 +194,7 @@ updateIcon();
 function updateIcon() {
   chrome.storage.sync.get({ enabled: DEFAULTS.enabled }, d => {
     if (!chrome.action || typeof chrome.action.setIcon !== "function") return;
+    if (!d) return; // failed read: leave the current icon alone
     const on = d.enabled;
     const path = on
       ? { 16: "icons/icon-16.png", 32: "icons/icon-32.png", 48: "icons/icon-48.png", 128: "icons/icon-128.png" }
@@ -245,12 +263,17 @@ function flushStats() {
   const delta = pendingStats;
   pendingStats = { filesProcessed: 0, bytesProcessed: 0, bytesSaved: 0 };
   chrome.storage.local.get({ stats: ZERO_STATS }, d => {
-    const s = d.stats || ZERO_STATS;
+    // A failed read leaves `d` undefined; without this guard the callback threw
+    // before releasing statsFlushInProgress and the delta was lost forever.
+    const s = normStats(d?.stats);
     s.filesProcessed += delta.filesProcessed;
     s.bytesProcessed += delta.bytesProcessed;
     s.bytesSaved     += delta.bytesSaved;
     // B8: commit stats and clear the crash mirror in ONE atomic write — a
-    // worker kill between two writes can no longer strand the delta.
+    // worker kill between two writes can no longer strand the delta. This
+    // does NOT serialize against the startup recovery's own read-modify-write:
+    // a true overlap is last-writer-wins and can drop or double-count one
+    // delta (counters only, self-healing via Reset stats).
     chrome.storage.local.set({ stats: s, statsPending: ZERO_STATS }, () => {
       statsFlushInProgress = false;
       if (pendingStats.filesProcessed || pendingStats.bytesProcessed || pendingStats.bytesSaved) scheduleStatsFlush();
@@ -285,13 +308,13 @@ function recordStats(bytes, saved) {
 // single get of both keys avoids deleting a newer mirror written between the
 // read and the remove (B8 related race).
 chrome.storage.local.get({ stats: ZERO_STATS, statsPending: null }, d => {
-  const p = d.statsPending;
+  const p = d?.statsPending;
   if (!p) return;
   const files = Number(p.filesProcessed) || 0;
   const bytes = Math.max(0, Number(p.bytesProcessed) || 0);
   const saved = Math.max(0, Number(p.bytesSaved) || 0);
   if (!files && !bytes && !saved) { try { chrome.storage.local.remove("statsPending"); } catch {}; return; }
-  const s = d.stats || ZERO_STATS;
+  const s = normStats(d?.stats);
   s.filesProcessed += files;
   s.bytesProcessed += bytes;
   s.bytesSaved     += saved;
@@ -306,9 +329,14 @@ chrome.storage.local.get({ stats: ZERO_STATS, statsPending: null }, d => {
 // fallback; onErrorOccurred feeds fallback and the circuit breaker.
 // "extraHeaders" is not needed for custom x-bh-* headers (B10).
 let webRequestRegistered = false;
+let registeredProxyOrigin = null;
 const PROXY_REQUEST_TYPES = ["image", "object"];
 function updateWebRequestListener(origin) {
   if (!chrome.webRequest || typeof chrome.webRequest.onCompleted !== "object") return;
+  // mirrorToLocal() runs on EVERY sync change (quality, grayscale, …); only an
+  // origin change needs new listeners, and re-registering needlessly leaves a
+  // window in which proxy responses are not observed.
+  if (webRequestRegistered && registeredProxyOrigin === origin) return;
   try {
     if (webRequestRegistered) {
       chrome.webRequest.onCompleted.removeListener(onProxyCompleted);
@@ -324,6 +352,7 @@ function updateWebRequestListener(origin) {
     );
     chrome.webRequest.onErrorOccurred?.addListener(onProxyError, { urls: urls, types: PROXY_REQUEST_TYPES });
     webRequestRegistered = true;
+    registeredProxyOrigin = origin;
   } catch {}
 }
 updateWebRequestListener("");
@@ -363,7 +392,7 @@ function handleProxyCompleted(details) {
 
   // STRICT detected image types only: count the response only when its actual
   // Content-Type is one of the supported image types.
-  if (!IMAGE_CONTENT_TYPES.has(contentType)) return;
+  if (!IMAGE_CONTENT_TYPE_SET.has(contentType)) return;
 
   const st = getProxyResponseStats(responseHeaders);
   recordStats(st.received, st.saved);
@@ -449,7 +478,12 @@ function bypassReady() {
 const BYPASSABLE_URL_RE = /^https?:\/\/[\x21-\x7b\x7d\x7e]+$/;
 
 function addBypass(tabId, urls) {
-  const tab = Number.isInteger(tabId) && tabId >= 0 ? tabId : -1;
+  // A failure with no associated tab (tabId < 0) must NOT become a global
+  // exemption: a session rule without tabIds would allow the URL in EVERY
+  // tab, while flushFallbacks skips the page notification for that same
+  // batch — so the URL would be exempted everywhere with no page told why.
+  if (!Number.isInteger(tabId) || tabId < 0) return Promise.resolve();
+  const tab = tabId;
   bypassChain = bypassReady().then(async () => {
     const addRules = [];
     for (const url of urls) {
@@ -458,8 +492,7 @@ function addBypass(tabId, urls) {
       if (bypassRules.has(key)) continue;
       const id = bypassNextId++;
       bypassRules.set(key, id);
-      const condition = { urlFilter: "|" + url + "|", resourceTypes: PROXY_REQUEST_TYPES };
-      if (tab >= 0) condition.tabIds = [tab];
+      const condition = { urlFilter: "|" + url + "|", resourceTypes: PROXY_REQUEST_TYPES, tabIds: [tab] };
       addRules.push({ id, priority: PRIORITY_BYPASS, action: { type: "allow" }, condition });
     }
     if (!addRules.length) return;
@@ -576,8 +609,11 @@ function readSuspended(cb) {
 // ── DNR rules ─────────────────────────────────────────────────────────────────
 function parseExcluded(text) {
   // DNR rejects the whole update on an invalid domain — pass only valid hosts.
-  var excluded = String(text || "").split(/[ ,\s]+/)
-    .map(function(s) { return s.trim().toLowerCase().replace(/^https?:\/\//, "").split("/")[0].replace(/\.$/, ""); })
+  // Same normalisation as prehook/content/popup (incl. port stripping) so all
+  // three layers agree: "example.com:8080" used to be dropped here by the
+  // validity filter while the DOM layers still excluded it.
+  var excluded = String(text || "").split(/[,\s]+/)
+    .map(function(s) { return s.trim().toLowerCase().replace(/^https?:\/\//, "").split("/")[0].replace(/:\d+$/, "").replace(/\.$/, ""); })
     .filter(function(s) { return /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$/.test(s); });
   return Array.from(new Set(excluded));
 }
@@ -594,9 +630,9 @@ function usableProxyBase(proxyBase) {
 
 // Raw-URL redirect target. The proxy parameters come FIRST and url= LAST, so
 // the proxy reads the original URL verbatim to the end of the query string.
-// Exported shape (KEEP IN SYNC with tests): base[?|&]jpeg=0&bw=N&quality=N[&max_width=N]&url=\0
+// Shape (KEEP IN SYNC with tests): base[?|&]jpeg=0&bw=N&quality=N[&max_width=N]&url=\0
 function redirectSubstitution(opts, base) {
-  const quality = Math.max(1, Math.min(100, Number(opts.quality ?? 60) || 60));
+  const quality = normQuality(opts.quality);
   const maxWidth = Number(opts.maxWidth) || 0;
   const parts = ["jpeg=0", "bw=" + (opts.grayscale ? "1" : "0"), "quality=" + quality];
   if (maxWidth > 0) parts.push("max_width=" + maxWidth);
@@ -709,7 +745,7 @@ function publishRuntime(runtime) {
   if (same) return;
   lastRuntime = runtime;
   chrome.storage.local.get({ bhRuntime: null }, d => {
-    const cur = d.bhRuntime;
+    const cur = d?.bhRuntime;
     if (cur && cur.redirect === runtime.redirect && cur.suspended === runtime.suspended) return;
     chrome.storage.local.set({ bhRuntime: runtime });
   });
@@ -737,14 +773,24 @@ function doRefreshRules(done) {
     } catch (e) { cb(e); }
   };
   chrome.storage.sync.get(DEFAULTS, function(opts) {
+    // A failed storage read hands the callback `undefined`. Without this guard
+    // buildRules() threw inside the callback, `done` never ran and `refreshing`
+    // stayed true for the life of the worker — no later settings change could
+    // ever rebuild the rules. Keep the installed rules and release the lock.
+    if (!opts) { if (typeof done === "function") done(); return; }
+    // Same guarantee if rule building itself throws: install nothing (no
+    // redirect, no CSP strip) rather than wedge the refresh lock.
+    const build = (noHeaderMatch, suspended) => {
+      try { return buildRules(opts, noHeaderMatch, suspended); } catch { return []; }
+    };
     readSuspended(function(suspended) {
-      update(buildRules(opts, false, suspended), function(err) {
+      update(build(false, suspended), function(err) {
         if (!err) { finish(); return; }
         // Retry without response-header matching (older Chromium), then with
         // the header rules only, so Save-Data/CSP survive a redirect problem.
-        update(buildRules(opts, true, suspended), function(err2) {
+        update(build(true, suspended), function(err2) {
           if (!err2) { finish(); return; }
-          update(buildRules(opts, true, true), function() { finish(); });
+          update(build(true, true), function() { finish(); });
         });
       });
     });
