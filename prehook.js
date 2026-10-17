@@ -1,16 +1,12 @@
 // Bandwidth Guardian — prehook (runs at document_start, in the page's MAIN world
 // via manifest "world": "MAIN", so page JavaScript actually hits these patches)
-// Intercepts <img src>, srcset, new Image() assignments AND parser-created
-// <img>/<source> elements (blanked + parked until settings load) to prevent
-// the original full-resolution images — and their DNS lookups — from ever
-// being requested directly.
+// Intercepts <img src>, srcset, and new Image() assignments to prevent the
+// original full-resolution images from ever being downloaded.
 (() => {
   // KEEP IN SYNC WITH defaults.js, content.js and service-worker.js.
   // Bandwidth Guardian uses its configurable custom image-proxy contract.
-  // saveData is intentionally absent: the service worker owns the Save-Data
-  // header and prehook never reads it.
   const defaults = {
-    enabled: true, proxyBase: "", quality: 60, grayscale: true,
+    enabled: true, saveData: true, proxyBase: "", quality: 60, grayscale: true,
     maxWidth: 768, excludeDomains: ""
   };
 
@@ -78,9 +74,8 @@
       .map(s => s.replace(/^https?:\/\//, "").split("/")[0].replace(/\.$/, ""))
   );
   const isHttp = u => /^https?:\/\//i.test(u);
-  // Parity with content.js (KEEP IN SYNC): favicons/.ico and known ad/tracking
-  // URLs. SVG remains eligible because image/svg+xml is a detected image type.
-  const SKIP_URL_RE = /favicon|\.ico(?:[?#]|$)/i;
+  // Parity with content.js (KEEP IN SYNC): favicons/.ico/.svg and known ad/tracking URLs.
+  const SKIP_URL_RE = /favicon|\.(?:ico|svg)(?:[?#]|$)/i;
   // prehook.js runs in the page's MAIN world while content.js runs in the
   // extension's isolated world, so JS objects cannot be shared between them.
   // Elements whose proxy load failed are flagged with a DOM attribute that
@@ -96,8 +91,7 @@
 
   function updateProxyConfig(next) {
     opts = next;
-    // Trim a trailing ? or &: "https://proxy/?" would otherwise produce "…/?&url=…".
-    const base = String(opts.proxyBase || "").trim().replace(/[?&]+$/, "");
+    const base = String(opts.proxyBase || "").trim();
     const quality = Math.max(1, Math.min(100, Number(opts.quality ?? 60) || 60));
     const maxWidth = Number(opts.maxWidth) || 0;
     proxyConfig = { base, sep: base.includes("?") ? "&" : "?", quality,
@@ -114,6 +108,8 @@
     pageExcluded = excludedHost(pageHost);
     ready = true;
   }
+
+  const sameOpts = (a, b) => !!a && !!b && Object.keys(defaults).every(k => a[k] === b[k]);
 
   function buildProxyUrl(orig) {
     if (!proxyConfig || !proxyConfig.base || !isHttp(orig)) return orig;
@@ -185,21 +181,12 @@
         const pendingSrc = el.dataset.bhPendingSrc;
         if (pendingSrc && el instanceof HTMLImageElement) {
           el.removeAttribute("data-bh-pending-src");
-          const decided = decideSrc(pendingSrc);
-          // Arm the failure fallback before assigning: without it a parked
-          // parser-created image whose proxy request fails has no error
-          // handler at all (content.js skips proxy URLs, so it never arms
-          // one for these elements either) and is left as a broken image.
-          if (decided !== null && decided !== pendingSrc) {
-            armProxyFallback(el, resolveHttp(pendingSrc), el.getAttribute("srcset") || "");
-          }
-          nativeSetSrc(el, decided ?? pendingSrc);
+          nativeSetSrc(el, decideSrc(pendingSrc) ?? pendingSrc);
         }
         const pendingSrcset = el.dataset.bhPendingSrcset;
         if (pendingSrcset) {
           el.removeAttribute("data-bh-pending-srcset");
           const rewritten = rewriteSrcset(pendingSrcset, el);
-          if (rewritten !== pendingSrcset) armProxyFallback(el, "", pendingSrcset);
           if (el instanceof HTMLImageElement) {
             nativeSetSrcset(el, rewritten);
           } else if (sourceProto && el instanceof HTMLSourceElement) {
@@ -231,17 +218,6 @@
       const raw = event?.detail;
       const next = typeof raw === "string" ? JSON.parse(raw) : null;
       if (!next || typeof next !== "object") return;
-      // Security: page JavaScript can dispatch this event too, with an
-      // attacker-controlled proxyBase that would hijack every image. The
-      // first event (from content.js at document_start) establishes the
-      // proxy; later events may tune quality/grayscale/exclusions but can
-      // never redirect images to a different proxy host. An empty current
-      // proxyHost (watchdog defaults, proxy not configured) always accepts.
-      if (ready && proxyHost) {
-        let nextHost = "";
-        try { nextHost = new URL(String(next.proxyBase || "")).hostname.toLowerCase(); } catch {}
-        if (nextHost !== proxyHost) return;
-      }
       applyOpts({
         enabled: next.enabled !== false,
         proxyBase: typeof next.proxyBase === "string" ? next.proxyBase : "",
@@ -579,79 +555,9 @@
     return setAttr.call(this, name, value);
   };
 
-  // ── MutationObserver for parser-created nodes ──────────────────────────────
-  // The HTML parser sets attributes natively, bypassing our JS property and
-  // setAttribute patches. Watch for added <img>/<source> elements and link
-  // preloads, plus src/srcset/href/rel/as/type attribute changes.
-  //
-  // DNS hygiene: an eligible parser-created image is blanked and parked until
-  // settings are known, then rewritten to the proxy URL — so the browser
-  // never starts a DNS lookup or a connection to the original host for an
-  // image that will be routed through the proxy anyway. Without this, the
-  // isolated-world pass in content.js reacts ~5–50 ms after the storage read,
-  // and the original fetch (and its DNS query, e.g. on dnsleaktest.com) has
-  // already been issued by then.
-  //
-  // Residual caveat (MV3): Chromium's speculative preload scanner may start
-  // the original fetch during HTML parsing, before any MutationObserver
-  // microtask can run. MV3 removed webRequestBlocking and DNR redirects
-  // cannot URL-encode the captured URL, so a guaranteed pre-network redirect
-  // is impossible; this closes the gap for everything the scanner did not
-  // already fetch.
-  function processParsedImg(el) {
-    try {
-      if (destroyed) return;
-      if (!el || !(el instanceof HTMLImageElement) || isFailed(el)) return;
-      const current = el.getAttribute("src");
-      if (current && current !== "about:blank") {
-        const absolute = resolveHttp(current);
-        if (absolute && !skipAbsolute(absolute)) {
-          const decided = decideSrc(current);
-          if (decided === null) {
-            // Settings not loaded yet: park the original and suppress the fetch.
-            if (el.dataset.bhPendingSrc === undefined) el.dataset.bhPendingSrc = current;
-            queuePending(el);
-            // Defer in case the fetch task is already queued: lazy images are
-            // not fetched until near the viewport.
-            if (el.getAttribute("loading") !== "lazy") setAttr.call(el, "loading", "lazy");
-            nativeSetSrc(el, "about:blank");
-          } else if (decided !== current) {
-            armProxyFallback(el, absolute, el.getAttribute("srcset") || "");
-            nativeSetSrc(el, decided);
-          }
-        }
-      }
-      // Parser may also set srcset; handled by the shared path below.
-      processParsedSrcset(el);
-    } catch {}
-  }
-
-  function processParsedSrcset(el) {
-    try {
-      if (destroyed) return;
-      if (!el || el.nodeType !== 1) return;
-      const isImg = el instanceof HTMLImageElement;
-      if (!isImg && !(sourceProto && el instanceof HTMLSourceElement)) return;
-      const current = el.getAttribute("srcset");
-      if (!current) return; // absent, or already blanked by us
-      if (proxyHost && current.indexOf(proxyHost) !== -1) return; // our own rewrite
-      if (isFailed(el)) return;
-      const native = isImg ? nativeSetSrcset : nativeSourceSetSrcset;
-      if (!ready || !opts) {
-        if (el.dataset.bhPendingSrcset === undefined) el.dataset.bhPendingSrcset = current;
-        queuePending(el);
-        native(el, "");
-        return;
-      }
-      if (!opts.enabled || !opts.proxyBase || pageExcluded) return;
-      const rewritten = rewriteSrcset(current, el);
-      if (rewritten !== current) {
-        armProxyFallback(el, "", current);
-        native(el, rewritten);
-      }
-    } catch {}
-  }
-
+  // ── MutationObserver for <link rel="preload" as="image"> ──────────────────
+  // The HTML parser sets attributes natively, bypassing our JS patches. Watch
+  // for link elements added to the DOM and for rel/as/href/type changes.
   preloadObserver = new MutationObserver(mutations => {
     if (destroyed) return;
     for (const m of mutations) {
@@ -659,35 +565,22 @@
         m.addedNodes.forEach(n => {
           if (n.nodeType !== 1) return;
           if (n instanceof HTMLLinkElement) processPreloadLink(n);
-          else if (n instanceof HTMLImageElement) processParsedImg(n);
-          else if (sourceProto && n instanceof HTMLSourceElement) processParsedSrcset(n);
           if (n.querySelectorAll) {
             n.querySelectorAll('link[rel~="preload"]').forEach(processPreloadLink);
-            n.querySelectorAll("img[src]").forEach(processParsedImg);
-            if (sourceProto) n.querySelectorAll("source[srcset]").forEach(processParsedSrcset);
           }
         });
       } else {
-        const t = m.target;
-        if (m.attributeName === "src") {
-          if (t instanceof HTMLImageElement) processParsedImg(t);
-          else if (t instanceof HTMLLinkElement) processPreloadLink(t);
-        } else if (m.attributeName === "srcset") {
-          if (t instanceof HTMLImageElement) processParsedImg(t);
-          else if (sourceProto && t instanceof HTMLSourceElement) processParsedSrcset(t);
-        } else {
-          processPreloadLink(t); // href / rel / as / type
-        }
+        processPreloadLink(m.target);
       }
     }
   });
   // document exists at document_start even before documentElement is parsed;
-  // observing it with subtree covers the parser-created nodes that follow.
+  // observing it with subtree covers the parser-created links that follow.
   preloadObserver.observe(document, {
     childList: true,
     subtree: true,
     attributes: true,
-    attributeFilter: ["href", "rel", "as", "type", "src", "srcset"]
+    attributeFilter: ["href", "rel", "as", "type"]
   });
 
   // Free the outgoing page immediately on normal navigation. Skip persisted

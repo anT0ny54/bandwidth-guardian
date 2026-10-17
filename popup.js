@@ -102,9 +102,9 @@ presetBtns.forEach(btn => {
   btn.addEventListener("click", async () => {
     const quality = Number(btn.dataset.q);
     await chrome.storage.sync.set({ quality });
-    // No manual highlight update needed: the storage.onChanged listener
-    // re-renders from the change payload, and this popup closes immediately
-    // after the reload anyway.
+    // Single highlight path — the storage.onChanged listener re-renders too,
+    // so the old manual class toggles ran the same work twice.
+    setActivePreset(quality);
     try {
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
       if (tab?.id) await chrome.tabs.reload(tab.id);

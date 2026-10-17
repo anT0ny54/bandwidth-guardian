@@ -14,11 +14,6 @@
 //  Image src rewriting is therefore done in the content scripts, which CAN call
 //  encodeURIComponent. DNR Rule 2 (CSP header stripping) is kept.
 //
-//  Rules 4-6 (image allow/block guard): DNR runs BEFORE the network stack, so
-//  it is the only layer that can stop Chromium's speculative preload scanner
-//  from fetching an original image URL during HTML parsing — a fetch the
-//  content scripts can only cancel after the DNS query has already leaked.
-//
 // ══════════════════════════════════════════════════════════════════════════════
 
 // Kiwi/Cromite do not support ES module service workers ("type": "module"),
@@ -35,25 +30,9 @@ const DEFAULTS = {
 };
 const sameOpts = (a, b) => !!a && !!b && Object.keys(DEFAULTS).every(k => a[k] === b[k]);
 
-const RULE_ID_CSP       = 2; // strips CSP headers so proxy images can load
+const RULE_ID_CSP      = 2;  // strips CSP headers so proxy images can load
 const RULE_ID_SAVE_DATA = 3; // adds Save-Data: on to requests
-const RULE_ID_IMG_PROXY = 4; // allows image responses from the configured proxy
-const RULE_ID_IMG_ICO   = 5; // allows favicons/.ico so site icons keep working
-const RULE_ID_IMG_BLOCK = 6; // blocks direct image loads so origin hosts are never resolved (DNS-leak guard)
-const ALL_RULE_IDS     = [RULE_ID_CSP, RULE_ID_SAVE_DATA, RULE_ID_IMG_PROXY, RULE_ID_IMG_ICO, RULE_ID_IMG_BLOCK];
-
-// Strict detected image types. Statistics are recorded only for proxy
-// responses whose Content-Type matches one of these media types. Parameters
-// such as "; charset=utf-8" are not part of the media type itself.
-const DETECTED_IMAGE_MIME_TYPES = new Set([
-  "image/jpeg",
-  "image/png",
-  "image/webp",
-  "image/gif",
-  "image/tiff",
-  "image/jxl",
-  "image/svg+xml"
-]);
+const ALL_RULE_IDS     = [RULE_ID_CSP, RULE_ID_SAVE_DATA];
 
 // ── Concurrency guard ─────────────────────────────────────────────────────────
 let refreshing     = false;
@@ -112,7 +91,7 @@ chrome.runtime.onInstalled.addListener(function() {
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== "sync") return;
   mirrorToLocal();
-  if ("enabled" in changes || "saveData" in changes || "excludeDomains" in changes || "proxyBase" in changes) refreshRules();
+  if ("enabled" in changes || "saveData" in changes || "excludeDomains" in changes) refreshRules();
   if ("enabled" in changes) updateIcon();
 });
 
@@ -140,27 +119,13 @@ function updateIcon() {
 // proxy's completed network response.
 // bhp2 returns x-bh-compressed-size (the exact response-body size), plus the
 // legacy x-compressed-size / x-original-size / x-bytes-saved headers.
-function getHeaderValue(headers, name) {
+function getHeaderInt(headers, name) {
   if (!Array.isArray(headers)) return null;
   const wanted = String(name).toLowerCase();
   const h = headers.find(h => String(h.name || "").toLowerCase() === wanted);
-  return h ? String(h.value ?? "") : null;
-}
-
-function getHeaderInt(headers, name) {
-  const raw = getHeaderValue(headers, name);
-  if (raw === null) return null;
-  const n = Number.parseInt(raw, 10);
+  if (!h) return null;
+  const n = Number.parseInt(String(h.value || ""), 10);
   return Number.isFinite(n) && n >= 0 ? n : null;
-}
-
-function getResponseContentType(headers) {
-  const value = getHeaderValue(headers, "content-type");
-  return value === null ? "" : value.split(";", 1)[0].trim().toLowerCase();
-}
-
-function isDetectedImageResponse(headers) {
-  return DETECTED_IMAGE_MIME_TYPES.has(getResponseContentType(headers));
 }
 
 function proxyOriginMatches(url) {
@@ -211,6 +176,8 @@ function flushStats() {
   statsFlushInProgress = true;
   const delta = pendingStats;
   pendingStats = { filesProcessed: 0, bytesProcessed: 0, bytesSaved: 0 };
+  // #6: clear the crash-recovery mirror now that the delta is committed.
+  try { chrome.storage.local.set({ statsPending: pendingStats }); } catch {}
   chrome.storage.local.get({ stats: { filesProcessed: 0, bytesProcessed: 0, bytesSaved: 0 } }, d => {
     const s = d.stats || { filesProcessed: 0, bytesProcessed: 0, bytesSaved: 0 };
     s.filesProcessed = Number(s.filesProcessed) || 0;
@@ -219,15 +186,7 @@ function flushStats() {
     s.filesProcessed += delta.filesProcessed;
     s.bytesProcessed += delta.bytesProcessed;
     s.bytesSaved     += delta.bytesSaved;
-    // Clear the crash-recovery mirror only after the statistics transaction
-    // has been committed. Clearing it first could lose the delta if the MV3
-    // worker is killed between the two storage operations.
-    // Mirror the CURRENT in-memory delta (a snapshot copy) instead of zeros:
-    // recordStats() may have run between the get() above and this commit, and
-    // committing emptyPending would discard the crash-recovery mirror for that
-    // delta — exactly the loss #6 guards against. storage.set serializes its
-    // payload synchronously, so the spread is a safe point-in-time snapshot.
-    chrome.storage.local.set({ stats: s, statsPending: { ...pendingStats } }, () => {
+    chrome.storage.local.set({ stats: s }, () => {
       statsFlushInProgress = false;
       if (pendingStats.filesProcessed || pendingStats.bytesProcessed || pendingStats.bytesSaved) scheduleStatsFlush();
     });
@@ -257,15 +216,11 @@ function recordStats(bytes, saved) {
 // flushStats(), then drop the scratch key.
 chrome.storage.local.get({ statsPending: null }, d => {
   const p = d.statsPending;
+  if (p) try { chrome.storage.local.remove("statsPending"); } catch {}
   const files = Number(p?.filesProcessed) || 0;
   const bytes = Math.max(0, Number(p?.bytesProcessed) || 0);
   const saved = Math.max(0, Number(p?.bytesSaved) || 0);
-  if (!files && !bytes && !saved) {
-    if (p) try { chrome.storage.local.remove("statsPending"); } catch {}
-    return;
-  }
-  // Keep statsPending until flushStats() commits it. If the worker is killed
-  // before the flush finishes, the next startup can recover the same delta.
+  if (!files && !bytes && !saved) return;
   pendingStats.filesProcessed += files;
   pendingStats.bytesProcessed += bytes;
   pendingStats.bytesSaved     += saved;
@@ -289,7 +244,6 @@ function onProxyCompleted(details) {
   if (!url || fromCache) return;
   if (typeof statusCode === "number" && (statusCode < 200 || statusCode >= 300)) return;
   if (!configuredProxyOrigin || !isGuardianProxyUrl(url)) return;
-  if (!isDetectedImageResponse(responseHeaders)) return;
 
   // A successful Guardian proxy response is one processed image. The proxy's
   // compressed-size header is authoritative for the bytes actually delivered;
@@ -299,8 +253,8 @@ function onProxyCompleted(details) {
 }
 
 // ── DNR rules ─────────────────────────────────────────────────────────────────
-// Active: Rule 2 (CSP stripping), Rule 3 (Save-Data), Rules 4-6 (image guard).
-// The old Rule 1 (redirect) was removed and its cleanup retired — see top-of-file.
+// Only Rule 2 (CSP stripping) and Rule 3 (Save-Data) are active. The old
+// Rule 1 (redirect) was removed and its cleanup retired — see top-of-file.
 //
 // Uses callback form throughout — the Promise-returning form of chrome APIs
 // (e.g. await chrome.storage.sync.get()) is not available in classic
@@ -329,10 +283,6 @@ function doRefreshRules(done) {
     var excludedDomains = Array.from(new Set(excluded));
     var addRules = [];
 
-    // Hostname of the configured proxy, for the image-guard allow rule.
-    var proxyHost = "";
-    try { proxyHost = new URL(String(opts.proxyBase || "").trim()).hostname.toLowerCase(); } catch (e) { proxyHost = ""; }
-
     // Rule 2: Strip CSP headers so proxy-domain images aren't blocked by the page.
     // CSP only matters for top-level/frame documents, so keep this rule narrow.
     if (opts.enabled) {
@@ -356,11 +306,7 @@ function doRefreshRules(done) {
     // because MV3 cannot use webRequestBlocking for normal extensions. No
     // resourceTypes filter is used, matching the original all-requests behavior.
     if (opts.saveData) {
-      // Never emit an empty condition object: Chromium DNR validators reject a
-      // condition with no fields, which fails the whole updateDynamicRules call
-      // (including the CSP rule in the same update). "urlFilter: '*'" matches
-      // everything and is always valid.
-      var saveDataCondition = { urlFilter: "*" };
+      var saveDataCondition = {};
       if (excludedDomains.length) {
         // Exclude both the destination itself and subresources initiated by an
         // excluded site (for example, its CDN/image host).
@@ -377,42 +323,6 @@ function doRefreshRules(done) {
           ]
         },
         condition: saveDataCondition
-      });
-    }
-
-    // ── DNS-leak guard (Rules 4-6) ──────────────────────────────────────────
-    // Chromium's speculative preload scanner fetches parser-discovered
-    // <img src> URLs during HTML parsing — before document_start scripts or
-    // any MutationObserver microtask can rewrite them. The content scripts
-    // cancel the in-flight fetch after the fact, but by then the DNS query
-    // to the origin image host has already been sent (a DNS leak, e.g. on
-    // dnsleaktest.com when the browser is supposed to resolve everything
-    // through the VPN/proxy). DNR evaluates before the network stack, so a
-    // blocked image request never opens a connection or sends a DNS lookup.
-    if (opts.enabled && proxyHost) {
-      // Proxied images must obviously load.
-      addRules.push({
-        id: RULE_ID_IMG_PROXY,
-        priority: 3,
-        action: { type: "allow" },
-        condition: { urlFilter: "||" + proxyHost, resourceTypes: ["image"] }
-      });
-      // Favicons and .ico resources keep working (tab/site icons).
-      addRules.push({
-        id: RULE_ID_IMG_ICO,
-        priority: 3,
-        action: { type: "allow" },
-        condition: { regexFilter: "favicon|\\.ico([?#]|$)", resourceTypes: ["image"] }
-      });
-      // Everything else image-typed is blocked pre-network. Excluded domains
-      // (matched with subdomains by excludedRequestDomains) stay direct.
-      var imgBlockCondition = { urlFilter: "|http", resourceTypes: ["image"] };
-      if (excludedDomains.length) imgBlockCondition.excludedRequestDomains = excludedDomains;
-      addRules.push({
-        id: RULE_ID_IMG_BLOCK,
-        priority: 1,
-        action: { type: "block" },
-        condition: imgBlockCondition
       });
     }
 

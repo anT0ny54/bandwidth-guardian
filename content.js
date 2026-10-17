@@ -101,9 +101,9 @@
   ].join("|"), "i");
 
 
-  // Favicons and .ico resources are never proxied. SVG remains eligible because
-  // image/svg+xml is included in the strict detected image-type allowlist.
-  const SKIP_URL_RE = /favicon|\.ico(?:[?#]|$)/i;
+  // Favicons, .ico and .svg are never proxied (cheap URL-only check; never load
+  // the original image just to inspect it).
+  const SKIP_URL_RE = /favicon|\.(?:ico|svg)(?:[?#]|$)/i;
 
   // Generic lazy attributes can point at video/audio/fonts/scripts/documents.
   // Never send those URLs to an image proxy. KEEP IN SYNC with bandwidth-saver.
@@ -229,8 +229,7 @@
   // Mirrors original buildCompressUrl() plus himshim proxy2 additions.
   function updateProxyConfig(next) {
     opts = next;
-    // Trim a trailing ? or &: "https://proxy/?" would otherwise produce "…/?&url=…".
-    const base = String(opts.proxyBase || "").trim().replace(/[?&]+$/, "");
+    const base = String(opts.proxyBase || "").trim();
     const quality = Math.max(1, Math.min(100, Number(opts.quality ?? 60) || 60));
     const maxWidth = Number(opts.maxWidth) || 0;
     proxyConfig = { base, sep: base.includes("?") ? "&" : "?", quality,
@@ -561,8 +560,11 @@
     imageTargets.forEach(rewriteImg);
     lazyTargets.forEach(rewriteLazy);
     bgTargets.forEach(rewriteBg);
-    // No trailing clear needed: every batch clears these module-level
-    // collections at entry, so the second clear was redundant.
+
+    addedRoots.length = 0;
+    imageTargets.clear();
+    lazyTargets.clear();
+    bgTargets.clear();
   }
 
   const MUTATION_RECORD_LIMIT = 2000;
