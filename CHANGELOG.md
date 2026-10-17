@@ -61,3 +61,4 @@
 - Exemptions for localhost, `*.local`, single-label and private-IP hosts.
 - Real-Chrome test suite (`tests/browser/`, 17 tests) and extended simulation
   tests; the CI build runs them before packaging.
+

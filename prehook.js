@@ -447,6 +447,7 @@
         }
         return;
       }
+
       if (!active) return;
       if (isImg) {
         const src = el.getAttribute("src");
