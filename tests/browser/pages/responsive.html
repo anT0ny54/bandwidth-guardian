@@ -1,0 +1,11 @@
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"></head><body>
+<img id="r1" sizes="(max-width: 600px) 100px, 300px"
+  srcset="http://cdn.test:__PORT__/img/resp/a,w_100.png?w=100 100w, http://cdn.test:__PORT__/img/resp/b.png?w=300 300w, http://cdn.test:__PORT__/img/resp/c.png?w=600 600w"
+  src="http://cdn.test:__PORT__/img/resp/fallback.png">
+<picture>
+  <source media="(max-width: 600px)" srcset="http://cdn.test:__PORT__/img/resp/pic-small.png?w=50 1x, http://cdn.test:__PORT__/img/resp/pic-small2x.png?w=100 2x">
+  <source srcset="http://cdn.test:__PORT__/img/resp/pic-large.png?w=200">
+  <img id="pic" src="http://cdn.test:__PORT__/img/resp/pic-fallback.png">
+</picture>
+<img id="q1" srcset="http://cdn.test:__PORT__/img/resp/q1.png?w=100&quality=80 1x, http://cdn.test:__PORT__/img/resp/q2.png?w=200&quality=80 2x">
+</body></html>

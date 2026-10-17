@@ -1,0 +1,17 @@
+<!doctype html><html><head><meta charset="utf-8"></head><body>
+<video id="v1" poster="http://cdn.test:__PORT__/img/video/poster.png" width="40" height="30"></video>
+<object id="o1" data="http://cdn.test:__PORT__/img/obj/o.png" type="image/png" width="40" height="30"></object>
+<embed id="e1" src="http://cdn.test:__PORT__/img/obj/e.png" type="image/png" width="40" height="30">
+<object id="o2" data="http://cdn.test:__PORT__/doc.pdf" width="40" height="30"></object>
+<object id="o3" data="http://cdn.test:__PORT__/doc.html" width="40" height="30"></object>
+<canvas id="cv" width="40" height="30"></canvas>
+<script>
+  window.__canvas = new Promise(resolve => {
+    const i = new Image(); i.crossOrigin = 'anonymous';
+    i.onload = () => { const cx = document.getElementById('cv').getContext('2d'); cx.drawImage(i, 0, 0);
+      try { resolve({ ok: true, pixel: Array.from(cx.getImageData(1, 1, 1, 1).data) }); } catch (e) { resolve({ ok: false, err: String(e) }); } };
+    i.onerror = () => resolve({ ok: false, err: 'error' });
+    i.src = 'http://cdn.test:__PORT__/img/obj/canvas.png';
+  });
+  window.__fetch = fetch('http://cdn.test:__PORT__/img/obj/fetch.png').then(r => r.status).catch(e => String(e));
+</script></body></html>

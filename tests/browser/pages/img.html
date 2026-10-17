@@ -1,0 +1,23 @@
+<!doctype html><html><head><meta charset="utf-8"><title>img</title></head><body>
+<img id="p1" src="http://cdn.test:__PORT__/img/img/parser1.png">
+<img id="p2" src="/img/img/parser-relative.png?x=1&y=2&z=%20a+b">
+<div id="dyn"></div>
+<script>
+  const dyn = document.getElementById('dyn');
+  const a = new Image(); a.id = 'js1'; a.src = 'http://cdn.test:__PORT__/img/img/js-src.png'; dyn.append(a);
+  const b = document.createElement('img'); b.id = 'js2'; b.setAttribute('src', 'http://cdn.test:__PORT__/img/img/js-setattr.png'); dyn.append(b);
+  dyn.insertAdjacentHTML('beforeend', '<img id="html1" src="http://cdn.test:__PORT__/img/img/innerhtml.png">');
+  setTimeout(() => { a.src = 'http://cdn.test:__PORT__/img/img/js-src-changed.png'; }, 60);
+  setTimeout(() => {
+    // Mutation burst: 2,500 images inserted in a single task.
+    const f = document.createDocumentFragment();
+    for (let i = 0; i < 2500; i++) {
+      const im = document.createElement('img');
+      im.loading = 'eager'; im.width = 1; im.height = 1; im.className = 'burst';
+      im.src = 'http://cdn.test:__PORT__/img/img/burst/' + i + '.png';
+      f.append(im);
+    }
+    dyn.append(f);
+    window.__burstInserted = true;
+  }, 120);
+</script></body></html>

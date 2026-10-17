@@ -1,0 +1,14 @@
+<!doctype html><html><head><meta charset="utf-8">
+<link id="pl1" rel="preload" as="image" href="http://cdn.test:__PORT__/img/preload/hero.png">
+<link id="pl2" rel="preload" as="image" imagesrcset="http://cdn.test:__PORT__/img/preload/r300.png?w=300 300w, http://cdn.test:__PORT__/img/preload/r600.png?w=600 600w" imagesizes="300px">
+</head><body>
+<img id="hero" src="http://cdn.test:__PORT__/img/preload/hero.png">
+<script>
+  setTimeout(() => {
+    const l = document.createElement('link'); l.id = 'dyn'; l.rel = 'preload'; l.as = 'image';
+    l.href = 'http://cdn.test:__PORT__/img/preload/dyn1.png'; document.head.append(l);
+    setTimeout(() => { l.href = 'http://cdn.test:__PORT__/img/preload/dyn2.png'; }, 120);
+    const m = document.createElement('link'); m.rel = 'preload'; m.href = 'http://cdn.test:__PORT__/img/preload/late-as.png';
+    document.head.append(m); m.as = 'image'; // "as" set after insertion
+  }, 60);
+</script></body></html>

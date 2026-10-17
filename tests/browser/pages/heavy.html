@@ -1,0 +1,22 @@
+<!doctype html><html><head><meta charset="utf-8"><style>img{display:block;width:100%;max-width:600px;height:120px}</style></head><body>
+<div id="h"></div>
+<script>
+  const h = document.getElementById('h');
+  for (let i = 0; i < 600; i++) {
+    const im = document.createElement('img');
+    im.loading = 'lazy';
+    im.sizes = '(max-width: 500px) 100vw, 600px';
+    im.srcset = [100, 300, 600, 1200].map(w => 'http://cdn.test:__PORT__/img/heavy/' + i + '-' + w + '.png?w=' + w + ' ' + w + 'w').join(', ');
+    im.src = 'http://cdn.test:__PORT__/img/heavy/' + i + '-fallback.png';
+    h.append(im);
+  }
+  // Infinite-scroll style dynamic loading.
+  let page = 0;
+  addEventListener('scroll', () => {
+    if (innerHeight + scrollY < document.body.scrollHeight - 400 || page >= 3) return;
+    page++;
+    const box = document.createElement('div');
+    box.innerHTML = Array.from({ length: 50 }, (_, j) => '<img loading="lazy" src="http://cdn.test:__PORT__/img/heavy/more-' + page + '-' + j + '.png">').join('');
+    h.append(box);
+  });
+</script></body></html>

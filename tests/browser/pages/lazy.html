@@ -1,0 +1,19 @@
+<!doctype html><html><head><meta charset="utf-8"><style>.sp{height:3000px}.bgbox{width:40px;height:30px}</style></head><body>
+<div class="sp"></div>
+<img class="lazy" id="l1" data-src="http://cdn.test:__PORT__/img/lazy/one.png" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==">
+<img class="lazy" id="l2" data-srcset="http://cdn.test:__PORT__/img/lazy/t-{width}.png 1x" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==">
+<img id="l3" loading="lazy" src="http://cdn.test:__PORT__/img/lazy/native.png" width="40" height="30">
+<div class="lazy bgbox" id="l4" data-bg="http://cdn.test:__PORT__/img/lazy/bg.png"></div>
+<script>
+  // Minimal lazysizes-style loader: resolves templates, then promotes.
+  const io = new IntersectionObserver(entries => {
+    for (const e of entries) {
+      if (!e.isIntersecting) continue;
+      const el = e.target; io.unobserve(el);
+      if (el.dataset.src) el.src = el.dataset.src;
+      if (el.dataset.srcset) el.srcset = el.dataset.srcset.replace('{width}', '300');
+      if (el.dataset.bg) el.style.backgroundImage = 'url(' + el.dataset.bg + ')';
+    }
+  });
+  document.querySelectorAll('.lazy').forEach(el => io.observe(el));
+</script></body></html>

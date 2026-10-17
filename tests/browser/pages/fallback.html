@@ -1,0 +1,23 @@
+<!doctype html><html><head><meta charset="utf-8">
+<style>
+  .box{width:40px;height:30px;display:inline-block}
+  #fs1{background-image:url(http://cdn.test:__PORT__/img/fallback/proxyfail-sheet.png)}
+  .fps::after{content:"";display:block;width:10px;height:10px;background-image:url(http://cdn.test:__PORT__/img/fallback/proxyfail-pseudo.png)}
+</style>
+<link rel="stylesheet" href="http://cdn.test:__PORT__/css/xf.css?sel=%23fx1&bg=http://cdn.test:__PORT__/img/fallback/proxyfail-xorigin.png">
+</head><body>
+<img id="f1" src="http://cdn.test:__PORT__/img/fallback/proxyfail-1.png">
+<img id="f2" srcset="http://cdn.test:__PORT__/img/fallback/proxyfail-ss.png 1x, http://cdn.test:__PORT__/img/fallback/proxyfail-ss2.png 2x">
+<img id="f3" src="http://cdn.test:__PORT__/img/fallback/proxy403.png">
+<img id="f4" src="http://cdn.test:__PORT__/img/fallback/proxyfail-originfail.png">
+<div class="box" id="fi1" style="background-image:url(http://cdn.test:__PORT__/img/fallback/proxyfail-inline.png)"></div>
+<div class="box" id="fs1"></div><div class="box" id="fx1"></div><div class="fps" id="fps">p</div>
+<video id="fv" poster="http://cdn.test:__PORT__/img/fallback/proxyfail-poster.png" width="40" height="30"></video>
+<svg width="20" height="20"><image id="fsvg" href="http://cdn.test:__PORT__/img/fallback/proxyfail-svg.png" width="10" height="10"/></svg>
+<div id="fch"></div>
+<script>
+  const c = document.getElementById('fch').attachShadow({ mode: 'closed' });
+  c.innerHTML = '<img src="http://cdn.test:__PORT__/img/fallback/proxyfail-closed.png">';
+  window.__closed = () => Array.from(c.querySelectorAll('img')).map(i => [i.complete, i.naturalWidth]);
+  const d = new Image(); d.id = 'fc'; d.src = 'http://cdn.test:__PORT__/img/fallback/proxyfail-conflict.png?w=40&quality=80'; document.body.append(d);
+</script></body></html>

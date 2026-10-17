@@ -1,0 +1,28 @@
+<!doctype html><html><head><meta charset="utf-8">
+<style>
+  .box{width:40px;height:30px;display:inline-block}
+  #s1{background-image:url(http://cdn.test:__PORT__/img/css/sheet-a.png), url("/img/css/sheet-b.png")}
+  @media (min-width: 1px) { #s2{background:url('http://cdn.test:__PORT__/img/css/media.png') no-repeat} }
+  #s3{background-image:image-set(url(http://cdn.test:__PORT__/img/css/set1x.png) 1x, url(http://cdn.test:__PORT__/img/css/set2x.png) 2x)}
+  #s4{border:5px solid;border-image:url(http://cdn.test:__PORT__/img/css/border.png) 30 round}
+  ul#s5{list-style-image:url(http://cdn.test:__PORT__/img/css/list.png)}
+  .ps::before{content:url(http://cdn.test:__PORT__/img/pseudo/before.png)}
+  .ps::after{content:"";display:block;width:10px;height:10px;background-image:url(http://cdn.test:__PORT__/img/pseudo/after.png)}
+</style>
+<link rel="stylesheet" href="/css/same.css?sel=%23s6&bg=http://cdn.test:__PORT__/img/css/samelink.png&bg2=/img/css/samelink-rel.png">
+<link rel="stylesheet" href="http://cdn.test:__PORT__/css/x.css?sel=%23x1&bg=http://cdn.test:__PORT__/img/xcss/bg.png&bg2=/img/xcss/rel.png">
+<style>@import url("http://cdn.test:__PORT__/css/imp.css?sel=%23x2&bg=/img/xcss/import.png");</style>
+</head><body>
+<div class="box" id="i1" style="background-image:url(http://cdn.test:__PORT__/img/css/inline1.png), url('/img/css/inline2.png')"></div>
+<div class="box" id="s1"></div><div class="box" id="s2"></div><div class="box" id="s3"></div>
+<div class="box" id="s4"></div><ul id="s5"><li>x</li></ul><div class="box" id="s6"></div>
+<div class="box" id="x1"></div><div class="box" id="x2"></div>
+<div class="ps" id="ps">p</div>
+<div class="box" id="j1"></div><div class="box" id="j2"></div>
+<script>
+  setTimeout(() => {
+    document.getElementById('j1').style.backgroundImage = 'url(http://cdn.test:__PORT__/img/css/js-style.png)';
+    const sh = document.styleSheets[0];
+    sh.insertRule('#j2{background-image:url(http://cdn.test:__PORT__/img/css/cssom.png)}', sh.cssRules.length);
+  }, 60);
+</script></body></html>

@@ -1,0 +1,8 @@
+<!doctype html><html><head><meta charset="utf-8"><title>many</title></head><body>
+<div id="m"></div>
+<script>
+  const n = Number(new URLSearchParams(location.search).get('n') || 10);
+  const tag = new URLSearchParams(location.search).get('tag') || 'many';
+  const m = document.getElementById('m');
+  for (let i = 0; i < n; i++) { const im = document.createElement('img'); im.className = 'mi'; im.src = 'http://cdn.test:__PORT__/img/' + tag + '/' + i + '.png'; m.append(im); }
+</script></body></html>

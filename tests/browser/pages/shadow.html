@@ -1,0 +1,11 @@
+<!doctype html><html><head><meta charset="utf-8"></head><body>
+<div id="open-host"></div><div id="closed-host"></div>
+<div id="dsd"><template shadowrootmode="open"><img id="dsd-img" src="http://cdn.test:__PORT__/img/shadow/dsd.png"></template></div>
+<script>
+  const o = document.getElementById('open-host').attachShadow({ mode: 'open' });
+  o.innerHTML = '<style>.b{width:40px;height:30px;background:url(http://cdn.test:__PORT__/img/shadow/open-bg.png)}</style><img id="oimg" src="http://cdn.test:__PORT__/img/shadow/open.png"><div class="b"></div>';
+  const c = document.getElementById('closed-host').attachShadow({ mode: 'closed' });
+  c.innerHTML = '<style>.b{width:40px;height:30px;background:url(http://cdn.test:__PORT__/img/shadow/closed-bg.png)}</style><img id="cimg" src="http://cdn.test:__PORT__/img/shadow/closed.png"><div class="b"></div>';
+  setTimeout(() => { const i = document.createElement('img'); i.src = 'http://cdn.test:__PORT__/img/shadow/closed-late.png'; c.append(i); }, 60);
+  window.__closedImgs = () => Array.from(c.querySelectorAll('img')).map(i => [i.currentSrc, i.complete, i.naturalWidth]);
+</script></body></html>
