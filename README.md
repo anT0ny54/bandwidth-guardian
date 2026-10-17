@@ -108,6 +108,10 @@ other. The options page reloads the tab that opened it after a save. The
 service worker only reacts to `storage.sync` changes for the settings keys it
 manages, so unrelated sync writes never trigger rule refreshes.
 
+A quality or max-width value that is not one of the preset buttons is shown
+with a per-group "Custom" badge on the popup and the settings page, instead of
+highlighting a nearby preset.
+
 ## Interception coverage and tests
 
 | Image mechanism | How it is covered | Browser test |

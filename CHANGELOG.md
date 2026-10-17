@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.1
+
+### Fixed
+
+- The settings page's "Custom" badge was a single element shared by the
+  quality and max-width preset groups. With both values customized at once,
+  only one group could show a badge (and it could appear next to the wrong
+  group). Each preset group now owns its own badge.
+- Dead code removed: width preset lookups also read a `data-width` attribute
+  that no element in the markup has (width buttons carry `data-w` only).
+
 ## 0.2.0
 
 ### Fixed

@@ -85,17 +85,20 @@ async function reloadCurrentPage() {
 
 // B16: exact match, or a visible "Custom" badge — the popup and options page
 // now agree, and custom values no longer highlight a nearby preset.
-let customBadgeEl = null;
+// One badge per container: quality and width are customized independently.
+const customBadges = new WeakMap();
 function setCustomBadge(container, show) {
   if (!container) return;
-  if (show && !customBadgeEl) {
-    customBadgeEl = document.createElement("span");
-    customBadgeEl.textContent = "Custom";
-    customBadgeEl.style.cssText = "font-size:11px;opacity:.65;margin-left:8px;vertical-align:middle;";
-    container.appendChild(customBadgeEl);
-  } else if (!show && customBadgeEl) {
-    customBadgeEl.remove();
-    customBadgeEl = null;
+  let badge = customBadges.get(container);
+  if (show && !badge) {
+    badge = document.createElement("span");
+    badge.textContent = "Custom";
+    badge.style.cssText = "font-size:11px;opacity:.65;margin-left:8px;vertical-align:middle;";
+    container.appendChild(badge);
+    customBadges.set(container, badge);
+  } else if (!show && badge) {
+    badge.remove();
+    customBadges.delete(container);
   }
 }
 
@@ -110,7 +113,7 @@ function setQualityUI(q) {
 function setWidthUI(w) {
   w = Number(w) || 0;
   const matched = WIDTH_PRESETS.includes(w);
-  widthPresets.forEach(b => b.classList.toggle("active", Number(b.dataset.w ?? b.dataset.width) === w));
+  widthPresets.forEach(b => b.classList.toggle("active", Number(b.dataset.w) === w));
   setCustomBadge($("widthPresets"), !matched);
   customWidthEl.value = matched ? "" : String(w);
 }
@@ -126,7 +129,7 @@ function readWidth() {
   const v = parseInt(customWidthEl.value, 10);
   if (!isNaN(v) && v >= 0) return v;
   const active = widthPresets.find(b => b.classList.contains("active"));
-  return active ? Number(active.dataset.w ?? active.dataset.width ?? 0) : savedWidth;
+  return active ? Number(active.dataset.w ?? 0) : savedWidth;
 }
 
 // ── Load ──────────────────────────────────────────────────────────────────────
