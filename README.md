@@ -1,7 +1,7 @@
 # Bandwidth Guardian
 
 An MV3 browser extension that routes images through your own
-[bandwidth-hero](https://github.com/anT0ny54/bhp2) compatible proxy,
+[bandwidth-hero-compatible-proxy](https://github.com/anT0ny54/bhp2),
 recompressing them (quality cap, optional grayscale, max-width downscale)
 before they reach the browser — and optionally sends `Save-Data: on` with every
 request.
