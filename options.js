@@ -85,21 +85,17 @@ async function reloadCurrentPage() {
 
 // B16: exact match, or a visible "Custom" badge — the popup and options page
 // now agree, and custom values no longer highlight a nearby preset.
-// Keep one badge per preset group: quality and width can both be custom.
-const customBadges = new WeakMap();
-
+let customBadgeEl = null;
 function setCustomBadge(container, show) {
   if (!container) return;
-  let badge = customBadges.get(container);
-  if (show && !badge) {
-    badge = document.createElement("span");
-    badge.textContent = "Custom";
-    badge.style.cssText = "font-size:11px;opacity:.65;margin-left:8px;vertical-align:middle;";
-    container.appendChild(badge);
-    customBadges.set(container, badge);
-  } else if (!show && badge) {
-    badge.remove();
-    customBadges.delete(container);
+  if (show && !customBadgeEl) {
+    customBadgeEl = document.createElement("span");
+    customBadgeEl.textContent = "Custom";
+    customBadgeEl.style.cssText = "font-size:11px;opacity:.65;margin-left:8px;vertical-align:middle;";
+    container.appendChild(customBadgeEl);
+  } else if (!show && customBadgeEl) {
+    customBadgeEl.remove();
+    customBadgeEl = null;
   }
 }
 
@@ -181,11 +177,11 @@ chrome.storage.onChanged.addListener((changes, area) => {
   if (changes.excludeDomains && !dirty.excludeDomains) {
     excludeEl.value = changes.excludeDomains.newValue || "";
   }
-  if (changes.quality && !dirty.quality) {
+  if (changes.quality && !dirty.quality && !dirty.width) {
     savedQuality = changes.quality.newValue ?? DEFAULTS.quality;
     setQualityUI(savedQuality);
   }
-  if (changes.maxWidth && !dirty.width) {
+  if (changes.maxWidth && !dirty.width && !dirty.quality) {
     savedWidth = changes.maxWidth.newValue ?? DEFAULTS.maxWidth;
     setWidthUI(savedWidth);
   }
@@ -195,7 +191,6 @@ chrome.storage.onChanged.addListener((changes, area) => {
 
 qualityPresets.forEach(btn => {
   btn.addEventListener("click", () => {
-    dirty.quality = true;
     qualityPresets.forEach(b => b.classList.remove("active"));
     btn.classList.add("active");
     customQualityEl.value = ""; // preset takes priority; clear custom
@@ -217,7 +212,6 @@ customQualityEl.addEventListener("input", () => {
 
 widthPresets.forEach(btn => {
   btn.addEventListener("click", () => {
-    dirty.width = true;
     widthPresets.forEach(b => b.classList.remove("active"));
     btn.classList.add("active");
     customWidthEl.value = "";

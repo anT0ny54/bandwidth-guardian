@@ -6,7 +6,7 @@
 (() => {
   "use strict";
 
-  // KEEP IN SYNC WITH content.js: FAILED_ATTR and proxy-failure event contract.
+  // KEEP IN SYNC WITH content.js: FAILED_ATTR / RESTORED_ATTR, event contract.
   const DEFAULT_SETTINGS_EVENT = "bh-settings-update";
 
   let opts = null;
@@ -24,9 +24,11 @@
   const MAX_PENDING = 1000;
   function queuePending(el) { if (pending.size < MAX_PENDING) pending.add(el); }
 
-  const failureHandlers = new WeakSet();
+  const fallbackHandlers = new WeakSet();
+  const fallbackMeta = new WeakMap();
 
   const FAILED_ATTR = "data-bh-failed";
+  const RESTORED_ATTR = "data-bh-restored"; // cross-world one-shot restore dedupe (B5)
   const isFailed = el => !!el && el.nodeType === 1 && el.hasAttribute(FAILED_ATTR);
   const markFailed = el => { try { el.setAttribute(FAILED_ATTR, ""); } catch {} };
 
@@ -58,18 +60,34 @@
   let preloadObserver = null;
   let linkAttrObserver = null;
 
-  function armProxyFailureGuard(el) {
+  function armProxyFallback(el, originalSrc, originalSrcset) {
     if (!el || !(el instanceof HTMLImageElement) || isFailed(el)) return;
-    if (failureHandlers.has(el)) return;
-    failureHandlers.add(el);
-
+    // Merge: src and srcset are armed by separate calls; one must not erase the other.
+    const prev = fallbackMeta.get(el) || {};
+    fallbackMeta.set(el, {
+      originalSrc: originalSrc || prev.originalSrc || "",
+      originalSrcset: originalSrcset || prev.originalSrcset || ""
+    });
+    if (fallbackHandlers.has(el)) return;
+    fallbackHandlers.add(el);
     el.addEventListener("error", () => {
-      // Fail closed: never restore or retry the original URL after a proxy
-      // failure. Mark the element so future writes are not proxied again.
+      // B5: restore ONLY when the URL that failed is actually a proxy URL.
       const cur = el.currentSrc || el.src || "";
       if (!isConfiguredProxyUrl(cur)) return;
+      if (el.hasAttribute(RESTORED_ATTR)) return; // the other world already restored
+      const meta = fallbackMeta.get(el);
+      if (!meta) return;
+      fallbackMeta.delete(el);
+      try { el.setAttribute(RESTORED_ATTR, ""); } catch {}
+      // Never proxy this element again, otherwise the restored original is
+      // re-proxied and a failing proxy is hit in an endless loop.
       markFailed(el);
+      try { if (meta.originalSrcset) nativeSetSrcset(el, meta.originalSrcset); } catch {}
+      try { if (meta.originalSrc) nativeSetSrc(el, meta.originalSrc); } catch {}
     }, true);
+    // B5: a successful load disarms the fallback (a later, unrelated failing
+    // src must not trigger a restore).
+    el.addEventListener("load", () => fallbackMeta.delete(el), { capture: true, once: true });
   }
 
   function updateProxyConfig(next) {
@@ -153,11 +171,11 @@
         const pendingSrc = el.dataset.bhPendingSrc;
         if (pendingSrc && el instanceof HTMLImageElement) {
           el.removeAttribute("data-bh-pending-src");
-          const decided = decideSrc(pendingSrc, el);
+          const decided = decideSrc(pendingSrc);
           // B7: queued values get the same treatment as live-set ones,
-          // including a proxy-failure guard.
+          // including an armed fallback.
           if (decided !== null && decided !== pendingSrc) {
-            armProxyFailureGuard(el);
+            armProxyFallback(el, resolveHttp(pendingSrc) || pendingSrc, el.getAttribute("srcset") || "");
           }
           nativeSetSrc(el, decided ?? pendingSrc);
         }
@@ -170,7 +188,7 @@
           } else {
             const rewritten = rewriteSrcset(pendingSrcset, el);
             if (el instanceof HTMLImageElement) {
-              if (rewritten !== pendingSrcset) armProxyFailureGuard(el);
+              if (rewritten !== pendingSrcset) armProxyFallback(el, "", pendingSrcset);
               nativeSetSrcset(el, rewritten);
             } else if (sourceProto && el instanceof HTMLSourceElement) {
               nativeSourceSetSrcset(el, rewritten);
@@ -287,7 +305,7 @@
 
   function rewriteSrcset(ss, el) {
     if (!ss) return ss;
-    if (pageExcluded || (el && isFailed(el))) return ss;
+    if (pageExcluded) return ss;
     if (el) {
       const cached = srcsetCache.get(el);
       if (cached && (cached.input === ss || cached.output === ss)) return cached.output;
@@ -305,8 +323,7 @@
     return output;
   }
 
-  function decideSrc(original, el) {
-    if (el && isFailed(el)) return original;
+  function decideSrc(original) {
     if (!original || !String(original).trim()) return original; // clearing src
     const absolute = resolveHttp(original);
     if (!absolute) return original;
@@ -356,13 +373,13 @@
     get: srcDesc.get,
     set(value) {
       try {
-        const decided = decideSrc(String(value), this);
+        const decided = isFailed(this) ? String(value) : decideSrc(String(value));
         if (decided === null) {
           this.dataset.bhPendingSrc = String(value);
           queuePending(this);
           // B6: write nothing while pending — no about:blank fake error.
         } else {
-          if (decided !== String(value)) armProxyFailureGuard(this);
+          if (decided !== String(value)) armProxyFallback(this, resolveHttp(String(value)), this.getAttribute("srcset") || "");
           nativeSetSrc(this, decided);
         }
       } catch { nativeSetSrc(this, value); }
@@ -386,7 +403,7 @@
             nativeSetSrcset(this, v);
           } else {
             const rewritten = rewriteSrcset(v, this);
-            if (rewritten !== v) armProxyFailureGuard(this);
+            if (rewritten !== v) armProxyFallback(this, "", v);
             nativeSetSrcset(this, rewritten);
           }
         } catch { nativeSetSrcset(this, value); }
@@ -448,7 +465,7 @@
       set(value) {
         try {
           if (isImagePreloadLink(this)) {
-            const decided = decideSrc(String(value), this);
+            const decided = decideSrc(String(value));
             if (decided === null) {
               this.dataset.bhPreloadHref = String(value);
               queuePending(this);
@@ -494,13 +511,13 @@
 
       if (this instanceof HTMLImageElement && (n === "src" || n === "srcset")) {
         if (n === "src") {
-          const decided = decideSrc(String(value), this);
+          const decided = isFailed(this) ? String(value) : decideSrc(String(value));
           if (decided === null) {
             this.dataset.bhPendingSrc = String(value);
             queuePending(this);
             return; // B6: write nothing while pending
           }
-          if (decided !== String(value)) armProxyFailureGuard(this);
+          if (decided !== String(value)) armProxyFallback(this, resolveHttp(String(value)), this.getAttribute("srcset") || "");
           return setAttr.call(this, "src", decided);
         }
         const v = String(value || "");
@@ -511,7 +528,7 @@
         }
         if (!opts.enabled || !opts.proxyBase) return setAttr.call(this, "srcset", v);
         const rewritten = rewriteSrcset(v, this);
-        if (rewritten !== v) armProxyFailureGuard(this);
+        if (rewritten !== v) armProxyFallback(this, "", v);
         return setAttr.call(this, "srcset", rewritten);
       }
 

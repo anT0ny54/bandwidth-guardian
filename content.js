@@ -80,15 +80,18 @@
   let active = false; // enabled && proxyBase set && !pageExcluded (O1)
   let proxyConfig = null;
   let proxyOrigin = "";  // C2: origin-based identity, matching the worker
+  let proxyHost = "";    // hostname only, for srcset substring checks
   let destroyed = false;
   const proxyUrlCache = new Map();
   const PROXY_CACHE_LIMIT = 512;
   const doneImg = new WeakSet();
   const doneBg = new WeakSet();
-  const failureHandlers = new WeakSet();
+  const fallbackHandlers = new WeakSet();
+  const fallbackMeta = new WeakMap();
   // prehook lives in the MAIN world; failed elements are flagged with a DOM
   // attribute both worlds can read. This duck-typed set mirrors WeakSet.
   const FAILED_ATTR = "data-bh-failed";
+  const RESTORED_ATTR = "data-bh-restored"; // KEEP IN SYNC with prehook.js (B5)
   const failedEls = {
     has: el => !!el && el.nodeType === 1 && el.hasAttribute(FAILED_ATTR),
     add(el) { try { el.setAttribute(FAILED_ATTR, ""); } catch {} }
@@ -145,6 +148,7 @@
       maxWidth: maxWidth > 0 ? maxWidth : 0, grayscale: !!opts.grayscale };
     const parsed = safeURL(base);
     proxyOrigin = parsed ? parsed.origin : "";
+    proxyHost = parsed ? parsed.hostname.toLowerCase() : "";
   }
 
   function applyOpts(next) {
@@ -256,26 +260,42 @@
     return output;
   }
 
-  // In the isolated world this descriptor is the untouched native setter,
-  // used to proxy parser-created src values without re-entering page hooks.
+  // In the isolated world these descriptors ARE the untouched native setters —
+  // exactly what the fallback restore needs to bypass re-proxying.
   const nativeImgSrcSetter =
     Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, "src")?.set;
+  const nativeImgSrcsetSetter =
+    Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, "srcset")?.set;
 
-  // Fail closed when a proxied image cannot load. The original URL is never
-  // restored or retried, preventing a broken proxy from causing a direct
-  // full-bandwidth request.
-  function armProxyFailureGuard(el) {
+  // Restore the original URL once when the PROXY load fails (B5).
+  function armProxyFallback(el, originalSrc, originalSrcset) {
     if (!el || el.tagName !== "IMG" || failedEls.has(el)) return;
-    if (failureHandlers.has(el)) return;
-    failureHandlers.add(el);
-
+    const prev = fallbackMeta.get(el) || {};
+    fallbackMeta.set(el, {
+      originalSrc: originalSrc || prev.originalSrc || "",
+      originalSrcset: originalSrcset || prev.originalSrcset || ""
+    });
+    if (fallbackHandlers.has(el)) return;
+    fallbackHandlers.add(el);
     el.addEventListener("error", () => {
       const cur = el.currentSrc || el.src || "";
       let curURL = null;
       try { curURL = new URL(cur); } catch { return; }
       if (!proxyOrigin || curURL.origin !== proxyOrigin) return; // B5
+      if (el.hasAttribute(RESTORED_ATTR)) return; // prehook already restored
+      const meta = fallbackMeta.get(el);
+      if (!meta) return;
+      fallbackMeta.delete(el);
+      try { el.setAttribute(RESTORED_ATTR, ""); } catch {}
       failedEls.add(el);
+      try {
+        if (meta.originalSrcset && proxyHost && (el.getAttribute("srcset") || "").includes(proxyHost)) {
+          nativeImgSrcsetSetter?.call(el, meta.originalSrcset);
+        }
+      } catch {}
+      try { if (meta.originalSrc) nativeImgSrcSetter?.call(el, meta.originalSrc); } catch {}
     }, true);
+    el.addEventListener("load", () => fallbackMeta.delete(el), { capture: true, once: true });
   }
 
   // ── A) Parser-created <img src> / <source srcset> ──────────────────────────
@@ -298,7 +318,7 @@
       const src = el.getAttribute("src");
       const absoluteSrc = src ? resolveHttp(src) : null;
       if (absoluteSrc && !shouldSkip(absoluteSrc) && nativeImgSrcSetter) {
-        armProxyFailureGuard(el);
+        armProxyFallback(el, absoluteSrc, "");
         nativeImgSrcSetter.call(el, buildProxyUrl(absoluteSrc));
         rewrote = true;
       }
@@ -309,7 +329,7 @@
       if (ss) {
         const output = rewriteSrcsetValue(ss, el);
         if (output !== ss) {
-          if (el.tagName === "IMG") armProxyFailureGuard(el);
+          if (el.tagName === "IMG") armProxyFallback(el, "", ss);
           el.setAttribute("srcset", output);
           rewrote = true;
         }

@@ -124,17 +124,6 @@ function getHeaderInt(headers, name) {
   return Number.isFinite(n) && n >= 0 ? n : null;
 }
 
-// Fail closed unless the response has exactly one unambiguous, supported
-// Content-Type. A comma-joined or duplicate header is not accepted.
-function getStrictImageContentType(headers) {
-  if (!Array.isArray(headers)) return null;
-  const matches = headers.filter(h => String(h.name || "").toLowerCase() === "content-type");
-  if (matches.length !== 1) return null;
-  const raw = String(matches[0].value ?? "").trim();
-  const mediaType = raw.split(";", 1)[0].trim().toLowerCase();
-  return IMAGE_CONTENT_TYPES.has(mediaType) ? mediaType : null;
-}
-
 function isGuardianProxyUrl(url) {
   if (!configuredProxyOrigin) return false;
   try {
@@ -272,10 +261,11 @@ function handleProxyCompleted(details) {
   if (typeof statusCode === "number" && (statusCode < 200 || statusCode >= 300)) return;
   if (!isGuardianProxyUrl(url)) return;
 
-  // Count only a response with one unambiguous, supported Content-Type.
-  // This validates the proxy response, not the original upstream resource.
-  const contentType = getStrictImageContentType(responseHeaders);
-  if (!contentType) return;
+  // STRICT detected image types only: count the response only when its actual
+  // Content-Type is one of the supported image types.
+  const contentType = (getHeaderValue(responseHeaders, "content-type") || "")
+    .split(";")[0].trim().toLowerCase();
+  if (!IMAGE_CONTENT_TYPES.has(contentType)) return;
 
   const st = getProxyResponseStats(responseHeaders);
   recordStats(st.received, st.saved);
@@ -299,7 +289,7 @@ function buildRules(opts, noHeaderMatch) {
   if (opts.enabled && proxyOk) {
     var cspCondition = { resourceTypes: ["main_frame", "sub_frame"] };
     if (!noHeaderMatch) {
-      cspCondition.responseHeaders = [{ name: "content-security-policy", values: ["*img-src*", "*default-src*"] }];
+      cspCondition.responseHeaders = [{ name: "content-security-policy", values: ["/img-src/i", "/default-src/i"] }];
     }
     if (excludedDomains.length) cspCondition.excludedRequestDomains = excludedDomains;
     addRules.push({
