@@ -5,7 +5,11 @@ cd "$(dirname "$0")"
 
 VERSION=$(sed -nE 's/.*"version": *"([^"]+)".*/\1/p' manifest.json | head -n1)
 STAGE=".build/stage"
-OUT="bandwidth-guardian-main.zip"
+# Absolute output path: zipping from inside $STAGE with a relative "../" put
+# the zip in .build/ where the cleanup line below deleted it (CI: upload found
+# nothing). An absolute path lands at the repo root no matter who invokes us.
+ROOT="$(pwd)"
+OUT="$ROOT/bandwidth-guardian-main.zip"
 
 INCLUDE=(
   manifest.json defaults.js service-worker.js prehook.js content.js
@@ -14,7 +18,7 @@ INCLUDE=(
   _locales icons
 )
 
-rm -rf .build "$OUT"
+rm -rf .build
 mkdir -p "$STAGE"
 
 # Stage only the INCLUDE entries (R11: staging can never contain a stray
@@ -46,6 +50,10 @@ node -e 'const m=require("./'"$STAGE"'/manifest.json");
 # O10: normalize file modes so zips are reproducible across machines.
 chmod -R u=rwX,go=rX "$STAGE"
 
-( cd "$STAGE" && zip -qr "../$OUT" . )
+# zip to stdout, redirected by the shell from the repo root: a shell
+# redirect is interpreted in the invoking directory (some zip builds also
+# mangle absolute output paths given after cd-ing elsewhere), so OUT — which
+# now lives OUTSIDE .build — is always written correctly and survives cleanup.
+( cd "$STAGE" && zip -qr - . ) > "$OUT"
 rm -rf .build
-echo "Built $OUT (v$VERSION)"
+echo "Built $(basename "$OUT") (v$VERSION)"
