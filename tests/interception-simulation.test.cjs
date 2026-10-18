@@ -420,14 +420,13 @@ test('duplicated patterns stay in sync across prehook, content script and servic
     assert.ok(m, `${name} present`);
     return new RegExp(m[1].slice(1, -1), m[2]);
   };
-  for (const name of ['TRACKING_RE', 'SKIP_URL_RE', 'CONFLICT_RE']) {
+  for (const name of ['SKIP_URL_RE', 'CONFLICT_RE']) {
     assert.equal(grab(prehook, name).source, grab(content, name).source, `${name} prehook vs content`);
   }
   const sb = {};
   vm.createContext(sb);
-  const consts = serviceWorker.slice(serviceWorker.indexOf('const TRACKING_PATTERNS'), serviceWorker.indexOf('const ALL_RULE_IDS'));
+  const consts = serviceWorker.slice(serviceWorker.indexOf('const SKIP_PATTERN'), serviceWorker.indexOf('const ALL_RULE_IDS'));
   vm.runInContext(consts.replace(/^const /gm, 'var '), sb);
-  assert.equal(sb.TRACKING_PATTERNS.join('|'), grab(prehook, 'TRACKING_RE').source, 'DNR tracking rules == TRACKING_RE');
   assert.equal(sb.SKIP_PATTERN, grab(prehook, 'SKIP_URL_RE').source);
   assert.equal(sb.CONFLICT_PATTERN, grab(prehook, 'CONFLICT_RE').source);
   const extractArray = (source, name) => {
@@ -445,7 +444,7 @@ test('duplicated patterns stay in sync across prehook, content script and servic
 test('service worker: raw redirect target round-trips through the proxy contract; recovery mirrors getImageUrl', () => {
   const sb = { URL, decodeURIComponent };
   vm.createContext(sb);
-  const consts = serviceWorker.slice(serviceWorker.indexOf('const TRACKING_PATTERNS'), serviceWorker.indexOf('const ALL_RULE_IDS'));
+  const consts = serviceWorker.slice(serviceWorker.indexOf('const SKIP_PATTERN'), serviceWorker.indexOf('const ALL_RULE_IDS'));
   vm.runInContext(consts.replace(/^const /gm, 'var ') + '\nvar configuredProxyOrigin = "https://proxy.example";\nvar PROXY_PARAMETER_RE = new RegExp(CONFLICT_PATTERN);\n' +
     extractFunction(serviceWorker, 'redirectSubstitution') + '\n' + extractFunction(serviceWorker, 'originalFromProxyUrl') +
     '\nthis.rs = redirectSubstitution; this.orig = originalFromProxyUrl;', sb);
