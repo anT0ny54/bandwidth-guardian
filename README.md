@@ -114,12 +114,14 @@ can then block the proxy on that browser configuration.
 | `quality` | `60` | 1–100 |
 | `grayscale` | `true` | Server-side grayscale (`bw=1`) |
 | `maxWidth` | `768` | `0` = no limit |
-| `excludeDomains` | `""` | Comma/space/newline separated; subdomains match |
+| `excludeDomains` | `""` | Comma/space/newline separated (any whitespace); subdomains match; entries other than plain host names (ports, wildcards) are ignored |
 
 Settings changed on one surface (popup vs. options page) stay in sync on the
-other. The options page reloads the tab that opened it after a save. The
+other. The options page reloads the tab that opened it after a save that changed a
+value. The
 service worker only reacts to `storage.sync` changes for the settings keys it
-manages, so unrelated sync writes never trigger rule refreshes.
+manages, so unrelated sync writes never trigger rule refreshes, and the
+`webRequest` observer is re-registered only when the proxy origin changes.
 
 A quality or max-width value that is not one of the preset buttons is shown
 with a per-group "Custom" badge on the popup and the settings page, instead of
@@ -160,8 +162,13 @@ npm i --no-save playwright-core
 npx playwright-core install chromium          # or use an existing Chrome/Chromium
 git clone https://github.com/anT0ny54/bhp2 ../bhp2   # optional: real URL parser
 CHROME_PATH="$(node -e "console.log(require('playwright-core').chromium.executablePath())")" \
-BHP2_DIR=../bhp2 node --test --test-concurrency=1 tests/
+BHP2_DIR=../bhp2 node --test --test-concurrency=1 \
+  tests/interception-simulation.test.cjs tests/browser/interception.browser.test.cjs
 ```
+
+Pass the test files explicitly: Node 21+ no longer accepts a bare `tests/`
+directory for `node --test`. Without `CHROME_PATH` the browser suite skips
+itself.
 
 ### Known limits
 

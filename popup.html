@@ -41,9 +41,6 @@
         --accent-soft: rgba(8,145,178,.09);
         --danger: #dc2626;
         --danger-soft: rgba(220,38,38,.09);
-        --warn-soft: rgba(245,158,11,.10);
-        --warn-text: #b45309;
-        --warn-border: rgba(245,158,11,.25);
         --off: #9aa8bb;
       }
     }
@@ -64,10 +61,9 @@
       font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
     }
     button, input { font: inherit; }
-    button, a, input { -webkit-tap-highlight-color: transparent; }
+    button, input { -webkit-tap-highlight-color: transparent; }
     button { touch-action: manipulation; color: inherit; }
-    a { color: var(--accent); }
-    a:focus-visible, button:focus-visible, input:focus-visible { outline: 3px solid var(--accent-soft); outline-offset: 2px; }
+    button:focus-visible, input:focus-visible { outline: 3px solid var(--accent-soft); outline-offset: 2px; }
 
     .page {
       width: 100%;

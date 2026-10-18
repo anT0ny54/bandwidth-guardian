@@ -52,10 +52,13 @@
     return r && /^https?:$/.test(r.protocol) ? r.href : null;
   };
   const isHttp = u => /^https?:\/\//i.test(u);
+  // Same tokenizer as service-worker.js / content.js / popup.js: split on commas
+  // and ANY whitespace (a narrower class here let a pasted non-breaking space
+  // glue two domains together, so this layer disagreed with the network rules).
   const toDomainSet = text => new Set(
-    String(text || "").split(/[, \n\r\t]+/)
-      .map(s => s.trim().toLowerCase()).filter(Boolean)
-      .map(s => s.replace(/^https?:\/\//, "").split("/")[0].replace(/\.$/, ""))
+    String(text || "").split(/[,\s]+/)
+      .map(s => s.toLowerCase().replace(/^https?:\/\//, "").split("/")[0].replace(/\.$/, ""))
+      .filter(Boolean)
   );
 
   // Anchored tracking-pixel patterns (B13): boundaries prevent false hits like

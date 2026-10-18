@@ -25,9 +25,9 @@ let currentTabId = null;
 
 function parseDomains(text) {
   return String(text || "")
-    .split(/[ ,\s]+/)
-    .map(s => s.trim().toLowerCase()).filter(Boolean)
-    .map(s => s.replace(/^https?:\/\//, "").split("/")[0].replace(/\.$/, ""));
+    .split(/[,\s]+/)
+    .map(s => s.toLowerCase().replace(/^https?:\/\//, "").split("/")[0].replace(/\.$/, ""))
+    .filter(Boolean);
 }
 
 function findExcludedDomain(host, domains) {
@@ -189,15 +189,13 @@ excludeBtn.addEventListener("click", async () => {
   if (!currentIsWeb || !currentHost) return;
   const d    = await chrome.storage.sync.get(DEFAULTS);
   const raw  = String(d.excludeDomains || "");
-  const list = new Set(parseDomains(raw));
-  const excludedDomain = findExcludedDomain(currentHost, Array.from(list));
+  const excludedDomain = findExcludedDomain(currentHost, parseDomains(raw));
   let next;
   if (excludedDomain) {
     // Normalize separators when removing a token so deleting the first or a
     // middle entry cannot leave leading commas or doubled separators.
     next = removeDomainToken(raw, excludedDomain);
   } else {
-    list.add(currentHost);
     next = raw.trim() ? raw.replace(/[\s,]*$/, "") + "\n" + currentHost : currentHost;
   }
   state.excludeDomains = next;

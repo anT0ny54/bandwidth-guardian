@@ -22,8 +22,9 @@ const customWidthEl   = $("customWidth");
 const qualityPresets = Array.from(document.querySelectorAll("#qualityPresets .preset"));
 const widthPresets   = Array.from(document.querySelectorAll("#widthPresets  .preset"));
 
-const QUALITY_PRESETS = [45, 60, 80];
-const WIDTH_PRESETS   = [768, 1024, 0];
+// Preset values come from the buttons themselves, so HTML and JS cannot drift.
+const QUALITY_PRESETS = qualityPresets.map(b => Number(b.dataset.q));
+const WIDTH_PRESETS   = widthPresets.map(b => Number(b.dataset.w));
 let savedQuality = DEFAULTS.quality;
 let savedWidth   = DEFAULTS.maxWidth;
 
@@ -63,19 +64,20 @@ function fmtBytes(n) {
 
 async function reloadCurrentPage() {
   const isHttpUrl = url => /^https?:\/\//i.test(String(url || ""));
-  // B14: prefer the tab that opened Settings.
+  // B14: prefer the tab that opened Settings. Only http(s) tabs qualify below,
+  // so this page itself (chrome-extension://) can never be reloaded by mistake.
   if (openerTabId != null) {
     try { await chrome.tabs.reload(openerTabId); return; } catch {}
   }
   try {
     const [active] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (active?.id && isHttpUrl(active.url) && !/options\.html$/.test(String(active.url))) {
+    if (active?.id && isHttpUrl(active.url)) {
       await chrome.tabs.reload(active.id);
       return;
     }
     const tabs = await chrome.tabs.query({ currentWindow: true });
     const page = tabs
-      .filter(tab => tab.id != null && isHttpUrl(tab.url) && !/options\.html$/.test(String(tab.url)))
+      .filter(tab => tab.id != null && isHttpUrl(tab.url))
       .sort((a, b) => Number(b.lastAccessed || 0) - Number(a.lastAccessed || 0))[0];
     if (page?.id) await chrome.tabs.reload(page.id);
   } catch {}
@@ -137,7 +139,7 @@ function readWidth() {
 async function load() {
   const [d, s] = await Promise.all([
     chrome.storage.sync.get(DEFAULTS),
-    chrome.storage.local.get({ stats: { filesProcessed: 0, bytesProcessed: 0, bytesSaved: 0 } })
+    chrome.storage.local.get({ stats: null })
   ]);
   enabledEl.checked    = !!d.enabled;
   grayscaleEl.checked  = !!d.grayscale;
@@ -161,14 +163,14 @@ function renderStats(st) {
   statSavedEl.textContent  = fmtBytes(Number(st.bytesSaved || 0));
 }
 
-// Live stats counter while this page is open (worker flushes in batches).
-chrome.storage.onChanged.addListener((changes, area) => {
-  if (area === "local" && changes.stats) renderStats(changes.stats.newValue);
-});
-
+// Live stats counter while this page is open (worker flushes in batches), and
 // B2: stay in sync with changes made elsewhere (popup toggles, popup
 // exclusions, second Settings window). Fields with unsaved edits win.
 chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === "local") {
+    if (changes.stats) renderStats(changes.stats.newValue);
+    return;
+  }
   if (area !== "sync") return;
   if (changes.enabled)    enabledEl.checked   = !!changes.enabled.newValue;
   if (changes.grayscale)  grayscaleEl.checked = !!changes.grayscale.newValue;

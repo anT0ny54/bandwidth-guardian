@@ -39,7 +39,8 @@ const DEFAULTS = {
   maxWidth:        768,
   excludeDomains:  "",
 };
-// STRICT detected image types (KEEP IN SYNC with defaults.js).
+// STRICT detected image types: a proxy response is only ever accounted when its
+// Content-Type is one of these (documented in README "What gets proxied").
 const IMAGE_CONTENT_TYPES = new Set(["image/jpeg", "image/png", "image/webp", "image/gif", "image/tiff", "image/jxl"]);
 const ZERO_STATS = { filesProcessed: 0, bytesProcessed: 0, bytesSaved: 0 };
 
@@ -113,9 +114,12 @@ let refreshing     = false;
 let pendingRefresh = false;
 let configuredProxyOrigin = "";
 
+// Same validation as the DNR rules (http/https only): an "ftp://" or
+// "javascript:" value must never yield an origin ("null") that would make
+// the webRequest filter registration throw.
 function setProxyOrigin(base) {
-  try { configuredProxyOrigin = new URL(String(base || "").trim()).origin; }
-  catch { configuredProxyOrigin = ""; }
+  const usable = usableProxyBase(base);
+  configuredProxyOrigin = usable ? new URL(usable).origin : "";
 }
 
 function refreshRules() {
@@ -178,30 +182,34 @@ refreshRules();
 updateIcon();
 
 // ── Extension icon ────────────────────────────────────────────────────────────
+const ICONS_ON  = { 16: "icons/icon-16.png", 32: "icons/icon-32.png", 48: "icons/icon-48.png", 128: "icons/icon-128.png" };
+const ICONS_OFF = { 16: "icons/icon-16-disabled.png", 32: "icons/icon-32-disabled.png", 48: "icons/icon-48-disabled.png", 128: "icons/icon-128-disabled.png" };
 function updateIcon() {
   chrome.storage.sync.get({ enabled: DEFAULTS.enabled }, d => {
     if (!chrome.action || typeof chrome.action.setIcon !== "function") return;
-    const on = d.enabled;
-    const path = on
-      ? { 16: "icons/icon-16.png", 32: "icons/icon-32.png", 48: "icons/icon-48.png", 128: "icons/icon-128.png" }
-      : { 16: "icons/icon-16-disabled.png", 32: "icons/icon-32-disabled.png", 48: "icons/icon-48-disabled.png", 128: "icons/icon-128-disabled.png" };
     try {
-      const maybePromise = chrome.action.setIcon({ path });
+      const maybePromise = chrome.action.setIcon({ path: d.enabled ? ICONS_ON : ICONS_OFF });
       if (maybePromise && typeof maybePromise.catch === "function") maybePromise.catch(() => {});
     } catch {}
   });
 }
 
 // ── Stats ─────────────────────────────────────────────────────────────────────
-function getHeaderValue(headers, name) {
-  if (!Array.isArray(headers)) return null;
-  const wanted = String(name).toLowerCase();
-  const h = headers.find(x => String(x.name || "").toLowerCase() === wanted);
-  return h ? String(h.value ?? "") : null;
+// Lower-cased name -> value, built once per response (the stats path used to
+// rescan the whole header array for each of its seven lookups).
+function headerMap(headers) {
+  const map = new Map();
+  if (Array.isArray(headers)) {
+    for (const h of headers) {
+      const name = String(h?.name || "").toLowerCase();
+      if (name && !map.has(name)) map.set(name, String(h.value ?? ""));
+    }
+  }
+  return map;
 }
-function getHeaderInt(headers, name) {
-  const v = getHeaderValue(headers, name);
-  if (v === null) return null;
+function headerInt(map, name) {
+  const v = map.get(name);
+  if (v === undefined) return null;
   const n = Number.parseInt(v, 10);
   return Number.isFinite(n) && n >= 0 ? n : null;
 }
@@ -214,13 +222,13 @@ function isGuardianProxyUrl(url) {
   } catch { return false; }
 }
 
-function getProxyResponseStats(responseHeaders) {
-  const compressed = getHeaderInt(responseHeaders, "x-bh-compressed-size") ??
-    getHeaderInt(responseHeaders, "x-compressed-size");
-  const original = getHeaderInt(responseHeaders, "x-bh-original-size") ??
-    getHeaderInt(responseHeaders, "x-original-size");
-  const savedHeader = getHeaderInt(responseHeaders, "x-bh-bytes-saved") ??
-    getHeaderInt(responseHeaders, "x-bytes-saved");
+function getProxyResponseStats(headers) {
+  const compressed = headerInt(headers, "x-bh-compressed-size") ??
+    headerInt(headers, "x-compressed-size");
+  const original = headerInt(headers, "x-bh-original-size") ??
+    headerInt(headers, "x-original-size");
+  const savedHeader = headerInt(headers, "x-bh-bytes-saved") ??
+    headerInt(headers, "x-bytes-saved");
 
   let received = compressed;
   let known = received !== null;
@@ -230,7 +238,7 @@ function getProxyResponseStats(responseHeaders) {
   }
   // Note: without "extraHeaders", Chromium may withhold Content-Length on
   // responses; the proxy's x-bh-compressed-size header is authoritative.
-  if (!known) received = getHeaderInt(responseHeaders, "content-length") ?? 0;
+  if (!known) received = headerInt(headers, "content-length") ?? 0;
 
   let saved = savedHeader;
   if (saved === null) saved = known && original !== null ? Math.max(0, original - received) : 0;
@@ -415,9 +423,13 @@ chrome.storage.local.get({ stats: ZERO_STATS, statsPending: null }, d => {
 // fallback; onErrorOccurred feeds fallback and the circuit breaker.
 // "extraHeaders" is not needed for custom x-bh-* headers (B10).
 let webRequestRegistered = false;
+let webRequestOrigin = null; // origin the current registration targets
 const PROXY_REQUEST_TYPES = ["image", "object"];
 function updateWebRequestListener(origin) {
   if (!chrome.webRequest || typeof chrome.webRequest.onCompleted !== "object") return;
+  // Every settings change (quality, grayscale, …) calls this through
+  // mirrorToLocal(); re-registering is only needed when the origin changed.
+  if (webRequestRegistered && origin === webRequestOrigin) return;
   try {
     if (webRequestRegistered) {
       chrome.webRequest.onCompleted.removeListener(onProxyCompleted);
@@ -433,7 +445,8 @@ function updateWebRequestListener(origin) {
     );
     chrome.webRequest.onErrorOccurred?.addListener(onProxyError, { urls: urls, types: PROXY_REQUEST_TYPES });
     webRequestRegistered = true;
-  } catch {}
+    webRequestOrigin = origin;
+  } catch { webRequestRegistered = false; }
 }
 updateWebRequestListener("");
 
@@ -452,8 +465,8 @@ function handleProxyCompleted(details) {
   const { url, responseHeaders, fromCache, statusCode } = details || {};
   if (!url || !isGuardianProxyUrl(url)) return;
 
-  const contentType = (getHeaderValue(responseHeaders, "content-type") || "")
-    .split(";")[0].trim().toLowerCase();
+  const headers = headerMap(responseHeaders);
+  const contentType = (headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
   const ok = typeof statusCode !== "number" || (statusCode >= 200 && statusCode < 300);
 
   if (!ok) {
@@ -474,7 +487,7 @@ function handleProxyCompleted(details) {
   // Content-Type is one of the supported image types.
   if (!IMAGE_CONTENT_TYPES.has(contentType)) return;
 
-  const st = getProxyResponseStats(responseHeaders);
+  const st = getProxyResponseStats(headers);
   recordStats(st.received, st.saved);
 }
 
@@ -647,7 +660,9 @@ function addBypass(tabId, urls) {
     }
     return bypassed;
   });
-  bypassChain = operation;
+  // A rejected link would wedge every later bypassReady() caller; the chain
+  // only serializes, results flow through `operation`.
+  bypassChain = operation.catch(() => {});
   return operation;
 }
 
@@ -672,7 +687,7 @@ chrome.tabs?.onRemoved?.addListener(tabId => {
       bypassRules.delete(key);
       bypassRegexRules.delete(key);
     }
-  });
+  }).catch(() => {});
 });
 
 // Content scripts ask for this tab's known-bad originals at page start, so the
@@ -732,7 +747,7 @@ function flushFallbacks() {
         const p = chrome.tabs.sendMessage(b.tabId, { type: "bh-retry", items }, { frameId: b.frameId });
         if (p && typeof p.catch === "function") p.catch(() => {});
       } catch {}
-    });
+    }).catch(() => {});
   }
 }
 
@@ -773,8 +788,8 @@ function readSuspended(cb) {
 // ── DNR rules ─────────────────────────────────────────────────────────────────
 function parseExcluded(text) {
   // DNR rejects the whole update on an invalid domain — pass only valid hosts.
-  var excluded = String(text || "").split(/[ ,\s]+/)
-    .map(function(s) { return s.trim().toLowerCase().replace(/^https?:\/\//, "").split("/")[0].replace(/\.$/, ""); })
+  var excluded = String(text || "").split(/[,\s]+/)
+    .map(function(s) { return s.toLowerCase().replace(/^https?:\/\//, "").split("/")[0].replace(/\.$/, ""); })
     .filter(function(s) { return /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$/.test(s); });
   return Array.from(new Set(excluded));
 }
@@ -910,19 +925,11 @@ function publishRuntime(runtime) {
 }
 
 function doRefreshRules(done) {
+  const finish = () => { if (typeof done === "function") done(); };
   if (!chrome.declarativeNetRequest || typeof chrome.declarativeNetRequest.updateDynamicRules !== "function") {
-    if (typeof done === "function") done();
+    finish();
     return;
   }
-  const finish = () => {
-    chrome.declarativeNetRequest.getDynamicRules(rules => {
-      const ids = new Set((rules || []).map(r => r.id));
-      readSuspended(suspended => {
-        publishRuntime({ redirect: ids.has(RULE_ID_REDIRECT_IMAGE), suspended });
-        if (typeof done === "function") done();
-      });
-    });
-  };
   // updateDynamicRules can fail asynchronously (lastError) OR throw
   // synchronously on a schema error; both paths must release the lock.
   const update = (addRules, cb) => {
@@ -932,13 +939,21 @@ function doRefreshRules(done) {
   };
   chrome.storage.sync.get(DEFAULTS, function(opts) {
     readSuspended(function(suspended) {
-      update(buildRules(opts, false, suspended), function(err) {
-        if (!err) { finish(); return; }
+      // The published runtime reflects exactly the rule set Chrome accepted.
+      const installed = addRules => {
+        publishRuntime({ redirect: addRules.some(r => r.id === RULE_ID_REDIRECT_IMAGE), suspended });
+        finish();
+      };
+      const full = buildRules(opts, false, suspended);
+      update(full, function(err) {
+        if (!err) { installed(full); return; }
         // Retry without response-header matching (older Chromium), then with
         // the header rules only, so Save-Data/CSP survive a redirect problem.
-        update(buildRules(opts, true, suspended), function(err2) {
-          if (!err2) { finish(); return; }
-          update(buildRules(opts, true, true), function() { finish(); });
+        const noHeaderMatch = buildRules(opts, true, suspended);
+        update(noHeaderMatch, function(err2) {
+          if (!err2) { installed(noHeaderMatch); return; }
+          const headersOnly = buildRules(opts, true, true);
+          update(headersOnly, function() { installed(headersOnly); });
         });
       });
     });

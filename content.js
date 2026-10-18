@@ -24,8 +24,9 @@
 //   Parser-created <link rel=preload as=image> hrefs are handled by prehook's
 //   MutationObserver (registered first), so no preload handling is needed here.
 //
-// The old DNR regexSubstitution redirect was removed because DNR cannot
-// encodeURIComponent the captured URL; content scripts can.
+// The network redirect appends the original URL RAW (DNR cannot
+// encodeURIComponent a capture group), so URLs the raw contract would truncate
+// (CONFLICT_RE) are exempted there and proxied HERE with an encoded URL.
 // ══════════════════════════════════════════════════════════════════════════════
 
 (function () {
@@ -141,8 +142,8 @@
   function domainSet(text) {
     return new Set(
       String(text || "").split(/[,\s]+/)
-        .map(s => s.trim().toLowerCase()).filter(Boolean)
-        .map(s => s.replace(/^https?:\/\//, "").split("/")[0].replace(/\.$/, ""))
+        .map(s => s.toLowerCase().replace(/^https?:\/\//, "").split("/")[0].replace(/\.$/, ""))
+        .filter(Boolean)
     );
   }
 
