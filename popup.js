@@ -34,6 +34,10 @@ function findExcludedDomain(host, domains) {
   return domains.find(domain => host === domain || host.endsWith(`.${domain}`)) || "";
 }
 
+function removeDomainToken(text, excludedDomain) {
+  return parseDomains(text).filter(domain => domain !== excludedDomain).join("\n");
+}
+
 // B16: exact-match highlighting. "Nearest" matching lied about custom values
 // (quality 55 highlighted "60"); when nothing matches we show a "Custom" badge.
 let customBadgeEl = null;
@@ -129,7 +133,7 @@ presetBtns.forEach(btn => {
 reloadBtn.addEventListener("click", async () => {
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (tab?.id) chrome.tabs.reload(tab.id);
+    if (tab?.id) await chrome.tabs.reload(tab.id);
   } catch {}
   window.close();
 });
@@ -189,11 +193,9 @@ excludeBtn.addEventListener("click", async () => {
   const excludedDomain = findExcludedDomain(currentHost, Array.from(list));
   let next;
   if (excludedDomain) {
-    // B21: remove only the matching token, preserving the user's separators
-    // and formatting (no lowercase + space-join rewrite of the whole field).
-    next = raw.split(/([,\s]+)/)
-      .filter(tok => /[,\s]/.test(tok) || parseDomains(tok)[0] !== excludedDomain)
-      .join("");
+    // Normalize separators when removing a token so deleting the first or a
+    // middle entry cannot leave leading commas or doubled separators.
+    next = removeDomainToken(raw, excludedDomain);
   } else {
     list.add(currentHost);
     next = raw.trim() ? raw.replace(/[\s,]*$/, "") + "\n" + currentHost : currentHost;

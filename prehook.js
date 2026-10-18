@@ -403,29 +403,55 @@
     try {
       if (destroyed) return;
       if (!isImagePreloadLink(el)) return;
-      const stashed = el.dataset.bhPreloadHref;
-      const current = el.getAttribute("href");
-      const original = stashed || current;
-      if (!original) return;
-      const decided = decideSrc(original);
-      if (decided === null) {
-        // Settings not loaded yet: stash the original and drop href so the
-        // browser cannot start downloading the full-resolution image.
-        if (!stashed) el.dataset.bhPreloadHref = original;
-        queuePending(el);
-        // B6: remove the attribute instead of writing about:blank — no fake
-        // error event, and reads see "absent" rather than a bogus URL.
-        if (current !== null) el.removeAttribute("href");
-      } else {
-        if (stashed) el.removeAttribute("data-bh-preload-href");
-        if (current !== decided) setAttr.call(el, "href", decided);
+
+      const stashedHref = el.dataset.bhPreloadHref;
+      const stashedSrcset = el.dataset.bhPreloadSrcset;
+      const currentHref = el.getAttribute("href");
+      const currentSrcset = el.getAttribute("imagesrcset");
+      const originalHref = stashedHref || currentHref;
+      const originalSrcset = stashedSrcset || currentSrcset;
+      if (!originalHref && !originalSrcset) return;
+
+      if (!ready || !opts) {
+        // Settings not loaded yet: stash conflict URLs and drop the attributes
+        // so the browser cannot start an unproxied request.
+        if (originalHref && mustHold(resolveHttp(originalHref))) {
+          if (!stashedHref) el.dataset.bhPreloadHref = originalHref;
+          queuePending(el);
+          // B6: remove the attribute instead of writing about:blank — no fake
+          // error event, and reads see "absent" rather than a bogus URL.
+          if (currentHref !== null) el.removeAttribute("href");
+        }
+        if (originalSrcset && srcsetNeedsHold(originalSrcset)) {
+          if (!stashedSrcset) el.dataset.bhPreloadSrcset = originalSrcset;
+          queuePending(el);
+          if (currentSrcset !== null) el.removeAttribute("imagesrcset");
+        }
+        return;
       }
+
+      if (stashedHref) el.removeAttribute("data-bh-preload-href");
+      if (originalHref) {
+        const decided = decideSrc(originalHref);
+        if (decided === null) {
+          if (!stashedHref) el.dataset.bhPreloadHref = originalHref;
+          queuePending(el);
+          if (currentHref !== null) el.removeAttribute("href");
+        } else if (currentHref !== decided) {
+          setAttr.call(el, "href", decided);
+        }
+      }
+
+      if (stashedSrcset) el.removeAttribute("data-bh-preload-srcset");
       // Responsive preloads: candidates in imagesrcset get the same per-URL
       // treatment as <img srcset> (only DOM-layer candidates are rewritten).
-      const iss = el.getAttribute("imagesrcset");
-      if (iss && ready && active) {
-        const out = rewriteSrcset(iss, el);
-        if (out !== iss) setAttr.call(el, "imagesrcset", out);
+      if (originalSrcset) {
+        if (!active) {
+          if (currentSrcset !== originalSrcset) setAttr.call(el, "imagesrcset", originalSrcset);
+        } else {
+          const out = rewriteSrcset(originalSrcset, el);
+          if (currentSrcset !== out) setAttr.call(el, "imagesrcset", out);
+        }
       }
     } catch {}
   }
@@ -669,9 +695,9 @@
 
   // ── MutationObservers for parser-created media and preload links ──────────────
   // C1/O5: childList catches parser-inserted links, images and sources — the
-  // parser bypasses JavaScript setters. Attribute watching is limited to rel/as
-  // on <link> elements: relList.add() is unpatchable, while href changes made by
-  // JS already flow through the patched href setter / setAttribute.
+  // parser bypasses JavaScript setters. Watch the attributes that can turn a
+  // link into an image preload or introduce responsive candidates: rel/as/type
+  // are not fully patchable, and imagesrcset can change without href.
   const linkObserverGuard = () => destroyed || (ready && !active);
   preloadObserver = new MutationObserver(mutations => {
     if (linkObserverGuard()) return;
@@ -699,7 +725,7 @@
   linkAttrObserver.observe(document, {
     subtree: true,
     attributes: true,
-    attributeFilter: ["rel", "as"]
+    attributeFilter: ["rel", "as", "type", "imagesrcset"]
   });
 
   // ── Shadow roots ────────────────────────────────────────────────────────────
@@ -810,7 +836,6 @@
     const has = abs => { if (!abs || !originals.has(abs)) return false; matched.add(abs); return true; };
     const hasRel = (v, base) => { const r = v ? safeURL(v, base || document.baseURI) : null; if (!r) return false; r.hash = ""; return has(r.href); };
     const reset = (el, name) => { const v = el.getAttribute(name); if (v !== null) setAttr.call(el, name, v); };
-    let found = 0;
     const crossOrigin = [];
 
     for (const root of collectRoots()) {
@@ -836,19 +861,18 @@
             markFailed(el);
             if (ss !== null) setAttr.call(el, "srcset", ss);
             if (src !== null) setAttr.call(el, "src", src);
-            found++;
           } else if (tag === "video") {
-            if (hasRel(el.getAttribute("poster"), el.baseURI) && !el.hasAttribute(FAILED_ATTR)) { markFailed(el); reset(el, "poster"); found++; }
+            if (hasRel(el.getAttribute("poster"), el.baseURI) && !el.hasAttribute(FAILED_ATTR)) { markFailed(el); reset(el, "poster"); }
           } else if (tag === "image" && el.namespaceURI === "http://www.w3.org/2000/svg") {
             if (el.hasAttribute(FAILED_ATTR)) continue;
             const XLINK = "http://www.w3.org/1999/xlink";
             const href = el.getAttribute("href");
             const xhref = el.getAttributeNS(XLINK, "href");
-            if (href && hasRel(href, el.baseURI)) { markFailed(el); setAttr.call(el, "href", href); found++; }
-            else if (xhref && hasRel(xhref, el.baseURI)) { markFailed(el); el.setAttributeNS(XLINK, "xlink:href", xhref); found++; }
+            if (href && hasRel(href, el.baseURI)) { markFailed(el); setAttr.call(el, "href", href); }
+            else if (xhref && hasRel(xhref, el.baseURI)) { markFailed(el); el.setAttributeNS(XLINK, "xlink:href", xhref); }
           } else if (tag === "object" || tag === "embed" || tag === "input") {
             const name = tag === "object" ? "data" : "src";
-            if (hasRel(el.getAttribute(name), el.baseURI) && !el.hasAttribute(FAILED_ATTR)) { markFailed(el); reset(el, name); found++; }
+            if (hasRel(el.getAttribute(name), el.baseURI) && !el.hasAttribute(FAILED_ATTR)) { markFailed(el); reset(el, name); }
           }
           // Inline styles (any element, including the ones above).
           const style = el.getAttribute("style");
@@ -862,7 +886,6 @@
               // insignificant trailing whitespace to force fresh image values.
               if (next === style) next = /\s$/.test(style) ? style.replace(/\s+$/, "") : style + " ";
               setAttr.call(el, "style", next); // re-parse → fresh request
-              found++;
             }
           }
         } catch {}
@@ -877,7 +900,7 @@
         let readable = true;
         try { void sh.cssRules; } catch { readable = false; }
         if (!readable) { crossOrigin.push(sh); continue; }
-        if (retryRules(sh, sh.href || document.baseURI, has, seen)) found++;
+        retryRules(sh, sh.href || document.baseURI, has, seen);
       }
     }
 

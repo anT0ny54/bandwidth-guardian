@@ -13,7 +13,6 @@ matching). Firefox is **not** supported: MV3 `background.service_worker` and the
 DNR features used here are Chromium-only, so the manifest no longer ships a
 `browser_specific_settings.gecko` block.
 
-
 ## What gets proxied
 
 Only **strictly detected image types** are ever treated as images for usage
@@ -64,8 +63,8 @@ once and before Chrome starts it.
      `&max_width=` would be truncated by the raw contract, so the network rule
      skips them and the DOM layer proxies them URL-encoded instead.
 2. **DOM layer, `prehook.js` (MAIN world, `document_start`) and `content.js`.**
-   Intercepts supported image `src`/`srcset` setters, preload-link attributes,
-   and inline background styles. The network layer, not these hooks, covers
+   Intercepts supported image `src`/`srcset` setters, preload-link `href`/`imagesrcset`
+   attributes, and inline background styles. The network layer, not these hooks, covers
    posters, SVG `<image>`, objects/embeds, CSSOM and stylesheet requests. The
    network rule handles ordinary requests; the DOM layer handles conflict URLs
    on supported surfaces and hands everything else
@@ -81,12 +80,15 @@ once and before Chrome starts it.
 ### Fallback, loops and the circuit breaker
 
 - A proxied request that fails (HTTP error, wrong type, network error) is
-  reported by `webRequest`; the original URL gets a **per-tab session bypass
-  rule** and the page is asked to re-request that one URL **directly, once**
-  (`<img>`, `<picture>`, poster, SVG `<image>`, `<object>/<embed>`, inline
-  styles, same-origin CSS rules; cross-origin `<link>` sheets are reloaded once
-  when the URL was not found anywhere accessible). The bypass list is also
-  given to new documents in that tab, so a reload does not try the proxy again.
+  reported by `webRequest`; the original URL gets an **exact-match per-tab
+  session bypass rule** and the page is asked to re-request that one URL
+  **directly, once** (`<img>`, `<picture>`, poster, SVG `<image>`,
+  `<object>/<embed>`, inline styles, same-origin CSS rules; cross-origin
+  `<link>` sheets are reloaded once when the URL was not found anywhere
+  accessible). URLs containing DNR filter metacharacters use an escaped regex
+  match rather than a wildcard-prone URL filter, subject to browser rule size
+  and quota limits. The bypass list is also given to new documents in that tab,
+  so a reload does not try the proxy again.
   Bypass rules are removed when the tab closes.
 - If the proxy itself is unreachable (6 connection-level failures within 30 s),
   the redirect is suspended for 2 minutes and pages load images directly; it
@@ -94,12 +96,13 @@ once and before Chrome starts it.
 - Usage statistics are counted only from successful proxy responses of the
   strict image types above; failed and fallback requests are never counted.
 
-`service-worker.js` also injects `Save-Data: on` and strips CSP **only while a
-valid proxy is configured** (only on documents whose CSP references
-`img-src`/`default-src`). Excluded domains always keep their own CSP. If Chrome
-rejects response-header matching during rule setup, the extension preserves CSP
-rather than removing it from every document; a restrictive policy can then block
-the proxy on that browser configuration.
+`service-worker.js` also injects `Save-Data: on` and strips CSP only while the
+proxy is valid, enabled, and not temporarily suspended by the circuit breaker
+(only on documents whose CSP references `img-src`/`default-src`). Excluded
+domains always keep their own CSP, and CSP remains intact while the breaker is
+open. If Chrome rejects response-header matching during rule setup, the extension
+preserves CSP rather than removing it from every document; a restrictive policy
+can then block the proxy on that browser configuration.
 
 ## Settings
 

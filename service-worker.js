@@ -297,6 +297,8 @@ function resetStatsCounters(sendResponse) {
 
 function flushStats() {
   if (statsResetPending || statsResetInProgress) return;
+  // Startup recovery and ordinary flushes must not race each other's read/modify/write.
+  if (statsStartupWriteInProgress) return;
   if (statsFlushInProgress) { scheduleStatsFlush(); return; }
   if (!hasPendingStats()) return;
   statsFlushInProgress = true;
@@ -332,7 +334,8 @@ function scheduleStatsFlush() {
 }
 
 function mirrorPendingStats() {
-  if (statsMirrorTimer || statsMirrorWriteInProgress || statsResetPending || statsResetInProgress) return;
+  if (statsMirrorTimer || statsMirrorWriteInProgress || statsStartupWriteInProgress ||
+      statsResetPending || statsResetInProgress) return;
   statsMirrorTimer = setTimeout(() => {
     statsMirrorTimer = null;
     if (!hasPendingStats() || statsResetPending || statsResetInProgress) return;
@@ -359,21 +362,30 @@ function recordStats(bytes, saved) {
   scheduleStatsFlush();
 }
 
-// Startup recovery: merge a stranded crash mirror into stats atomically. The
-// single get of both keys avoids deleting a newer mirror written between the
-// read and the remove (B8 related race).
+// Startup recovery: merge a stranded crash mirror into stats atomically.
+// Mirror writes and ordinary flushes pause until recovery completes, so an
+// in-flight recovery cannot overwrite newer pending activity.
 let statsRevision = 0;
 const startupStatsRevision = statsRevision;
+function finishStatsStartup() {
+  statsStartupWriteInProgress = false;
+  if (statsResetPending) {
+    finishStatsResetIfReady();
+    return;
+  }
+  if (hasPendingStats()) {
+    mirrorPendingStats();
+    scheduleStatsFlush();
+  }
+}
 chrome.storage.local.get({ stats: ZERO_STATS, statsPending: null }, d => {
   if (startupStatsRevision !== statsRevision) {
-    statsStartupWriteInProgress = false;
-    if (statsResetPending) finishStatsResetIfReady();
+    finishStatsStartup();
     return;
   }
   const p = d.statsPending;
   if (!p) {
-    statsStartupWriteInProgress = false;
-    if (statsResetPending) finishStatsResetIfReady();
+    finishStatsStartup();
     return;
   }
   const files = Number(p.filesProcessed) || 0;
@@ -381,13 +393,9 @@ chrome.storage.local.get({ stats: ZERO_STATS, statsPending: null }, d => {
   const saved = Math.max(0, Number(p.bytesSaved) || 0);
   if (!files && !bytes && !saved) {
     try {
-      chrome.storage.local.remove("statsPending", () => {
-        statsStartupWriteInProgress = false;
-        if (statsResetPending) finishStatsResetIfReady();
-      });
+      chrome.storage.local.remove("statsPending", finishStatsStartup);
     } catch {
-      statsStartupWriteInProgress = false;
-      if (statsResetPending) finishStatsResetIfReady();
+      finishStatsStartup();
     }
     return;
   }
@@ -396,18 +404,9 @@ chrome.storage.local.get({ stats: ZERO_STATS, statsPending: null }, d => {
   s.bytesProcessed += bytes;
   s.bytesSaved     += saved;
   try {
-    chrome.storage.local.set({ stats: s, statsPending: { ...ZERO_STATS } }, () => {
-      statsStartupWriteInProgress = false;
-      if (statsResetPending) {
-        finishStatsResetIfReady();
-        return;
-      }
-      // If recordStats() ran while we were reading, re-mirror the fresh delta.
-      if (hasPendingStats()) mirrorPendingStats();
-    });
+    chrome.storage.local.set({ stats: s, statsPending: { ...ZERO_STATS } }, finishStatsStartup);
   } catch {
-    statsStartupWriteInProgress = false;
-    if (statsResetPending) finishStatsResetIfReady();
+    finishStatsStartup();
   }
 });
 
@@ -533,7 +532,11 @@ function originalFromProxyUrl(proxyUrl) {
 // at most one proxied attempt and one direct attempt per URL per tab.
 const BYPASS_BASE_ID = 100000;
 const BYPASS_LIMIT   = 3000;    // well under DNR's session-rule cap
+// Chrome allows at most 1000 regex rules per session ruleset. Keep headroom
+// for other rules and avoid rejecting an entire batch after a burst of failures.
+const BYPASS_REGEX_LIMIT = 900;
 const bypassRules    = new Map(); // "tabId url" -> ruleId (insertion order = age)
+const bypassRegexRules = new Set(); // keys whose exact URL uses regexFilter
 let bypassNextId     = BYPASS_BASE_ID;
 let bypassChain      = null;    // serializes updateSessionRules calls
 
@@ -544,9 +547,12 @@ function bypassReady() {
       const rules = await chrome.declarativeNetRequest.getSessionRules();
       for (const r of rules) {
         if (r.id < BYPASS_BASE_ID) continue;
-        const url = String(r.condition?.urlFilter || "").replace(/^\||\|$/g, "");
+        const url = bypassUrlFromRule(r);
+        if (!url) continue;
         const tab = r.condition?.tabIds?.[0] ?? -1;
-        bypassRules.set(tab + " " + url, r.id);
+        const key = tab + " " + url;
+        bypassRules.set(key, r.id);
+        if (r.condition?.regexFilter) bypassRegexRules.add(key);
         bypassNextId = Math.max(bypassNextId, r.id + 1);
       }
     } catch {}
@@ -554,46 +560,118 @@ function bypassReady() {
   return bypassChain;
 }
 
-// urlFilter has no escape syntax: "|" would break the anchors, and non-ASCII
-// cannot appear in a request URL anyway. "*" and "^" only widen the match.
-const BYPASSABLE_URL_RE = /^https?:\/\/[\x21-\x7b\x7d\x7e]+$/;
+// Browser request URLs are ASCII after URL canonicalization. Most URLs can use
+// urlFilter's exact start/end anchors; URLs containing its wildcard or separator
+// metacharacters need a literal-escaped regex instead.
+const BYPASSABLE_URL_RE = /^https?:\/\/[\x21-\x7e]+$/;
+const MAX_BYPASS_REGEX_LENGTH = 1900;
+function bypassCondition(url) {
+  if (!/[|*^]/.test(url)) return { urlFilter: "|" + url + "|" };
+  const regexFilter = "^" + url.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "$";
+  if (regexFilter.length > MAX_BYPASS_REGEX_LENGTH) return null;
+  return { regexFilter, isUrlFilterCaseSensitive: true };
+}
+
+// Reconstruct original URLs from persisted session rules after a worker wake.
+// Regex filters are generated only by bypassCondition and contain escaped
+// literal URLs bounded by ^ and $, so consuming one escape at a time is safe.
+function bypassUrlFromRule(rule) {
+  const filter = rule?.condition?.urlFilter;
+  if (typeof filter === "string") return filter.replace(/^\||\|$/g, "");
+  const regex = rule?.condition?.regexFilter;
+  if (typeof regex !== "string" || regex.length < 2 || regex[0] !== "^" || regex[regex.length - 1] !== "$") return "";
+  const body = regex.slice(1, -1);
+  let url = "";
+  for (let i = 0; i < body.length; i++) {
+    if (body[i] === "\\" && i + 1 < body.length) url += body[++i];
+    else url += body[i];
+  }
+  return url;
+}
 
 function addBypass(tabId, urls) {
   const tab = Number.isInteger(tabId) && tabId >= 0 ? tabId : -1;
-  bypassChain = bypassReady().then(async () => {
+  const operation = bypassReady().then(async () => {
     const addRules = [];
+    const addedKeys = new Map();
+    const alreadyPresent = new Set();
+    let regexesToAdd = 0;
     for (const url of urls) {
       if (!BYPASSABLE_URL_RE.test(url)) continue;
       const key = tab + " " + url;
-      if (bypassRules.has(key)) continue;
+      if (bypassRules.has(key)) { alreadyPresent.add(url); continue; }
+      if (addedKeys.has(key) || addRules.length >= BYPASS_LIMIT) continue;
+      const baseCondition = bypassCondition(url);
+      if (!baseCondition) continue;
+      if (baseCondition.regexFilter && bypassRegexRules.size + regexesToAdd >= BYPASS_REGEX_LIMIT) continue;
       const id = bypassNextId++;
-      bypassRules.set(key, id);
-      const condition = { urlFilter: "|" + url + "|", resourceTypes: PROXY_REQUEST_TYPES };
+      const condition = { ...baseCondition, resourceTypes: PROXY_REQUEST_TYPES };
       if (tab >= 0) condition.tabIds = [tab];
       addRules.push({ id, priority: PRIORITY_BYPASS, action: { type: "allow" }, condition });
+      addedKeys.set(key, { id, url, isRegex: !!baseCondition.regexFilter });
+      if (baseCondition.regexFilter) regexesToAdd++;
     }
-    if (!addRules.length) return;
+    if (!addRules.length) return Array.from(alreadyPresent);
+
+    // Compute evictions without mutating the live map. Commit the map only after
+    // Chrome confirms the rule update, and never evict a newly added rule here.
     const removeRuleIds = [];
-    while (bypassRules.size > BYPASS_LIMIT) {
-      const [oldKey, oldId] = bypassRules.entries().next().value;
-      bypassRules.delete(oldKey);
+    const nextRules = new Map(bypassRules);
+    const nextRegexRules = new Set(bypassRegexRules);
+    const existingToKeep = Math.max(0, BYPASS_LIMIT - addRules.length);
+    while (nextRules.size > existingToKeep) {
+      const [oldKey, oldId] = nextRules.entries().next().value;
+      nextRules.delete(oldKey);
+      nextRegexRules.delete(oldKey);
       removeRuleIds.push(oldId);
     }
-    try { await chrome.declarativeNetRequest.updateSessionRules({ removeRuleIds, addRules }); }
-    catch {
-      // Keep the map honest if Chrome rejected the batch.
-      for (const r of addRules) for (const [k, id] of bypassRules) if (id === r.id) bypassRules.delete(k);
+    for (const [key, { id, isRegex }] of addedKeys) {
+      nextRules.set(key, id);
+      if (isRegex) nextRegexRules.add(key);
     }
+
+    try {
+      await chrome.declarativeNetRequest.updateSessionRules({ removeRuleIds, addRules });
+    } catch {
+      // Failed updates leave the old rules intact; don't tell the page to retry
+      // unless a direct-load bypass rule is known to exist.
+      return Array.from(alreadyPresent);
+    }
+    bypassRules.clear();
+    for (const entry of nextRules) bypassRules.set(...entry);
+    bypassRegexRules.clear();
+    for (const key of nextRegexRules) bypassRegexRules.add(key);
+    const bypassed = Array.from(alreadyPresent).filter(url => nextRules.has(tab + " " + url));
+    for (const [key, item] of addedKeys) {
+      if (nextRules.has(key) && nextRules.get(key) === item.id) bypassed.push(item.url);
+    }
+    return bypassed;
   });
-  return bypassChain;
+  bypassChain = operation;
+  return operation;
 }
 
 // Drop a closed tab's bypass rules (they can never match again).
 chrome.tabs?.onRemoved?.addListener(tabId => {
   bypassChain = bypassReady().then(async () => {
+    const keys = [];
     const removeRuleIds = [];
-    for (const [k, id] of bypassRules) if (k.startsWith(tabId + " ")) { bypassRules.delete(k); removeRuleIds.push(id); }
-    if (removeRuleIds.length) { try { await chrome.declarativeNetRequest.updateSessionRules({ removeRuleIds }); } catch {} }
+    for (const [key, id] of bypassRules) {
+      if (key.startsWith(tabId + " ")) {
+        keys.push(key);
+        removeRuleIds.push(id);
+      }
+    }
+    if (!removeRuleIds.length) return;
+    try {
+      await chrome.declarativeNetRequest.updateSessionRules({ removeRuleIds });
+    } catch {
+      return; // Keep the in-memory index aligned with rules Chrome still owns.
+    }
+    for (const key of keys) {
+      bypassRules.delete(key);
+      bypassRegexRules.delete(key);
+    }
   });
 });
 
@@ -644,9 +722,12 @@ function flushFallbacks() {
   fallbackBatch.clear();
   for (const b of batches) {
     const originals = Array.from(b.items.keys());
-    addBypass(b.tabId, originals).then(() => {
-      if (b.tabId < 0 || !chrome.tabs?.sendMessage) return;
-      const items = Array.from(b.items, ([original, proxyUrl]) => ({ original, proxyUrl }));
+    addBypass(b.tabId, originals).then(bypassed => {
+      if (b.tabId < 0 || !chrome.tabs?.sendMessage || !bypassed?.length) return;
+      const allowed = new Set(bypassed);
+      const items = Array.from(b.items, ([original, proxyUrl]) => ({ original, proxyUrl }))
+        .filter(item => allowed.has(item.original));
+      if (!items.length) return;
       try {
         const p = chrome.tabs.sendMessage(b.tabId, { type: "bh-retry", items }, { frameId: b.frameId });
         if (p && typeof p.catch === "function") p.catch(() => {});
@@ -732,7 +813,7 @@ function buildRules(opts, noHeaderMatch, suspended) {
   // document: if this condition is unsupported, preserving page policy is safer
   // than silently weakening script/connect/frame restrictions. Report-only CSP
   // is left alone (R15): it blocks nothing. CSP also applies to redirect targets.
-  if (opts.enabled && proxyOk && !noHeaderMatch) {
+  if (opts.enabled && proxyOk && !noHeaderMatch && !suspended) {
     // DNR HeaderInfo.values uses case-insensitive wildcard patterns, not regex.
     // The key is `header` (HeaderInfo), not `name`.
     var cspCondition = {
