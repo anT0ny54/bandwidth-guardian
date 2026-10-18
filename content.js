@@ -78,6 +78,15 @@
 
   // Favicons, .ico and .svg are never proxied.
   const SKIP_URL_RE = /favicon|\.(?:ico|svg)(?:[?#]|$)/i;
+  // Keep these URL patterns in sync with PRIVATE_HOST_PATTERNS in service-worker.js.
+  // The DOM fallback must never send private/intranet URLs to a public proxy.
+  const PRIVATE_HOST_PATTERNS = [
+    "^https?://(?:localhost|[^/?#:]*\\.localhost|[^/?#:]*\\.local|[^/?#:.\\[]+)(?::[0-9]+)?(?:[/?#]|$)",
+    "^https?://(?:127|10|192\\.168|172\\.(?:1[6-9]|2[0-9]|3[01])|169\\.254)\\.[0-9.]+(?::[0-9]+)?(?:[/?#]|$)",
+    "^https?://\\[(?:::1|f[cd][0-9a-f]*:[0-9a-f:]*|fe80:[0-9a-f:%.a-z]*)\\](?::[0-9]+)?(?:[/?#]|$)"
+  ];
+  const PRIVATE_HOST_RE = PRIVATE_HOST_PATTERNS.map(pattern => new RegExp(pattern, "i"));
+  const isPrivateHttpUrl = absolute => PRIVATE_HOST_RE.some(pattern => pattern.test(absolute));
   // URLs the raw-URL network redirect cannot carry. KEEP IN SYNC with prehook.js
   // and CONFLICT_PATTERN in service-worker.js.
   const CONFLICT_RE = /&(?:quality|l|bw|jpeg|max_width)=/;
@@ -152,7 +161,7 @@
   function shouldSkip(absolute) {
     if (!active) return true;
     const u = safeURL(absolute);
-    if (!u) return true;
+    if (!u || isPrivateHttpUrl(absolute)) return true;
     if (SKIP_URL_RE.test(absolute) || TRACKING_RE.test(absolute)) return true;
     if (u.origin === proxyOrigin) return true; // already proxied
     if (failedUrls.size && failedUrls.has(stripHash(absolute))) return true; // proxy failed before
@@ -165,7 +174,12 @@
 
   function updateProxyConfig(next) {
     opts = next;
-    const base = String(opts.proxyBase || "").trim();
+    let base = String(opts.proxyBase || "").trim();
+    try {
+      const parsed = new URL(base);
+      if (!/^https?:$/.test(parsed.protocol)) base = "";
+      else { parsed.hash = ""; base = parsed.href; }
+    } catch { base = ""; }
     const quality = Math.max(1, Math.min(100, Number(opts.quality ?? 60) || 60));
     const maxWidth = Number(opts.maxWidth) || 0;
     proxyConfig = { base, sep: base.includes("?") ? "&" : "?", quality,

@@ -241,23 +241,87 @@ let pendingStats = { filesProcessed: 0, bytesProcessed: 0, bytesSaved: 0 };
 let statsFlushTimer = null;
 let statsFlushInProgress = false;
 let statsMirrorTimer = null;
+let statsMirrorWriteInProgress = false;
+let statsStartupWriteInProgress = true; // startup recovery's first storage read/write
+let statsResetPending = false;
+let statsResetInProgress = false;
+const statsResetResponders = [];
+
+const hasPendingStats = () => !!(pendingStats.filesProcessed || pendingStats.bytesProcessed || pendingStats.bytesSaved);
+
+function finishStatsResetIfReady() {
+  if (!statsResetPending || statsFlushInProgress || statsMirrorWriteInProgress ||
+      statsStartupWriteInProgress || statsResetInProgress) return;
+  statsResetPending = false;
+  statsResetInProgress = true;
+  const finish = () => {
+    const ok = !chrome.runtime.lastError;
+    statsResetInProgress = false;
+    // Serialize concurrent reset requests: finish the newest reset before
+    // acknowledging any waiter or allowing new counter writes to flush.
+    if (statsResetPending) {
+      finishStatsResetIfReady();
+      return;
+    }
+    for (const respond of statsResetResponders.splice(0)) {
+      try { respond({ ok }); } catch {}
+    }
+    // Images that completed after the reset request count as new activity.
+    if (hasPendingStats()) {
+      mirrorPendingStats();
+      scheduleStatsFlush();
+    }
+  };
+  try {
+    chrome.storage.local.set({ stats: { ...ZERO_STATS }, statsPending: { ...ZERO_STATS } }, finish);
+  } catch {
+    statsResetInProgress = false;
+    if (statsResetPending) {
+      finishStatsResetIfReady();
+      return;
+    }
+    for (const respond of statsResetResponders.splice(0)) {
+      try { respond({ ok: false }); } catch {}
+    }
+  }
+}
+
+function resetStatsCounters(sendResponse) {
+  pendingStats = { ...ZERO_STATS };
+  if (statsFlushTimer) { clearTimeout(statsFlushTimer); statsFlushTimer = null; }
+  if (statsMirrorTimer) { clearTimeout(statsMirrorTimer); statsMirrorTimer = null; }
+  if (typeof sendResponse === "function") statsResetResponders.push(sendResponse);
+  statsResetPending = true;
+  finishStatsResetIfReady();
+}
 
 function flushStats() {
+  if (statsResetPending || statsResetInProgress) return;
   if (statsFlushInProgress) { scheduleStatsFlush(); return; }
-  if (!pendingStats.filesProcessed && !pendingStats.bytesProcessed && !pendingStats.bytesSaved) return;
+  if (!hasPendingStats()) return;
   statsFlushInProgress = true;
   const delta = pendingStats;
   pendingStats = { filesProcessed: 0, bytesProcessed: 0, bytesSaved: 0 };
   chrome.storage.local.get({ stats: ZERO_STATS }, d => {
-    const s = d.stats || ZERO_STATS;
+    // A reset requested during the read wins over this stale delta.
+    if (statsResetPending || statsResetInProgress) {
+      statsFlushInProgress = false;
+      finishStatsResetIfReady();
+      return;
+    }
+    const s = d.stats || { ...ZERO_STATS };
     s.filesProcessed += delta.filesProcessed;
     s.bytesProcessed += delta.bytesProcessed;
     s.bytesSaved     += delta.bytesSaved;
     // B8: commit stats and clear the crash mirror in ONE atomic write — a
     // worker kill between two writes can no longer strand the delta.
-    chrome.storage.local.set({ stats: s, statsPending: ZERO_STATS }, () => {
+    chrome.storage.local.set({ stats: s, statsPending: { ...ZERO_STATS } }, () => {
       statsFlushInProgress = false;
-      if (pendingStats.filesProcessed || pendingStats.bytesProcessed || pendingStats.bytesSaved) scheduleStatsFlush();
+      if (statsResetPending) {
+        finishStatsResetIfReady();
+      } else if (hasPendingStats()) {
+        scheduleStatsFlush();
+      }
     });
   });
 }
@@ -268,11 +332,21 @@ function scheduleStatsFlush() {
 }
 
 function mirrorPendingStats() {
-  if (statsMirrorTimer) return; // O2: crash mirror is throttled to ≤1 write/sec
+  if (statsMirrorTimer || statsMirrorWriteInProgress || statsResetPending || statsResetInProgress) return;
   statsMirrorTimer = setTimeout(() => {
     statsMirrorTimer = null;
-    if (pendingStats.filesProcessed || pendingStats.bytesProcessed || pendingStats.bytesSaved) {
-      try { chrome.storage.local.set({ statsPending: pendingStats }); } catch {}
+    if (!hasPendingStats() || statsResetPending || statsResetInProgress) return;
+    statsMirrorWriteInProgress = true;
+    const snapshot = { ...pendingStats };
+    try {
+      chrome.storage.local.set({ statsPending: snapshot }, () => {
+        statsMirrorWriteInProgress = false;
+        if (statsResetPending) finishStatsResetIfReady();
+        else if (hasPendingStats()) mirrorPendingStats();
+      });
+    } catch {
+      statsMirrorWriteInProgress = false;
+      if (statsResetPending) finishStatsResetIfReady();
     }
   }, 1000);
 }
@@ -288,21 +362,53 @@ function recordStats(bytes, saved) {
 // Startup recovery: merge a stranded crash mirror into stats atomically. The
 // single get of both keys avoids deleting a newer mirror written between the
 // read and the remove (B8 related race).
+let statsRevision = 0;
+const startupStatsRevision = statsRevision;
 chrome.storage.local.get({ stats: ZERO_STATS, statsPending: null }, d => {
+  if (startupStatsRevision !== statsRevision) {
+    statsStartupWriteInProgress = false;
+    if (statsResetPending) finishStatsResetIfReady();
+    return;
+  }
   const p = d.statsPending;
-  if (!p) return;
+  if (!p) {
+    statsStartupWriteInProgress = false;
+    if (statsResetPending) finishStatsResetIfReady();
+    return;
+  }
   const files = Number(p.filesProcessed) || 0;
   const bytes = Math.max(0, Number(p.bytesProcessed) || 0);
   const saved = Math.max(0, Number(p.bytesSaved) || 0);
-  if (!files && !bytes && !saved) { try { chrome.storage.local.remove("statsPending"); } catch {}; return; }
-  const s = d.stats || ZERO_STATS;
+  if (!files && !bytes && !saved) {
+    try {
+      chrome.storage.local.remove("statsPending", () => {
+        statsStartupWriteInProgress = false;
+        if (statsResetPending) finishStatsResetIfReady();
+      });
+    } catch {
+      statsStartupWriteInProgress = false;
+      if (statsResetPending) finishStatsResetIfReady();
+    }
+    return;
+  }
+  const s = d.stats || { ...ZERO_STATS };
   s.filesProcessed += files;
   s.bytesProcessed += bytes;
   s.bytesSaved     += saved;
-  chrome.storage.local.set({ stats: s, statsPending: ZERO_STATS }, () => {
-    // If recordStats() ran while we were reading, re-mirror the fresh delta.
-    if (pendingStats.filesProcessed || pendingStats.bytesProcessed || pendingStats.bytesSaved) mirrorPendingStats();
-  });
+  try {
+    chrome.storage.local.set({ stats: s, statsPending: { ...ZERO_STATS } }, () => {
+      statsStartupWriteInProgress = false;
+      if (statsResetPending) {
+        finishStatsResetIfReady();
+        return;
+      }
+      // If recordStats() ran while we were reading, re-mirror the fresh delta.
+      if (hasPendingStats()) mirrorPendingStats();
+    });
+  } catch {
+    statsStartupWriteInProgress = false;
+    if (statsResetPending) finishStatsResetIfReady();
+  }
 });
 
 // Observe proxy responses, narrowed to the configured proxy origin (O3) and
@@ -494,7 +600,13 @@ chrome.tabs?.onRemoved?.addListener(tabId => {
 // Content scripts ask for this tab's known-bad originals at page start, so the
 // DOM layer does not send them to the proxy again after a reload.
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (!msg || msg.type !== "bh-failed-list") return;
+  if (!msg) return;
+  if (msg.type === "bh-reset-stats") {
+    statsRevision++;
+    resetStatsCounters(sendResponse);
+    return true;
+  }
+  if (msg.type !== "bh-failed-list") return;
   const prefix = (sender?.tab?.id ?? -1) + " ";
   bypassReady().then(() => {
     const urls = [];
@@ -615,21 +727,18 @@ function buildRules(opts, noHeaderMatch, suspended) {
   var base = usableProxyBase(opts.proxyBase);
   var proxyOk = !!base;
 
-  // B1: CSP is stripped ONLY when a usable proxy is configured. Chrome 128+
-  // DNR response-header matching narrows the rule to documents whose CSP
-  // actually contains img-src/default-src (falls back to the broad rule on
-  // older Chromium). Report-only CSP is left alone (R15): it blocks nothing.
-  // CSP also applies to redirect targets, so the redirect needs this too.
-  if (opts.enabled && proxyOk) {
-    var cspCondition = { resourceTypes: ["main_frame", "sub_frame"] };
-    if (!noHeaderMatch) {
-      // DNR HeaderInfo.values uses case-insensitive wildcard patterns, not
-      // regular expressions.
-      // The key is `header` (HeaderInfo), not `name`: with `name` Chrome threw
-      // a synchronous schema TypeError, so NO rule (CSP, Save-Data) was ever
-      // installed and the refresh lock was never released.
-      cspCondition.responseHeaders = [{ header: "content-security-policy", values: ["*img-src*", "*default-src*"] }];
-    }
+  // B1: CSP is stripped only when the proxy is configured AND Chrome accepts
+  // response-header matching. Never fall back to removing CSP from every
+  // document: if this condition is unsupported, preserving page policy is safer
+  // than silently weakening script/connect/frame restrictions. Report-only CSP
+  // is left alone (R15): it blocks nothing. CSP also applies to redirect targets.
+  if (opts.enabled && proxyOk && !noHeaderMatch) {
+    // DNR HeaderInfo.values uses case-insensitive wildcard patterns, not regex.
+    // The key is `header` (HeaderInfo), not `name`.
+    var cspCondition = {
+      resourceTypes: ["main_frame", "sub_frame"],
+      responseHeaders: [{ header: "content-security-policy", values: ["*img-src*", "*default-src*"] }]
+    };
     if (excludedDomains.length) cspCondition.excludedRequestDomains = excludedDomains;
     addRules.push({
       id: RULE_ID_CSP,

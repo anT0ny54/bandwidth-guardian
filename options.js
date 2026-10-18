@@ -180,11 +180,11 @@ chrome.storage.onChanged.addListener((changes, area) => {
   if (changes.excludeDomains && !dirty.excludeDomains) {
     excludeEl.value = changes.excludeDomains.newValue || "";
   }
-  if (changes.quality && !dirty.quality && !dirty.width) {
+  if (changes.quality && !dirty.quality) {
     savedQuality = changes.quality.newValue ?? DEFAULTS.quality;
     setQualityUI(savedQuality);
   }
-  if (changes.maxWidth && !dirty.width && !dirty.quality) {
+  if (changes.maxWidth && !dirty.width) {
     savedWidth = changes.maxWidth.newValue ?? DEFAULTS.maxWidth;
     setWidthUI(savedWidth);
   }
@@ -345,10 +345,22 @@ async function resetAll() {
 }
 
 async function resetStats() {
-  // Only touch the stats: load() would also overwrite unsaved form edits.
-  await chrome.storage.local.set({ stats: { filesProcessed: 0, bytesProcessed: 0, bytesSaved: 0 } });
-  renderStats(null);
-  showToast("Stats cleared");
+  // The worker owns buffered deltas as well as the crash mirror; resetting only
+  // storage.local.stats could make old counts reappear on the next flush.
+  try {
+    await new Promise((resolve, reject) => {
+      chrome.runtime.sendMessage({ type: "bh-reset-stats" }, response => {
+        const error = chrome.runtime.lastError;
+        if (error) reject(new Error(error.message));
+        else if (!response?.ok) reject(new Error("Stats reset failed"));
+        else resolve(response);
+      });
+    });
+    renderStats(null);
+    showToast("Stats cleared");
+  } catch {
+    showToast("Could not reset stats", "err");
+  }
 }
 
 // ── Event wiring ──────────────────────────────────────────────────────────────

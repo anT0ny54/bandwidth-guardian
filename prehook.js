@@ -62,6 +62,15 @@
   // facebook.com/tracy.jpg or /products/pagead-banner.jpg; the useless `(…)+`
   // quantifiers are gone. KEEP IN SYNC with content.js.
   const SKIP_URL_RE = /favicon|\.(?:ico|svg)(?:[?#]|$)/i;
+  // Keep these URL patterns in sync with PRIVATE_HOST_PATTERNS in service-worker.js.
+  // The DOM fallback must never send private/intranet URLs to a public proxy.
+  const PRIVATE_HOST_PATTERNS = [
+    "^https?://(?:localhost|[^/?#:]*\\.localhost|[^/?#:]*\\.local|[^/?#:.\\[]+)(?::[0-9]+)?(?:[/?#]|$)",
+    "^https?://(?:127|10|192\\.168|172\\.(?:1[6-9]|2[0-9]|3[01])|169\\.254)\\.[0-9.]+(?::[0-9]+)?(?:[/?#]|$)",
+    "^https?://\\[(?:::1|f[cd][0-9a-f]*:[0-9a-f:]*|fe80:[0-9a-f:%.a-z]*)\\](?::[0-9]+)?(?:[/?#]|$)"
+  ];
+  const PRIVATE_HOST_RE = PRIVATE_HOST_PATTERNS.map(pattern => new RegExp(pattern, "i"));
+  const isPrivateHttpUrl = absolute => PRIVATE_HOST_RE.some(pattern => pattern.test(absolute));
   // URLs the raw-URL redirect cannot carry (KEEP IN SYNC with CONFLICT_PATTERN
   // in service-worker.js and PROXY_PARAMETER in bandwidth-hero-proxy2).
   const CONFLICT_RE = /&(?:quality|l|bw|jpeg|max_width)=/;
@@ -115,12 +124,17 @@
 
   function updateProxyConfig(next) {
     opts = next;
-    const base = String(opts.proxyBase || "").trim();
+    let base = String(opts.proxyBase || "").trim();
+    try {
+      const parsed = new URL(base);
+      if (!/^https?:$/.test(parsed.protocol)) base = "";
+      else { parsed.hash = ""; base = parsed.href; }
+    } catch { base = ""; }
     const quality = Math.max(1, Math.min(100, Number(opts.quality ?? 60) || 60));
     const maxWidth = Number(opts.maxWidth) || 0;
     proxyConfig = { base, sep: base.includes("?") ? "&" : "?", quality,
       maxWidth: maxWidth > 0 ? maxWidth : 0, grayscale: !!opts.grayscale };
-    try { proxyOrigin = new URL(base).origin; } catch { proxyOrigin = ""; }
+    try { proxyOrigin = base ? new URL(base).origin : ""; } catch { proxyOrigin = ""; }
   }
 
   function applyOpts(next) {
@@ -339,7 +353,7 @@
     if (isConfiguredProxyUrl(absolute) || SKIP_URL_RE.test(absolute) ||
         TRACKING_RE.test(absolute)) return true;
     const u = safeURL(absolute);
-    if (!u) return true;
+    if (!u || isPrivateHttpUrl(absolute)) return true;
     if (failedUrls.size) { const h = u.hash; u.hash = ""; const bad = failedUrls.has(u.href); u.hash = h; if (bad) return true; }
     return excludedHost(u.hostname);
   }
@@ -879,9 +893,8 @@
           const clone = link.cloneNode(true);
           setAttr.call(clone, RELOADED_ATTR, "");
           setAttr.call(link, RELOADED_ATTR, "");
-          const drop = () => { try { link.remove(); } catch {} };
-          clone.addEventListener("load", drop, { once: true });
-          clone.addEventListener("error", drop, { once: true });
+          clone.addEventListener("load", () => { try { link.remove(); } catch {} }, { once: true });
+          clone.addEventListener("error", () => { try { clone.remove(); } catch {} }, { once: true });
           link.after(clone);
         } catch {}
       }

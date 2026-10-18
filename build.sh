@@ -111,6 +111,8 @@ for ref in sorted(refs):
         raise SystemExit(f'Manifest references missing file: {ref}')
 PY
 
+find "$STAGING" -type d -exec chmod 755 {} +
+find "$STAGING" -type f -exec chmod 644 {} +
 find "$STAGING" -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} +
 rm -f "$ZIPFILE"
 (

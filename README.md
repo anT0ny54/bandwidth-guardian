@@ -64,12 +64,19 @@ once and before Chrome starts it.
      `&max_width=` would be truncated by the raw contract, so the network rule
      skips them and the DOM layer proxies them URL-encoded instead.
 2. **DOM layer, `prehook.js` (MAIN world, `document_start`) and `content.js`.**
-   Patches `src`/`srcset`/`href`/`poster`/`setAttribute` and observes the
-   document and every open, closed and declarative shadow root. When the
-   network rule is live it only handles conflict URLs, and hands everything else
-   to the network layer untouched (so nothing is wrapped twice). If the network
-   rule could not be installed, it falls back to rewriting every eligible URL
-   itself (the pre-0.1.9 behaviour).
+   Intercepts supported image `src`/`srcset` setters, preload-link attributes,
+   and inline background styles. The network layer, not these hooks, covers
+   posters, SVG `<image>`, objects/embeds, CSSOM and stylesheet requests. The
+   network rule handles ordinary requests; the DOM layer handles conflict URLs
+   on supported surfaces and hands everything else
+   to the network layer untouched (so nothing is wrapped twice). If Chrome
+   rejects the network rule, the DOM layer provides best-effort fallback for
+   observed `<img>`/`<source>` setters and parser insertions, image preloads, and
+   inline background images. That fallback cannot replace network-layer coverage
+   for every mechanism (in particular cross-origin stylesheets, CSSOM-generated
+   CSS images, SVG `<image>`, video posters, and `<object>`/`<embed>`). Full
+   coverage requires the DNR rules to install successfully. Private/intranet and
+   excluded-host exemptions still apply in DOM fallback mode.
 
 ### Fallback, loops and the circuit breaker
 
@@ -89,7 +96,10 @@ once and before Chrome starts it.
 
 `service-worker.js` also injects `Save-Data: on` and strips CSP **only while a
 valid proxy is configured** (only on documents whose CSP references
-`img-src`/`default-src`). Excluded domains always keep their own CSP.
+`img-src`/`default-src`). Excluded domains always keep their own CSP. If Chrome
+rejects response-header matching during rule setup, the extension preserves CSP
+rather than removing it from every document; a restrictive policy can then block
+the proxy on that browser configuration.
 
 ## Settings
 
@@ -161,7 +171,12 @@ BHP2_DIR=../bhp2 node --test --test-concurrency=1 tests/
 - Same-origin images become cross-origin through the proxy; a canvas drawing
   them without `crossorigin` becomes tainted for `getImageData()`/`toDataURL()`.
 - Conflict URLs (containing `&quality=` and similar) are proxied by the DOM
-  layer only; when referenced from stylesheets they load directly.
+  layer only when referenced through supported DOM attributes or inline CSS;
+  when referenced from stylesheets they load directly.
+- If declarativeNetRequest rules cannot be installed, fallback coverage is
+  intentionally best-effort and does not include every network-only mechanism
+  (see **How it works**); full interception requires a compatible Chromium build
+  with the extension's network rules installed.
 - Fallback can't re-request images inside closed declarative shadow roots or
   `new Image()` objects not attached to the document; a reload loads them
   directly because the bypass rule is already installed.
