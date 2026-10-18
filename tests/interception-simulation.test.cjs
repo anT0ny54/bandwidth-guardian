@@ -10,6 +10,8 @@ const { spawnSync } = require('node:child_process');
 const ROOT = path.resolve(__dirname, '..');
 const prehook = fs.readFileSync(path.join(ROOT, 'prehook.js'), 'utf8');
 const contentPath = path.join(ROOT, 'content.js');
+const popupPath = path.join(ROOT, 'popup.js');
+const popupSource = fs.readFileSync(popupPath, 'utf8');
 const content = fs.existsSync(contentPath) ? fs.readFileSync(contentPath, 'utf8') : null;
 const swPath = path.join(ROOT, 'service-worker.js');
 const serviceWorker = fs.existsSync(swPath) ? fs.readFileSync(swPath, 'utf8') : null;
@@ -205,6 +207,15 @@ test('prehook and available extension scripts pass Node syntax checks', () => {
   }
 });
 
+test('popup exclusion removal normalizes separators without leaving empty tokens', () => {
+  const helpers = ['parseDomains', 'removeDomainToken'].map(name => extractFunction(popupSource, name)).join('\n');
+  const sandbox = {};
+  vm.createContext(sandbox);
+  vm.runInContext(`${helpers}\nthis.removeToken = removeDomainToken;`, sandbox);
+  assert.equal(sandbox.removeToken(',example.com,, CDN.example.net  ', 'example.com'), 'cdn.example.net');
+  assert.equal(sandbox.removeToken('https://example.com/path,other.example', 'example.com'), 'other.example');
+});
+
 test('srcset parser preserves descriptors and commas inside image URLs', () => {
   const sources = [['prehook.js', prehook]];
   if (content) sources.push(['content.js', content]);
@@ -323,6 +334,33 @@ test('parser-created conflict images, picture sources, preload links, and 2,005 
   assertProxied(rewrittenSources[0], sourceA);
   assertProxied(rewrittenSources[1], sourceB);
   assertProxied(preload.getAttribute('href'), preloadUrl);
+});
+
+test('parser-created responsive preload without href holds conflicting imagesrcset until settings arrive', () => {
+  const h = createDomHarness();
+  const root = new h.Element('div');
+  const preload = new h.HTMLLinkElement();
+  preload._attrs.set('rel', 'preload');
+  preload._attrs.set('as', 'image');
+  const responsiveUrl = 'https://cdn.example/preload/responsive.jpg?width=800&quality=75';
+  preload._attrs.set('imagesrcset', `${responsiveUrl} 800w, https://cdn.example/preload/full.jpg 1600w`);
+
+  root.appendChild(preload);
+  h.notifyAdded(root);
+
+  assert.equal(preload.getAttribute('href'), null, 'imagesrcset-only preload has no href to hold');
+  assert.equal(preload.getAttribute('imagesrcset'), null, 'conflicting imagesrcset should be held while options are pending');
+  assert.equal(preload.dataset.bhPreloadSrcset, `${responsiveUrl} 800w, https://cdn.example/preload/full.jpg 1600w`);
+
+  h.publishSettings();
+
+  const rewritten = preload.getAttribute('imagesrcset');
+  assert.ok(rewritten, 'imagesrcset should be restored after settings arrive');
+  const candidates = rewritten.split(', ').map(part => part.split(' '));
+  assertProxied(candidates[0][0], responsiveUrl);
+  assert.equal(candidates[0][1], '800w');
+  assert.equal(candidates[1][0], 'https://cdn.example/preload/full.jpg');
+  assert.equal(candidates[1][1], '1600w');
 });
 
 test('content script rewrites URLs in inline CSS background-image', { skip: !content }, () => {
@@ -464,6 +502,27 @@ test('service worker never broadens CSP removal when response-header matching is
   assert.deepEqual(JSON.parse(JSON.stringify(csp.condition.responseHeaders)), [
     { header: 'content-security-policy', values: ['*img-src*', '*default-src*'] }
   ]);
+  const suspendedRules = sandbox.__buildRules(opts, false, true);
+  assert.equal(suspendedRules.some(rule => rule.id === 2), false, 'suspension must preserve page CSP');
+  assert.equal(suspendedRules.some(rule => rule.id === 10), false, 'suspension disables redirects');
+});
+
+test('service worker builds exact bypass matches for URLs containing DNR filter metacharacters', { skip: !serviceWorker }, () => {
+  const helper = extractFunction(serviceWorker, 'bypassCondition');
+  const decode = extractFunction(serviceWorker, 'bypassUrlFromRule');
+  const sandbox = {};
+  vm.createContext(sandbox);
+  vm.runInContext(`const MAX_BYPASS_REGEX_LENGTH = 1900;\n${helper}\n${decode}\nthis.makeCondition = bypassCondition; this.decodeRule = bypassUrlFromRule;`, sandbox);
+  const url = 'https://cdn.example/a*.png?x=1^2&next=|ok';
+  const condition = sandbox.makeCondition(url);
+  assert.ok(condition.regexFilter, 'special URLs use regex rather than urlFilter');
+  assert.equal(condition.isUrlFilterCaseSensitive, true);
+  assert.ok(new RegExp(condition.regexFilter).test(url), 'the exact URL matches');
+  assert.equal(sandbox.decodeRule({ condition }), url, 'regex bypass survives service-worker restarts');
+  assert.equal(new RegExp(condition.regexFilter).test('https://cdn.example/anything.png?x=1^2&next=|ok'), false,
+    'wildcards in a failed URL must not widen the bypass');
+  assert.deepEqual(JSON.parse(JSON.stringify(sandbox.makeCondition('https://cdn.example/a.png?x=1'))),
+    { urlFilter: '|https://cdn.example/a.png?x=1|' });
 });
 
 test('service worker waits for startup recovery, serializes concurrent stats resets, and preserves later activity', { skip: !serviceWorker }, () => {
@@ -510,6 +569,42 @@ test('service worker waits for startup recovery, serializes concurrent stats res
   assert.equal(state.pendingStats.filesProcessed, 1, 'activity after reset request is retained');
   assert.equal(state.mirrored, 1, 'new activity is mirrored after the reset');
   assert.equal(state.flushed, 1, 'new activity is flushed after the reset');
+});
+
+test('service worker gates stats mirrors and flushes until startup recovery finishes', { skip: !serviceWorker }, () => {
+  const helpers = ['flushStats', 'scheduleStatsFlush', 'mirrorPendingStats', 'finishStatsStartup']
+    .map(name => extractFunction(serviceWorker, name)).join('\n');
+  const scheduled = [];
+  const writes = [];
+  let reads = 0;
+  const sandbox = {
+    setTimeout: (callback, delay) => { scheduled.push({ callback, delay }); return scheduled.length; },
+    clearTimeout: () => {},
+    chrome: { storage: { local: {
+      get: () => { reads++; },
+      set: value => { writes.push(value); }
+    } } }
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(`
+    const ZERO_STATS = { filesProcessed: 0, bytesProcessed: 0, bytesSaved: 0 };
+    let pendingStats = { filesProcessed: 1, bytesProcessed: 128, bytesSaved: 64 };
+    let statsFlushTimer = null, statsMirrorTimer = null;
+    let statsFlushInProgress = false, statsMirrorWriteInProgress = false;
+    let statsStartupWriteInProgress = true;
+    let statsResetPending = false, statsResetInProgress = false;
+    const hasPendingStats = () => !!(pendingStats.filesProcessed || pendingStats.bytesProcessed || pendingStats.bytesSaved);
+    ${helpers}
+    this.api = { begin: () => { mirrorPendingStats(); flushStats(); }, finish: finishStatsStartup };
+  `, sandbox);
+
+  sandbox.api.begin();
+  assert.equal(scheduled.length, 0, 'startup recovery should defer timers and writes');
+  assert.equal(reads, 0, 'flush must not read stale totals during recovery');
+  assert.equal(writes.length, 0, 'mirror must not overwrite the recovery snapshot');
+  sandbox.api.finish();
+  assert.deepEqual(scheduled.map(item => item.delay).sort((a, b) => a - b), [750, 1000],
+    'pending activity is mirrored and scheduled for a normal flush after startup');
 });
 
 test('architecture markers: network redirect is the primary layer, DOM layers defer to it', { skip: !content || !serviceWorker }, () => {
