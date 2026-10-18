@@ -74,8 +74,6 @@
     });
   }
 
-  // Anchored tracking-pixel patterns (B13). KEEP IN SYNC with prehook.js.
-  const TRACKING_RE = /(?:\/|\.)pagead(?:[/?#]|$)|(?:pixel|cleardot)\.*\.(?:gif|jpe?g)(?:[?#]|$)|google\.[a-z.]+\/(?:ads|generate_204|.*\/log204)(?:[?#]|$)|google-analytics\.[a-z.]+\/(?:r|collect)(?:[?#]|$)|youtube\.[a-z.]+\/(?:api|ptracking|player_204|live_204)(?:[?#]|$)|doubleclick\.[a-z.]+\/(?:pcs|pixel|r)(?:[?#]|$)|googlesyndication\.[a-z.]+\/ddm(?:[?#]|$)|pixel\.facebook\.[a-z.]+|facebook\.[a-z.]+\/(?:tr|impression\.php)(?:[?#]|$)|ad\.bitmedia\.io(?:[/?#]|$)|yahoo\.[a-z.]+\/pixel(?:[?#]|$)|criteo\.net\/img(?:[?#]|$)|ad\.doubleclick\.net(?:[/?#]|$)/i;
 
   // Favicons, .ico and .svg are never proxied.
   const SKIP_URL_RE = /favicon|\.(?:ico|svg)(?:[?#]|$)/i;
@@ -163,7 +161,7 @@
     if (!active) return true;
     const u = safeURL(absolute);
     if (!u || isPrivateHttpUrl(absolute)) return true;
-    if (SKIP_URL_RE.test(absolute) || TRACKING_RE.test(absolute)) return true;
+    if (SKIP_URL_RE.test(absolute)) return true;
     if (u.origin === proxyOrigin) return true; // already proxied
     if (failedUrls.size && failedUrls.has(stripHash(absolute))) return true; // proxy failed before
     // The network redirect owns every non-conflict URL; rewriting it here too
@@ -465,9 +463,10 @@
       root.querySelectorAll(CANDIDATE_SELECTOR).forEach(processCandidate);
       // #17: style-attribute candidates from THIS batch only (R5: nodeType is
       // always 1 here — it was filtered on push — so no re-checks are needed).
-      if (root.hasAttribute("style") && String(root.getAttribute("style")).includes("url(")) {
-        rewriteBg(root);
-      }
+      // Case-insensitive, matching STYLE_SELECTOR ([style*='url(' i]): an
+      // uppercase "URL(" on the added root itself was previously missed.
+      const rootStyle = root.getAttribute("style");
+      if (rootStyle && /\burl\(/i.test(rootStyle)) rewriteBg(root);
       root.querySelectorAll(STYLE_SELECTOR).forEach(rewriteBg);
     }
     imageTargets.forEach(rewriteImg);

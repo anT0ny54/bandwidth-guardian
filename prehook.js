@@ -61,9 +61,6 @@
       .filter(Boolean)
   );
 
-  // Anchored tracking-pixel patterns (B13): boundaries prevent false hits like
-  // facebook.com/tracy.jpg or /products/pagead-banner.jpg; the useless `(…)+`
-  // quantifiers are gone. KEEP IN SYNC with content.js.
   const SKIP_URL_RE = /favicon|\.(?:ico|svg)(?:[?#]|$)/i;
   // Keep these URL patterns in sync with PRIVATE_HOST_PATTERNS in service-worker.js.
   // The DOM fallback must never send private/intranet URLs to a public proxy.
@@ -83,7 +80,6 @@
   // are held; everything else is already covered by the network redirect.
   const mustHold = absolute => !!absolute && CONFLICT_RE.test(absolute);
   const srcsetNeedsHold = ss => parseSrcset(String(ss || "")).some(c => mustHold(resolveHttp(c.url)));
-  const TRACKING_RE = /(?:\/|\.)pagead(?:[/?#]|$)|(?:pixel|cleardot)\.*\.(?:gif|jpe?g)(?:[?#]|$)|google\.[a-z.]+\/(?:ads|generate_204|.*\/log204)(?:[?#]|$)|google-analytics\.[a-z.]+\/(?:r|collect)(?:[?#]|$)|youtube\.[a-z.]+\/(?:api|ptracking|player_204|live_204)(?:[?#]|$)|doubleclick\.[a-z.]+\/(?:pcs|pixel|r)(?:[?#]|$)|googlesyndication\.[a-z.]+\/ddm(?:[?#]|$)|pixel\.facebook\.[a-z.]+|facebook\.[a-z.]+\/(?:tr|impression\.php)(?:[?#]|$)|ad\.bitmedia\.io(?:[/?#]|$)|yahoo\.[a-z.]+\/pixel(?:[?#]|$)|criteo\.net\/img(?:[?#]|$)|ad\.doubleclick\.net(?:[/?#]|$)/i;
 
   // C2: proxy identity is ORIGIN-based, matching the service worker.
   const isConfiguredProxyUrl = u => {
@@ -353,8 +349,7 @@
   }
 
   function skipAbsolute(absolute) {
-    if (isConfiguredProxyUrl(absolute) || SKIP_URL_RE.test(absolute) ||
-        TRACKING_RE.test(absolute)) return true;
+    if (isConfiguredProxyUrl(absolute) || SKIP_URL_RE.test(absolute)) return true;
     const u = safeURL(absolute);
     if (!u || isPrivateHttpUrl(absolute)) return true;
     if (failedUrls.size) { const h = u.hash; u.hash = ""; const bad = failedUrls.has(u.href); u.hash = h; if (bad) return true; }

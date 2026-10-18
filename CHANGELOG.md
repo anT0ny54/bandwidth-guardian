@@ -1,6 +1,23 @@
 # Changelog
 
-## 0.2.2 - 2026-10-18
+## 0.2.3 - 2026-10-18
+
+### Modified (post-release audit, no version bump)
+
+- Verified end-to-end: no tracking pixels or tracking code exist anywhere in
+  the extension; the only outbound traffic is image data to the
+  user-configured proxy (and the settings page's manual "Test proxy" fetch).
+- Fixed: an added subtree root whose inline `style` attribute used an
+  uppercase `URL(` was never scanned for background-image proxying, because
+  the fast pre-check was case-sensitive while the descendant selector
+  `[style*='url(' i]` is not. The pre-check is now case-insensitive and reads
+  the attribute once instead of twice.
+- Verified permissions (`webRequest`, `alarms`, `tabs`, `storage`, DNR) are
+  all exercised by live code paths, and all cross-layer KEEP-IN-SYNC
+  contracts (defaults, conflict pattern, private-host patterns, srcset
+  parser, settings-event name, failure attributes) are consistent. No dead
+  code, conflicts or further bugs found; no other code changed.
+
 
 ### Fixed
 
@@ -41,7 +58,15 @@
   CSS (`.btn.full`, popup anchor rules, duplicated light-theme variables) and
   test-only "patch ZIP" guards and unused mock-server fields.
 
+- The built-in tracking-pixel pattern lists (`TRACKING_PATTERNS` in the service
+  worker, `TRACKING_RE` in the DOM layers) and the per-pattern DNR allow rules
+  that exempted known tracking pixels from proxying. Tracking images are now
+  routed through the proxy like any other image; the retired rule IDs 30-42 are
+  removed from installed browsers on the next rule refresh.
+
 ### Tests
 
 - Added regression tests for domain tokenizing, proxy-origin validation and
   proxy statistics header parsing.
+- Removed the tracking-pattern sync assertions and the tracking-exemption rule
+  check (rule IDs 30-42); the `skip.html` pixel URL is now asserted proxied.

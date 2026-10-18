@@ -5,6 +5,12 @@ An MV3 browser extension that routes eligible images through your own
 them (quality cap, optional grayscale, max-width downscale) before they reach
 the browser — and optionally sends `Save-Data: on` with requests.
 
+**Privacy:** the extension contains no analytics, no tracking pixels and no
+telemetry of any kind. The only outbound traffic it generates is image data sent
+to the compression proxy you configure yourself (plus one manual health-check
+fetch when you press "Test proxy" on the settings page). No browsing data is
+collected, logged or shared by the extension itself.
+
 ## Platform support
 
 **Chrome / Chromium-based browsers only** (Chrome, Edge, Brave, Opera, Arc,
@@ -28,9 +34,8 @@ statistics:
 | JPEG XL | `image/jxl` |
 
 Usage statistics are counted only for proxy responses whose actual
-`Content-Type` is one of the above. Favicons, `.ico`, `.svg`, known
-tracking-pixel URLs, excluded domains and private-network hosts are never
-proxied.
+`Content-Type` is one of the above. Favicons, `.ico`, `.svg`,
+excluded domains and private-network hosts are never proxied.
 
 ## How it works
 
@@ -55,7 +60,7 @@ once and before Chrome starts it.
      proxy origin itself, so a proxied URL is never redirected again.
    - **Exemptions** (higher priority than the redirect): excluded domains
      (both as request host and page/initiator), favicons, `.ico`/`.svg`,
-     known tracking pixels, `data:`/`blob:` (never matched), localhost,
+     `data:`/`blob:` (never matched), localhost,
      `*.local`, single-label intranet hosts and private/link-local IP
      literals (a public proxy cannot reach them; bandwidth-hero-proxy2 answers
      403 for them).

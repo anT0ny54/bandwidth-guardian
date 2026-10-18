@@ -56,7 +56,6 @@ const RULE_ID_ALLOW_PROXY     = 20;  // never redirect the proxy itself (loop gu
 const RULE_ID_ALLOW_SKIP      = 21;  // favicon / .ico / .svg
 const RULE_ID_ALLOW_CONFLICT  = 22;  // URLs the raw proxy contract would truncate
 const RULE_ID_ALLOW_PRIVATE   = 23;  // 23–25: localhost / private-network / single-label hosts
-const RULE_ID_ALLOW_TRACKING  = 30;  // 30 … 30 + TRACKING_PATTERNS.length - 1
 
 // Priorities: modifyHeaders rules sit above every allow rule so Save-Data and
 // CSP handling still apply to exempted/bypassed requests.
@@ -66,24 +65,6 @@ const PRIORITY_PROXY    = 3;
 const PRIORITY_BYPASS   = 4;   // session rules (per-tab fallback)
 const PRIORITY_HEADERS  = 10;
 
-// Tracking-pixel patterns. KEEP IN SYNC with TRACKING_RE in prehook.js /
-// content.js (that regex is exactly these alternatives joined with "|").
-// One DNR rule per alternative: the joined regex exceeds DNR's RE2 memory cap.
-const TRACKING_PATTERNS = [
-  "(?:\\/|\\.)pagead(?:[/?#]|$)",
-  "(?:pixel|cleardot)\\.*\\.(?:gif|jpe?g)(?:[?#]|$)",
-  "google\\.[a-z.]+\\/(?:ads|generate_204|.*\\/log204)(?:[?#]|$)",
-  "google-analytics\\.[a-z.]+\\/(?:r|collect)(?:[?#]|$)",
-  "youtube\\.[a-z.]+\\/(?:api|ptracking|player_204|live_204)(?:[?#]|$)",
-  "doubleclick\\.[a-z.]+\\/(?:pcs|pixel|r)(?:[?#]|$)",
-  "googlesyndication\\.[a-z.]+\\/ddm(?:[?#]|$)",
-  "pixel\\.facebook\\.[a-z.]+",
-  "facebook\\.[a-z.]+\\/(?:tr|impression\\.php)(?:[?#]|$)",
-  "ad\\.bitmedia\\.io(?:[/?#]|$)",
-  "yahoo\\.[a-z.]+\\/pixel(?:[?#]|$)",
-  "criteo\\.net\\/img(?:[?#]|$)",
-  "ad\\.doubleclick\\.net(?:[/?#]|$)"
-];
 // KEEP IN SYNC with SKIP_URL_RE in prehook.js / content.js.
 const SKIP_PATTERN = "favicon|\\.(?:ico|svg)(?:[?#]|$)";
 // KEEP IN SYNC with CONFLICT_RE in prehook.js / content.js and with
@@ -106,8 +87,7 @@ const OBJECT_IMAGE_PATTERN = "^https?://[^?#]*\\.(?:jpe?g|png|webp|gif|tiff?|jxl
 
 const ALL_RULE_IDS = [1, RULE_ID_CSP, RULE_ID_SAVE_DATA, RULE_ID_REDIRECT_IMAGE,
   RULE_ID_REDIRECT_OBJECT, RULE_ID_ALLOW_PROXY, RULE_ID_ALLOW_SKIP, RULE_ID_ALLOW_CONFLICT,
-  ...PRIVATE_HOST_PATTERNS.map((_, i) => RULE_ID_ALLOW_PRIVATE + i),
-  ...TRACKING_PATTERNS.map((_, i) => RULE_ID_ALLOW_TRACKING + i)];
+  ...PRIVATE_HOST_PATTERNS.map((_, i) => RULE_ID_ALLOW_PRIVATE + i)];
 
 // ── Concurrency guard ─────────────────────────────────────────────────────────
 let refreshing     = false;
@@ -881,12 +861,6 @@ function buildRules(opts, noHeaderMatch, suspended) {
     PRIVATE_HOST_PATTERNS.forEach(function(p, i) {
       addRules.push({
         id: RULE_ID_ALLOW_PRIVATE + i, priority: PRIORITY_EXEMPT, action: { type: "allow" },
-        condition: { regexFilter: p, isUrlFilterCaseSensitive: false, resourceTypes: PROXY_REQUEST_TYPES }
-      });
-    });
-    TRACKING_PATTERNS.forEach(function(p, i) {
-      addRules.push({
-        id: RULE_ID_ALLOW_TRACKING + i, priority: PRIORITY_EXEMPT, action: { type: "allow" },
         condition: { regexFilter: p, isUrlFilterCaseSensitive: false, resourceTypes: PROXY_REQUEST_TYPES }
       });
     });
