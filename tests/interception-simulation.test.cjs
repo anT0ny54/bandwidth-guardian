@@ -9,12 +9,9 @@ const { spawnSync } = require('node:child_process');
 
 const ROOT = path.resolve(__dirname, '..');
 const prehook = fs.readFileSync(path.join(ROOT, 'prehook.js'), 'utf8');
-const contentPath = path.join(ROOT, 'content.js');
-const popupPath = path.join(ROOT, 'popup.js');
-const popupSource = fs.readFileSync(popupPath, 'utf8');
-const content = fs.existsSync(contentPath) ? fs.readFileSync(contentPath, 'utf8') : null;
-const swPath = path.join(ROOT, 'service-worker.js');
-const serviceWorker = fs.existsSync(swPath) ? fs.readFileSync(swPath, 'utf8') : null;
+const content = fs.readFileSync(path.join(ROOT, 'content.js'), 'utf8');
+const popupSource = fs.readFileSync(path.join(ROOT, 'popup.js'), 'utf8');
+const serviceWorker = fs.readFileSync(path.join(ROOT, 'service-worker.js'), 'utf8');
 
 function extractFunction(source, name) {
   const marker = new RegExp(`function\\s+${name}\\s*\\(`);
@@ -197,12 +194,15 @@ function assertProxied(url, original) {
   assert.equal(parsed.searchParams.get('url'), original);
 }
 
-test('prehook and available extension scripts pass Node syntax checks', () => {
+test('every shipped script passes Node syntax checks', () => {
   const files = ['prehook.js', 'content.js', 'service-worker.js', 'options.js', 'popup.js', 'defaults.js'];
   for (const file of files) {
     const full = path.join(ROOT, file);
-    if (!fs.existsSync(full)) continue; // patch ZIP intentionally contains only changed files
-    const result = spawnSync(process.execPath, ['--check', full], { encoding: 'utf8' });
+    // popup/options/defaults are ES modules: check them as .mjs content via stdin.
+    const esm = ['options.js', 'popup.js', 'defaults.js'].includes(file);
+    const result = esm
+      ? spawnSync(process.execPath, ['--input-type=module', '--check'], { encoding: 'utf8', input: fs.readFileSync(full, 'utf8') })
+      : spawnSync(process.execPath, ['--check', full], { encoding: 'utf8' });
     assert.equal(result.status, 0, `${file}: ${result.stderr || result.stdout}`);
   }
 });
@@ -217,9 +217,7 @@ test('popup exclusion removal normalizes separators without leaving empty tokens
 });
 
 test('srcset parser preserves descriptors and commas inside image URLs', () => {
-  const sources = [['prehook.js', prehook]];
-  if (content) sources.push(['content.js', content]);
-  for (const [name, source] of sources) {
+  for (const [name, source] of [['prehook.js', prehook], ['content.js', content]]) {
     const { fn: parseSrcset } = functionFrom(source, 'parseSrcset');
     const input = 'https://cdn.example/a,w_400,h_300.webp 1x, https://cdn.example/b.jpg?fit=cover,center 2x';
     const actual = parseSrcset(input).map(({ url, desc }) => [url, desc]);
@@ -363,7 +361,7 @@ test('parser-created responsive preload without href holds conflicting imagesrcs
   assert.equal(candidates[1][1], '1600w');
 });
 
-test('content script rewrites URLs in inline CSS background-image', { skip: !content }, () => {
+test('content script rewrites URLs in inline CSS background-image', () => {
   const rewriteBgSource = extractFunction(content, 'rewriteBg');
   const sandbox = {
     doneBg: new WeakSet(), active: true, failedEls: { has: () => false },
@@ -416,7 +414,7 @@ test('DOM fallback preserves private/intranet exemptions and normalizes proxy UR
   assert.equal(invalidProxyImage.getAttribute('src'), publicUrl, 'invalid proxy values do not activate rewriting');
 });
 
-test('duplicated patterns stay in sync across prehook, content script and service worker', { skip: !content || !serviceWorker }, () => {
+test('duplicated patterns stay in sync across prehook, content script and service worker', () => {
   const grab = (src, name) => {
     const m = new RegExp(`const ${name} = (\/.*\/)([a-z]*);`).exec(src);
     assert.ok(m, `${name} present`);
@@ -444,7 +442,7 @@ test('duplicated patterns stay in sync across prehook, content script and servic
   assert.equal(extractArray(prehook, 'PRIVATE_HOST_PATTERNS'), JSON.stringify(sb.PRIVATE_HOST_PATTERNS));
 });
 
-test('service worker: raw redirect target round-trips through the proxy contract; recovery mirrors getImageUrl', { skip: !serviceWorker }, () => {
+test('service worker: raw redirect target round-trips through the proxy contract; recovery mirrors getImageUrl', () => {
   const sb = { URL, decodeURIComponent };
   vm.createContext(sb);
   const consts = serviceWorker.slice(serviceWorker.indexOf('const TRACKING_PATTERNS'), serviceWorker.indexOf('const ALL_RULE_IDS'));
@@ -483,7 +481,7 @@ test('service worker: raw redirect target round-trips through the proxy contract
   }
 });
 
-test('service worker never broadens CSP removal when response-header matching is unavailable', { skip: !serviceWorker }, () => {
+test('service worker never broadens CSP removal when response-header matching is unavailable', () => {
   const constantsStart = serviceWorker.indexOf('const RULE_ID_CSP');
   const constantsEnd = serviceWorker.indexOf('const ALL_RULE_IDS');
   const constantSource = serviceWorker.slice(constantsStart, constantsEnd);
@@ -507,7 +505,7 @@ test('service worker never broadens CSP removal when response-header matching is
   assert.equal(suspendedRules.some(rule => rule.id === 10), false, 'suspension disables redirects');
 });
 
-test('service worker builds exact bypass matches for URLs containing DNR filter metacharacters', { skip: !serviceWorker }, () => {
+test('service worker builds exact bypass matches for URLs containing DNR filter metacharacters', () => {
   const helper = extractFunction(serviceWorker, 'bypassCondition');
   const decode = extractFunction(serviceWorker, 'bypassUrlFromRule');
   const sandbox = {};
@@ -525,7 +523,7 @@ test('service worker builds exact bypass matches for URLs containing DNR filter 
     { urlFilter: '|https://cdn.example/a.png?x=1|' });
 });
 
-test('service worker waits for startup recovery, serializes concurrent stats resets, and preserves later activity', { skip: !serviceWorker }, () => {
+test('service worker waits for startup recovery, serializes concurrent stats resets, and preserves later activity', () => {
   const helpers = ['finishStatsResetIfReady', 'resetStatsCounters'].map(name => extractFunction(serviceWorker, name)).join('\n');
   const writes = [];
   const sandbox = { clearTimeout: () => {}, writes, chrome: {
@@ -571,7 +569,7 @@ test('service worker waits for startup recovery, serializes concurrent stats res
   assert.equal(state.flushed, 1, 'new activity is flushed after the reset');
 });
 
-test('service worker gates stats mirrors and flushes until startup recovery finishes', { skip: !serviceWorker }, () => {
+test('service worker gates stats mirrors and flushes until startup recovery finishes', () => {
   const helpers = ['flushStats', 'scheduleStatsFlush', 'mirrorPendingStats', 'finishStatsStartup']
     .map(name => extractFunction(serviceWorker, name)).join('\n');
   const scheduled = [];
@@ -607,7 +605,7 @@ test('service worker gates stats mirrors and flushes until startup recovery fini
     'pending activity is mirrored and scheduled for a normal flush after startup');
 });
 
-test('architecture markers: network redirect is the primary layer, DOM layers defer to it', { skip: !content || !serviceWorker }, () => {
+test('architecture markers: network redirect is the primary layer, DOM layers defer to it', () => {
   assert.match(serviceWorker, /type: "redirect", redirect: \{ regexSubstitution: substitution \}/);
   assert.match(serviceWorker, /RULE_ID_ALLOW_PROXY/);
   assert.match(serviceWorker, /updateSessionRules/);
@@ -615,4 +613,44 @@ test('architecture markers: network redirect is the primary layer, DOM layers de
   assert.match(prehook, /const domHandles = absolute => !redirectLive \|\| CONFLICT_RE\.test\(absolute\)/);
   assert.match(content, /runtime\.redirect !== false && !CONFLICT_RE\.test\(absolute\)/);
   assert.match(prehook, /function retryFailed\(/);
+});
+
+test('prehook excludes domains with the same tokenizer as the other layers (any whitespace, commas, URLs)', () => {
+  const h = createDomHarness();
+  // Non-breaking space / tab / comma separators, a URL-shaped entry and a trailing dot.
+  h.publishSettings({ redirect: false, excludeDomains: 'a.example\u00a0b.example,\tc.example\nhttps://d.example/path e.example.' });
+  for (const host of ['a.example', 'b.example', 'c.example', 'd.example', 'sub.e.example']) {
+    const img = new h.HTMLImageElement();
+    const url = `https://${host}/x.png`;
+    img.src = url;
+    assert.equal(img.getAttribute('src'), url, `${host} must stay direct`);
+  }
+  const other = new h.HTMLImageElement();
+  other.src = 'https://f.example/x.png';
+  assertProxied(other.getAttribute('src'), 'https://f.example/x.png');
+});
+
+test('service worker only derives a proxy origin from http(s) proxy URLs', () => {
+  const sb = { URL };
+  vm.createContext(sb);
+  vm.runInContext(['usableProxyBase', 'setProxyOrigin'].map(n => extractFunction(serviceWorker, n)).join('\n') +
+    '\nvar configuredProxyOrigin = "";\nthis.set = v => { setProxyOrigin(v); return configuredProxyOrigin; };', sb);
+  assert.equal(sb.set('https://proxy.example/convert?k=1#frag'), 'https://proxy.example');
+  assert.equal(sb.set('http://localhost:3000/api'), 'http://localhost:3000');
+  for (const bad of ['', '   ', 'not a url', 'ftp://proxy.example/x', 'javascript:alert(1)', 'data:text/plain,hi']) {
+    assert.equal(sb.set(bad), '', `${JSON.stringify(bad)} must not produce an origin`);
+  }
+});
+
+test('service worker reads proxy stats headers case-insensitively from one pass', () => {
+  const sb = {};
+  vm.createContext(sb);
+  vm.runInContext(['headerMap', 'headerInt', 'getProxyResponseStats'].map(n => extractFunction(serviceWorker, n)).join('\n') +
+    '\nthis.stats = (h) => getProxyResponseStats(headerMap(h));', sb);
+  const run = headers => JSON.parse(JSON.stringify(sb.stats(headers)));
+  assert.deepEqual(run([{ name: 'X-BH-Compressed-Size', value: '100' }, { name: 'X-BH-Original-Size', value: '300' }]), { received: 100, saved: 200 });
+  assert.deepEqual(run([{ name: 'x-bh-original-size', value: '300' }, { name: 'x-bh-bytes-saved', value: '120' }]), { received: 180, saved: 120 });
+  assert.deepEqual(run([{ name: 'Content-Length', value: '42' }]), { received: 42, saved: 0 });
+  assert.deepEqual(run([{ name: 'x-bh-compressed-size', value: 'junk' }, { name: 'content-length', value: '7' }]), { received: 7, saved: 0 });
+  assert.deepEqual(run(undefined), { received: 0, saved: 0 });
 });
