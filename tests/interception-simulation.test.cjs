@@ -341,6 +341,43 @@ test('content script rewrites URLs in inline CSS background-image', { skip: !con
   assert.equal((el.style.backgroundImage.match(/https:\/\/proxy\.example\/convert/g) || []).length, 2);
 });
 
+test('DOM fallback preserves private/intranet exemptions and normalizes proxy URLs', () => {
+  const h = createDomHarness();
+  h.publishSettings({ redirect: false, proxyBase: 'https://proxy.example/convert#discard-me' });
+  const privateUrls = [
+    'http://localhost:3000/image.png',
+    'http://app.localhost/image.png',
+    'http://nas/image.png',
+    'http://printer.local/image.png',
+    'http://127.0.0.1/image.png',
+    'http://10.1.2.3/image.png',
+    'http://192.168.1.5/image.png',
+    'http://172.16.0.1/image.png',
+    'http://169.254.10.20/image.png',
+    'http://[::1]/image.png',
+    'http://[fd00::1]/image.png',
+    'http://[fe80::1]/image.png'
+  ];
+  for (const url of privateUrls) {
+    const image = new h.HTMLImageElement();
+    image.src = url;
+    assert.equal(image.getAttribute('src'), url, `${url} must stay direct`);
+  }
+
+  const publicUrl = 'https://cdn.example/image.png?x=1&y=2';
+  const publicImage = new h.HTMLImageElement();
+  publicImage.src = publicUrl;
+  const proxyUrl = new URL(publicImage.getAttribute('src'));
+  assert.equal(proxyUrl.origin, 'https://proxy.example');
+  assert.equal(proxyUrl.hash, '', 'fragments are removed before proxy parameters are appended');
+  assert.equal(proxyUrl.searchParams.get('url'), publicUrl);
+
+  h.publishSettings({ redirect: false, proxyBase: 'ftp://proxy.example/convert' });
+  const invalidProxyImage = new h.HTMLImageElement();
+  invalidProxyImage.src = publicUrl;
+  assert.equal(invalidProxyImage.getAttribute('src'), publicUrl, 'invalid proxy values do not activate rewriting');
+});
+
 test('duplicated patterns stay in sync across prehook, content script and service worker', { skip: !content || !serviceWorker }, () => {
   const grab = (src, name) => {
     const m = new RegExp(`const ${name} = (\/.*\/)([a-z]*);`).exec(src);
@@ -357,6 +394,16 @@ test('duplicated patterns stay in sync across prehook, content script and servic
   assert.equal(sb.TRACKING_PATTERNS.join('|'), grab(prehook, 'TRACKING_RE').source, 'DNR tracking rules == TRACKING_RE');
   assert.equal(sb.SKIP_PATTERN, grab(prehook, 'SKIP_URL_RE').source);
   assert.equal(sb.CONFLICT_PATTERN, grab(prehook, 'CONFLICT_RE').source);
+  const extractArray = (source, name) => {
+    const m = new RegExp(`const ${name} = (\\[[\\s\\S]*?\\n\\s*\\]);`).exec(source);
+    assert.ok(m, `${name} present`);
+    const arrayContext = {};
+    vm.createContext(arrayContext);
+    vm.runInContext(`this.value = ${m[1]}`, arrayContext);
+    return JSON.stringify(arrayContext.value);
+  };
+  assert.equal(extractArray(prehook, 'PRIVATE_HOST_PATTERNS'), extractArray(content, 'PRIVATE_HOST_PATTERNS'));
+  assert.equal(extractArray(prehook, 'PRIVATE_HOST_PATTERNS'), JSON.stringify(sb.PRIVATE_HOST_PATTERNS));
 });
 
 test('service worker: raw redirect target round-trips through the proxy contract; recovery mirrors getImageUrl', { skip: !serviceWorker }, () => {
@@ -396,6 +443,73 @@ test('service worker: raw redirect target round-trips through the proxy contract
   for (const u of ['https://cdn.example/a.png', 'https://172.32.0.1/a', 'https://11.0.0.1/a', 'https://example.com/localhost/a.png', 'https://local.example.com/a', 'https://[2001:db8::1]/a', 'https://a.b/10.0.0.1']) {
     assert.ok(!priv.test(u), `${u} is public`);
   }
+});
+
+test('service worker never broadens CSP removal when response-header matching is unavailable', { skip: !serviceWorker }, () => {
+  const constantsStart = serviceWorker.indexOf('const RULE_ID_CSP');
+  const constantsEnd = serviceWorker.indexOf('const ALL_RULE_IDS');
+  const constantSource = serviceWorker.slice(constantsStart, constantsEnd);
+  const helpers = ['parseExcluded', 'usableProxyBase', 'redirectSubstitution', 'buildRules']
+    .map(name => extractFunction(serviceWorker, name)).join('\n');
+  const sandbox = { URL, Math, Set, PROXY_REQUEST_TYPES: ['image', 'object'] };
+  vm.createContext(sandbox);
+  vm.runInContext(`${constantSource}\n${helpers}\nthis.__buildRules = buildRules;`, sandbox);
+  const opts = { enabled: true, proxyBase: 'https://proxy.example/convert', saveData: true,
+    quality: 60, grayscale: false, maxWidth: 768, excludeDomains: '' };
+  const fallbackRules = sandbox.__buildRules(opts, true, false);
+  assert.equal(fallbackRules.some(rule => rule.id === 2), false, 'unsupported header matching must preserve CSP');
+  assert.ok(fallbackRules.some(rule => rule.id === 10), 'image redirect remains installed without CSP matching');
+  const normalRules = sandbox.__buildRules(opts, false, false);
+  const csp = normalRules.find(rule => rule.id === 2);
+  assert.deepEqual(JSON.parse(JSON.stringify(csp.condition.responseHeaders)), [
+    { header: 'content-security-policy', values: ['*img-src*', '*default-src*'] }
+  ]);
+});
+
+test('service worker waits for startup recovery, serializes concurrent stats resets, and preserves later activity', { skip: !serviceWorker }, () => {
+  const helpers = ['finishStatsResetIfReady', 'resetStatsCounters'].map(name => extractFunction(serviceWorker, name)).join('\n');
+  const writes = [];
+  const sandbox = { clearTimeout: () => {}, writes, chrome: {
+    runtime: { lastError: null },
+    storage: { local: { set: (value, callback) => writes.push({ value, callback }) } }
+  } };
+  vm.createContext(sandbox);
+  vm.runInContext(`
+    const ZERO_STATS = { filesProcessed: 0, bytesProcessed: 0, bytesSaved: 0 };
+    let pendingStats = { ...ZERO_STATS };
+    let statsFlushTimer = null, statsMirrorTimer = null;
+    let statsFlushInProgress = false, statsMirrorWriteInProgress = false;
+    let statsStartupWriteInProgress = true;
+    let statsResetPending = false, statsResetInProgress = false;
+    const statsResetResponders = [];
+    let mirrored = 0, flushed = 0;
+    const hasPendingStats = () => !!(pendingStats.filesProcessed || pendingStats.bytesProcessed || pendingStats.bytesSaved);
+    const mirrorPendingStats = () => { mirrored++; };
+    const scheduleStatsFlush = () => { flushed++; };
+    ${helpers}
+    this.api = { resetStatsCounters, startupDone: () => { statsStartupWriteInProgress = false; finishStatsResetIfReady(); }, addActivity: () => { pendingStats.filesProcessed++; }, state: () => ({
+      pendingStats: { ...pendingStats }, statsResetPending, statsResetInProgress, responders: statsResetResponders.length, mirrored, flushed
+    }) };
+  `, sandbox);
+
+  const responses = [];
+  sandbox.api.resetStatsCounters(response => responses.push(['first', response]));
+  assert.equal(sandbox.writes.length, 0, 'reset waits for startup recovery');
+  sandbox.api.startupDone();
+  assert.equal(sandbox.writes.length, 1, 'first reset begins after startup recovery');
+  sandbox.api.resetStatsCounters(response => responses.push(['second', response]));
+  assert.equal(sandbox.writes.length, 1, 'second reset waits for the first write');
+  sandbox.api.addActivity();
+
+  sandbox.writes[0].callback();
+  assert.equal(sandbox.writes.length, 2, 'second reset starts after first callback');
+  assert.deepEqual(responses, [], 'waiters are not acknowledged before the last reset commits');
+  sandbox.writes[1].callback();
+  assert.deepEqual(JSON.parse(JSON.stringify(responses)), [['first', { ok: true }], ['second', { ok: true }]]);
+  const state = sandbox.api.state();
+  assert.equal(state.pendingStats.filesProcessed, 1, 'activity after reset request is retained');
+  assert.equal(state.mirrored, 1, 'new activity is mirrored after the reset');
+  assert.equal(state.flushed, 1, 'new activity is flushed after the reset');
 });
 
 test('architecture markers: network redirect is the primary layer, DOM layers defer to it', { skip: !content || !serviceWorker }, () => {
