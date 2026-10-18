@@ -134,7 +134,7 @@ function createServer({ pagesDir }) {
     }
     if (p.endsWith('.pdf')) { res.setHeader('content-type', 'application/pdf'); return res.end('%PDF-1.4\n%%EOF'); }
     if (p.endsWith('.html')) { res.setHeader('content-type', 'text/html'); return res.end('<p>doc</p>'); }
-    if (p.startsWith('/img/') || p.startsWith('/track/')) {
+    if (p.startsWith('/img/')) {
       if (p.includes('originfail')) { res.statusCode = 404; return res.end('nope'); }
       const w = Number(u.searchParams.get('w')) || 40;
       res.setHeader('content-type', 'image/png');

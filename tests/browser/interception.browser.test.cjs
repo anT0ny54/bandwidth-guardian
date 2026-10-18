@@ -136,7 +136,6 @@ test.describe('Bandwidth Guardian in Chrome', { skip: SKIP }, () => {
     assert.deepEqual(red.condition.resourceTypes, ['image']);
     assert.ok(byId.get(20) && byId.get(20).condition.urlFilter === `|http://proxy.test:${PORT}/`, 'proxy allow rule');
     assert.ok(byId.get(21) && byId.get(22), 'skip and conflict exemptions');
-    for (let i = 30; i < 43; i++) assert.ok(byId.get(i), `tracking exemption ${i}`);
     const bad = [];
     for (const r of rules) {
       if (!r.condition.regexFilter) continue;
@@ -340,17 +339,18 @@ test.describe('Bandwidth Guardian in Chrome', { skip: SKIP }, () => {
     await page.close();
   });
 
-  test('exclusions, private-network hosts, favicons, tracking pixels and data: URLs are never proxied', async () => {
+  test('exclusions, private-network hosts, favicons and data: URLs are never proxied', async () => {
     const page = await open('skip.html');
     await page.waitForFunction(() => Array.from(document.images).every(i => i.complete));
     await sleep(200);
     assert.equal(direct('/img/skip/favicon-32.png').length, 1);
-    assert.equal(direct('/track/pixel.gif').length, 1);
+    assert.equal(proxied('/track/pixel.gif').length, 1, 'tracking-pixel-shaped URLs are proxied like any image');
     assert.equal(direct('/img/skip/excluded-host.png').length, 1);
     assert.equal(direct('/img/skip/excluded-sub.png').length, 1);
     assert.equal(proxied('/img/skip/normal.png').length, 1);
     for (const p of ['loopback.png', 'single-label.png', 'mdns.png']) assert.equal(direct('/img/skip/' + p).length, 1, `private host ${p} stays direct`);
-    assert.equal(proxied('/img/skip/').length + proxied('/track/').length, 1);
+    assert.equal(proxied('/img/skip/').length, 1);
+    assert.equal(direct('/track/').length, 0);
     await page.close();
     // A page on an excluded host keeps all its images direct.
     const ex = await ctx.newPage();
