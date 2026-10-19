@@ -304,9 +304,9 @@ test.describe('Bandwidth Guardian in Chrome', { skip: SKIP }, () => {
     const statsBefore = await settledStats();
     const page = await open('fallback.html');
     await page.waitForFunction(() => ['f1', 'f2', 'f3'].every(id => { const i = document.getElementById(id); return i.complete && i.naturalWidth > 0; }), null, { timeout: 8000 });
-    await until(() => ['inline', 'sheet', 'xorigin', 'pseudo', 'poster', 'svg', 'closed'].every(k => direct(`/img/fallback/proxyfail-${k}`).length), 8000);
+    await until(() => ['inline', 'upper', 'sheet', 'xorigin', 'pseudo', 'poster', 'svg', 'closed'].every(k => direct(`/img/fallback/proxyfail-${k}`).length), 8000);
     await sleep(1500); // give any loop a chance to show up
-    const names = ['proxyfail-1.png', 'proxyfail-ss.png', 'proxy403.png', 'proxyfail-originfail.png', 'proxyfail-inline.png', 'proxyfail-sheet.png',
+    const names = ['proxyfail-1.png', 'proxyfail-ss.png', 'proxy403.png', 'proxyfail-originfail.png', 'proxyfail-inline.png', 'proxyfail-upper.png', 'proxyfail-sheet.png',
       'proxyfail-xorigin.png', 'proxyfail-pseudo.png', 'proxyfail-poster.png', 'proxyfail-svg.png', 'proxyfail-closed.png'];
     for (const n of names) {
       assert.equal(proxied('/img/fallback/' + n).length, 1, `${n}: one proxy attempt`);
