@@ -4,6 +4,10 @@
 
 ### Modified (post-release audit, no version bump)
 
+- Fixed: the one-shot fallback retry for inline `style` attributes still used
+  a case-sensitive `url(` pre-check, so uppercase `URL(...)` was selected by
+  the case-insensitive matcher but skipped before restoration. The retry gate
+  is now case-insensitive.
 - Verified end-to-end: no tracking pixels or tracking code exist anywhere in
   the extension; the only outbound traffic is image data to the
   user-configured proxy (and the settings page's manual "Test proxy" fetch).
@@ -16,7 +20,7 @@
   all exercised by live code paths, and all cross-layer KEEP-IN-SYNC
   contracts (defaults, conflict pattern, private-host patterns, srcset
   parser, settings-event name, failure attributes) are consistent. No dead
-  code, conflicts or further bugs found; no other code changed.
+  code or conflicts were found in that audit; no other code was changed.
 
 
 ### Fixed

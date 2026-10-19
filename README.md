@@ -88,7 +88,8 @@ once and before Chrome starts it.
   reported by `webRequest`; the original URL gets an **exact-match per-tab
   session bypass rule** and the page is asked to re-request that one URL
   **directly, once** (`<img>`, `<picture>`, poster, SVG `<image>`,
-  `<object>/<embed>`, inline styles, same-origin CSS rules; cross-origin
+  `<object>/<embed>`, inline styles (`URL(...)` matching is
+  case-insensitive), same-origin CSS rules; cross-origin
   `<link>` sheets are reloaded once when the URL was not found anywhere
   accessible). URLs containing DNR filter metacharacters use an escaped regex
   match rather than a wildcard-prone URL filter, subject to browser rule size

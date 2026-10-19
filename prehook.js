@@ -874,7 +874,7 @@
           }
           // Inline styles (any element, including the ones above).
           const style = el.getAttribute("style");
-          if (style && style.indexOf("url(") >= 0 && !el.hasAttribute(FAILED_ATTR + "-style")) {
+          if (style && /\burl\(/i.test(style) && !el.hasAttribute(FAILED_ATTR + "-style")) {
             let next = style;
             for (const [p, o] of proxyToOriginal) if (next.includes(p)) next = next.split(p).join(o); // DOM-layer rewrite
             if (next !== style || cssUrls(style, el.baseURI).some(has)) {
