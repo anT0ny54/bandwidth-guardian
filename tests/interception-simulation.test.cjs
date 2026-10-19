@@ -612,6 +612,8 @@ test('architecture markers: network redirect is the primary layer, DOM layers de
   assert.match(prehook, /const domHandles = absolute => !redirectLive \|\| CONFLICT_RE\.test\(absolute\)/);
   assert.match(content, /runtime\.redirect !== false && !CONFLICT_RE\.test\(absolute\)/);
   assert.match(prehook, /function retryFailed\(/);
+  assert.ok(prehook.includes('/\\burl\\(/i.test(style)'),
+    'inline-style fallback retry is case-insensitive');
 });
 
 test('prehook excludes domains with the same tokenizer as the other layers (any whitespace, commas, URLs)', () => {
