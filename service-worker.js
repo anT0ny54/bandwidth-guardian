@@ -472,11 +472,14 @@ function handleProxyCompleted(details) {
 }
 
 // Network errors that say nothing about the proxy: the page cancelled the
-// request (navigation, element removed), or another extension/policy blocked it.
+// request (navigation, element removed), another extension/policy blocked it,
+// or the client's own cache/network state tripped. ORB and BLOCKED_BY_RESPONSE
+// are deliberately NOT ignored: when they fire on a PROXY-origin URL they mean
+// the proxy answered with a non-image body (e.g. an HTML error page from a dead
+// or cold public proxy), which is a proxy failure and must trigger the fallback.
 const IGNORED_NET_ERRORS = new Set([
   "net::ERR_ABORTED", "net::ERR_BLOCKED_BY_CLIENT", "net::ERR_BLOCKED_BY_ADMINISTRATOR",
-  "net::ERR_BLOCKED_BY_RESPONSE", "net::ERR_BLOCKED_BY_ORB", "net::ERR_CACHE_MISS",
-  "net::ERR_NETWORK_CHANGED"
+  "net::ERR_CACHE_MISS", "net::ERR_NETWORK_CHANGED"
 ]);
 function onProxyError(details) {
   if (!configuredProxyOrigin) {

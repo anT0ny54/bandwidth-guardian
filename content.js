@@ -116,6 +116,11 @@
   const doneBg = new WeakSet();
   const fallbackHandlers = new WeakSet();
   const fallbackMeta = new WeakMap();
+  // Pending one-shot restores claimed at error time but deliberately deferred
+  // until the service worker confirms the per-tab bypass rule (bh-retry), or
+  // until the safety timeout below fires. Only the world that holds the timer
+  // entry performs the restore, so a cross-world double restore is impossible.
+  const fallbackTimers = new WeakMap(); // el -> timeout id
   // prehook lives in the MAIN world; failed elements are flagged with a DOM
   // attribute both worlds can read. This duck-typed set mirrors WeakSet.
   const FAILED_ATTR = "data-bh-failed";
@@ -305,6 +310,53 @@
     Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, "srcset")?.set;
 
   // Restore the original URL once when the PROXY load fails (B5).
+  const metaMatchesOriginal = (meta, original) => {
+    if (!meta || !original) return false;
+    if (meta.originalSrc) {
+      try { if (stripHash(meta.originalSrc) === original) return true; } catch {}
+    }
+    if (meta.originalSrcset) {
+      for (const cand of parseSrcset(meta.originalSrcset)) {
+        const abs = resolveHttp(cand.url);
+        if (abs && stripHash(abs) === original) return true;
+      }
+    }
+    return false;
+  };
+
+  // Restore the original URL once the per-tab bypass rule is known to exist.
+  // Restoring earlier races the service worker: DNR would re-redirect the
+  // retried original to the proxy, the second failure is deduped by
+  // fallbackSeen in the worker, and the image stays broken forever.
+  // KEEP IN SYNC WITH prehook.js: shared claim marker so exactly one world
+  // claims a given failure; a different value means the page re-armed a new
+  // URL (lazy promotion) and a re-claim is required.
+  const PENDING_ORIGINAL_ATTR = "data-bh-pending-original";
+
+  function restoreOriginal(el, meta) {
+    fallbackMeta.delete(el);
+    const t = fallbackTimers.get(el);
+    if (t !== undefined) { clearTimeout(t); fallbackTimers.delete(el); }
+    // The page may have moved on while the restore was deferred (a lazy loader
+    // promoting data-src after the placeholder errored). Restoring now would
+    // clobber the new URL, so disarm unless the element still shows the exact
+    // proxy URL that failed.
+    let cur = "";
+    try { cur = el.currentSrc || el.src || ""; } catch {}
+    if (!meta.failedProxyUrl || cur !== meta.failedProxyUrl) {
+      try { el.setAttribute(RESTORED_ATTR, ""); } catch {}
+      return;
+    }
+    try { el.setAttribute(RESTORED_ATTR, ""); } catch {}
+    failedEls.add(el);
+    try {
+      if (meta.originalSrcset && proxyHost && (el.getAttribute("srcset") || "").includes(proxyHost)) {
+        nativeImgSrcsetSetter?.call(el, meta.originalSrcset);
+      }
+    } catch {}
+    try { if (meta.originalSrc) nativeImgSrcSetter?.call(el, meta.originalSrc); } catch {}
+  }
+
   function armProxyFallback(el, originalSrc, originalSrcset) {
     if (!el || el.tagName !== "IMG" || failedEls.has(el)) return;
     const prev = fallbackMeta.get(el) || {};
@@ -319,20 +371,42 @@
       let curURL = null;
       try { curURL = new URL(cur); } catch { return; }
       if (!proxyOrigin || curURL.origin !== proxyOrigin) return; // B5
-      if (el.hasAttribute(RESTORED_ATTR)) return; // prehook already restored
       const meta = fallbackMeta.get(el);
-      if (!meta) return;
-      fallbackMeta.delete(el);
+      if (!meta) return; // this world never armed the element
+      // Claim token: the original this world's meta currently represents.
+      // A lazy loader may promote a new URL after the first failure; the
+      // setter patches then re-arm meta, and the token mismatch lets the new
+      // failure be claimed. Both worlds must agree, so token = absolute src.
+      const token = meta.originalSrc ? resolveHttp(meta.originalSrc) : meta.originalSrcset;
+      if (el.hasAttribute(RESTORED_ATTR) && meta.failedProxyUrl &&
+          el.getAttribute(PENDING_ORIGINAL_ATTR) !== token) {
+        // This failure belongs to a URL my meta doesn't own: the setter
+        // patches re-armed the other world. Disarm my stale state.
+        fallbackMeta.delete(el);
+        const staleT = fallbackTimers.get(el);
+        if (staleT !== undefined) { clearTimeout(staleT); fallbackTimers.delete(el); }
+        return;
+      }
+      if (el.hasAttribute(RESTORED_ATTR) && el.getAttribute(PENDING_ORIGINAL_ATTR) === token) return;
+      // Claim synchronously (RESTORED_ATTR is shared across worlds) but defer
+      // the restore itself until the bypass rule exists: the worker's bh-retry
+      // message normally triggers it; the timeout covers a lost message.
       try { el.setAttribute(RESTORED_ATTR, ""); } catch {}
-      failedEls.add(el);
-      try {
-        if (meta.originalSrcset && proxyHost && (el.getAttribute("srcset") || "").includes(proxyHost)) {
-          nativeImgSrcsetSetter?.call(el, meta.originalSrcset);
-        }
-      } catch {}
-      try { if (meta.originalSrc) nativeImgSrcSetter?.call(el, meta.originalSrc); } catch {}
+      try { el.setAttribute(PENDING_ORIGINAL_ATTR, token); } catch {}
+      meta.failedProxyUrl = cur;
+      const oldT = fallbackTimers.get(el);
+      if (oldT !== undefined) clearTimeout(oldT);
+      fallbackTimers.set(el, setTimeout(() => {
+        if (destroyed) return;
+        const m = fallbackMeta.get(el);
+        if (m) restoreOriginal(el, m);
+      }, 1500)); // > the worker's 250 ms fallback flush + slow DNR commits
     }, true);
-    el.addEventListener("load", () => fallbackMeta.delete(el), { capture: true, once: true });
+    el.addEventListener("load", () => {
+      fallbackMeta.delete(el);
+      const t = fallbackTimers.get(el);
+      if (t !== undefined) { clearTimeout(t); fallbackTimers.delete(el); }
+    }, { capture: true, once: true });
   }
 
   // ── A) Parser-created <img src> / <source srcset> ──────────────────────────
@@ -588,7 +662,23 @@
       .filter(it => it && typeof it.original === "string")
       .map(it => ({ original: it.original, proxyUrl: typeof it.proxyUrl === "string" ? it.proxyUrl : "" }));
     for (const it of items) failedUrls.add(stripHash(it.original));
-    if (items.length) sendToPrehook({ kind: "retry", items });
+    if (items.length) {
+      // The bypass rules are confirmed at this point: restore pending elements
+      // now instead of waiting for the safety timeout. Only this world's own
+      // claims (pending timers) are restored — never the other world's.
+      const originals = new Set(items.map(it => stripHash(it.original)));
+      try {
+        document.querySelectorAll("img").forEach(el => {
+          if (!fallbackTimers.has(el)) return; // not claimed by this world
+          const meta = fallbackMeta.get(el);
+          if (!meta) return;
+          for (const o of originals) {
+            if (metaMatchesOriginal(meta, o)) { restoreOriginal(el, meta); break; }
+          }
+        });
+      } catch {}
+      sendToPrehook({ kind: "retry", items });
+    }
   }
   try { chrome.runtime.onMessage.addListener(onRuntimeMessage); } catch {}
 

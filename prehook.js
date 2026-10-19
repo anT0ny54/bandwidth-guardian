@@ -40,6 +40,42 @@
 
   const fallbackHandlers = new WeakSet();
   const fallbackMeta = new WeakMap();
+  // Pending one-shot restores claimed at error time but deliberately deferred
+  // until the service worker confirms the per-tab bypass rule (kind:"retry"),
+  // or until the safety timeout fires. Only the world holding the timer entry
+  // performs the restore, so a cross-world double restore is impossible.
+  const fallbackTimers = new WeakMap(); // el -> timeout id
+
+  // Restore the original URL once the per-tab bypass rule is known to exist.
+  // Restoring at error time races the service worker: DNR would re-redirect
+  // the retried original to the proxy, the second failure is deduped by
+  // fallbackSeen, and the image stays broken forever.
+  // KEEP IN SYNC WITH content.js: shared claim marker so exactly one world
+  // claims a given failure; a different value means the page re-armed a new
+  // URL (lazy promotion) and a re-claim is required.
+  const PENDING_ORIGINAL_ATTR = "data-bh-pending-original";
+
+  function restoreOriginal(el, meta) {
+    fallbackMeta.delete(el);
+    const t = fallbackTimers.get(el);
+    if (t !== undefined) { clearTimeout(t); fallbackTimers.delete(el); }
+    // The page may have moved on while the restore was deferred (a lazy loader
+    // promoting data-src after the placeholder errored). Restoring now would
+    // clobber the new URL, so disarm unless the element still shows the exact
+    // proxy URL that failed.
+    let cur = "";
+    try { cur = el.currentSrc || el.src || ""; } catch {}
+    if (!meta.failedProxyUrl || cur !== meta.failedProxyUrl) {
+      try { el.setAttribute(RESTORED_ATTR, ""); } catch {}
+      return;
+    }
+    try { el.setAttribute(RESTORED_ATTR, ""); } catch {}
+    // Never proxy this element again, otherwise the restored original is
+    // re-proxied and a failing proxy is hit in an endless loop.
+    markFailed(el);
+    try { if (meta.originalSrcset) nativeSetSrcset(el, meta.originalSrcset); } catch {}
+    try { if (meta.originalSrc) nativeSetSrc(el, meta.originalSrc); } catch {}
+  }
 
   const FAILED_ATTR = "data-bh-failed";
   const RESTORED_ATTR = "data-bh-restored"; // cross-world one-shot restore dedupe (B5)
@@ -105,20 +141,46 @@
       // B5: restore ONLY when the URL that failed is actually a proxy URL.
       const cur = el.currentSrc || el.src || "";
       if (!isConfiguredProxyUrl(cur)) return;
-      if (el.hasAttribute(RESTORED_ATTR)) return; // the other world already restored
       const meta = fallbackMeta.get(el);
-      if (!meta) return;
-      fallbackMeta.delete(el);
+      if (!meta) return; // this world never armed the element
+      // Claim token: the original this world's meta currently represents.
+      // A lazy loader may promote a new URL after the first failure; the
+      // setter patches then re-arm meta, and the token mismatch lets the new
+      // failure be claimed. Both worlds must agree, so token = absolute src.
+      const token = meta.originalSrc ? resolveHttp(meta.originalSrc) : meta.originalSrcset;
+      if (el.hasAttribute(RESTORED_ATTR) && meta.failedProxyUrl &&
+          el.getAttribute(PENDING_ORIGINAL_ATTR) !== token) {
+        // This failure belongs to a URL my meta doesn't own: the setter
+        // patches re-armed the other world. Disarm my stale state.
+        fallbackMeta.delete(el);
+        const staleT = fallbackTimers.get(el);
+        if (staleT !== undefined) { clearTimeout(staleT); fallbackTimers.delete(el); }
+        return;
+      }
+      if (el.hasAttribute(RESTORED_ATTR) && el.getAttribute(PENDING_ORIGINAL_ATTR) === token) return;
+      // Claim synchronously (RESTORED_ATTR is shared across worlds) but defer
+      // the restore itself until the bypass rule exists: the kind:"retry"
+      // message normally triggers it; the timeout covers a lost message.
+      // NOTE: no markFailed here — the element may legitimately be re-armed
+      // with a new URL by a lazy loader before the restore runs.
       try { el.setAttribute(RESTORED_ATTR, ""); } catch {}
-      // Never proxy this element again, otherwise the restored original is
-      // re-proxied and a failing proxy is hit in an endless loop.
-      markFailed(el);
-      try { if (meta.originalSrcset) nativeSetSrcset(el, meta.originalSrcset); } catch {}
-      try { if (meta.originalSrc) nativeSetSrc(el, meta.originalSrc); } catch {}
+      try { el.setAttribute(PENDING_ORIGINAL_ATTR, token); } catch {}
+      meta.failedProxyUrl = cur;
+      const oldT = fallbackTimers.get(el);
+      if (oldT !== undefined) clearTimeout(oldT);
+      fallbackTimers.set(el, setTimeout(() => {
+        if (destroyed) return;
+        const m = fallbackMeta.get(el);
+        if (m) restoreOriginal(el, m);
+      }, 1500)); // > the worker's 250 ms fallback flush + slow DNR commits
     }, true);
     // B5: a successful load disarms the fallback (a later, unrelated failing
     // src must not trigger a restore).
-    el.addEventListener("load", () => fallbackMeta.delete(el), { capture: true, once: true });
+    el.addEventListener("load", () => {
+      fallbackMeta.delete(el);
+      const t = fallbackTimers.get(el);
+      if (t !== undefined) { clearTimeout(t); fallbackTimers.delete(el); }
+    }, { capture: true, once: true });
   }
 
   function updateProxyConfig(next) {
@@ -844,6 +906,22 @@
         try {
           const tag = el.localName;
           if (tag === "img") {
+            // Finish a restore this world claimed at error time but deferred
+            // until the bypass confirmation; kind:"retry" IS that confirmation.
+            if (fallbackTimers.has(el)) {
+              const pend = fallbackMeta.get(el);
+              const hitPending = pend && Array.from(originals).some(o => {
+                if (pend.originalSrc && stripHash(pend.originalSrc) === o) return true;
+                if (pend.originalSrcset) {
+                  for (const cand of parseSrcset(pend.originalSrcset)) {
+                    const r = safeURL(cand.url, el.baseURI);
+                    if (r) { r.hash = ""; if (r.href === o) return true; }
+                  }
+                }
+                return false;
+              });
+              if (hitPending) { restoreOriginal(el, pend); continue; }
+            }
             // An element already restored by its own DOM-layer fallback is done.
             if (el.hasAttribute(RESTORED_ATTR) || el.hasAttribute(FAILED_ATTR)) continue;
             const src = el.getAttribute("src");
