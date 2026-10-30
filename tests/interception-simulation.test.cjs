@@ -519,7 +519,7 @@ test('service worker builds exact bypass matches for URLs containing DNR filter 
   assert.equal(new RegExp(condition.regexFilter).test('https://cdn.example/anything.png?x=1^2&next=|ok'), false,
     'wildcards in a failed URL must not widen the bypass');
   assert.deepEqual(JSON.parse(JSON.stringify(sandbox.makeCondition('https://cdn.example/a.png?x=1'))),
-    { urlFilter: '|https://cdn.example/a.png?x=1|' });
+    { urlFilter: '|https://cdn.example/a.png?x=1|', isUrlFilterCaseSensitive: true });
 });
 
 test('service worker waits for startup recovery, serializes concurrent stats resets, and preserves later activity', () => {
@@ -654,4 +654,30 @@ test('service worker reads proxy stats headers case-insensitively from one pass'
   assert.deepEqual(run([{ name: 'Content-Length', value: '42' }]), { received: 42, saved: 0 });
   assert.deepEqual(run([{ name: 'x-bh-compressed-size', value: 'junk' }, { name: 'content-length', value: '7' }]), { received: 7, saved: 0 });
   assert.deepEqual(run(undefined), { received: 0, saved: 0 });
+});
+
+test('eleventh review: conflict detection matches DNR casing and srcset restore normalizes proxy host', () => {
+  const grabConflict = source => {
+    const m = /const CONFLICT_RE = \/([^/]+)\/([a-z]*);/.exec(source);
+    assert.ok(m, 'CONFLICT_RE declaration present');
+    return { source: m[1], flags: m[2], re: new RegExp(m[1], m[2]) };
+  };
+  for (const source of [prehook, content]) {
+    const conflict = grabConflict(source);
+    assert.ok(conflict.flags.includes('i'), 'DOM conflict regex is case-insensitive like DNR regexFilter');
+    for (const parameter of ['quality', 'l', 'bw', 'jpeg', 'max_width']) {
+      assert.ok(
+        conflict.re.test(`https://cdn.example/image.jpg?x=1&${parameter.toUpperCase()}=50`),
+        `${parameter} conflict is detected case-insensitively`
+      );
+    }
+  }
+
+  const uppercaseProxy = new URL('https://PROXY.example:8443/convert');
+  assert.equal(uppercaseProxy.host.toLowerCase(), 'proxy.example:8443');
+  assert.match(
+    content,
+    /proxyHost = parsed \? parsed\.host\.toLowerCase\(\) : "";\n/,
+    'content.js normalizes proxy host casing before srcset restore matching'
+  );
 });
