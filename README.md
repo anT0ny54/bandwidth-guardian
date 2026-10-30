@@ -65,8 +65,9 @@ once and before Chrome starts it.
      literals (a public proxy cannot reach them; bandwidth-hero-proxy2 answers
      403 for them).
    - **Conflict URLs:** URLs containing `&quality=`, `&l=`, `&bw=`, `&jpeg=` or
-     `&max_width=` would be truncated by the raw contract, so the network rule
-     skips them and the DOM layer proxies them URL-encoded instead.
+     `&max_width=` (matched case-insensitively, like DNR regex filters) would
+     be truncated by the raw contract, so the network rule skips them and the
+     DOM layer proxies them URL-encoded instead.
 2. **DOM layer, `prehook.js` (MAIN world, `document_start`) and `content.js`.**
    Intercepts supported image `src`/`srcset` setters, preload-link `href`/`imagesrcset`
    attributes, and inline background styles. The network layer, not these hooks, covers
@@ -94,7 +95,9 @@ once and before Chrome starts it.
   accessible). URLs containing DNR filter metacharacters use an escaped regex
   match rather than a wildcard-prone URL filter, subject to browser rule size
   and quota limits. The bypass list is also given to new documents in that tab,
-  so a reload does not try the proxy again.
+  so a reload does not try the proxy again. Bypass matching is case-sensitive,
+  so a bypass for one URL can never match a different-cased path of the same
+  host.
   Bypass rules are removed when the tab closes.
 - If the proxy itself is unreachable (6 connection-level failures within 30 s),
   the redirect is suspended for 2 minutes and pages load images directly; it
@@ -220,6 +223,19 @@ builds the extension. If a release for the manifest version does not exist, the
 workflow creates it; if that release already exists, it replaces the release
 asset. Bump `manifest.json`'s version when publishing a distinct release.
 
+The shipped code is periodically re-audited for dead/redundant code,
+cross-layer conflicts, bugs and optimization opportunities (details in
+`CHANGELOG.md`). A thirteenth pass re-read every shipped file end to end and
+fixed a settings-sync regression (the `sameOpts` helper was deleted while its
+call sites remained in `content.js`, so the first storage change in a tab threw
+a ReferenceError) and a stats-merging hazard in `service-worker.js` (deltas
+could be merged into the shared zero-stats default object; stats are now
+cloned before merging). A fourteenth pass corrected the build preflight
+(classic scripts are now syntax-checked as classic scripts, not as ES
+modules) and fixed a stale-queue edge case in the service worker (early
+webRequest events queued before the proxy origin was known are now dropped
+when no proxy is configured). No version bump.
+
 ## 🔗 Related projects (not part of this repository)
 
 The services below are maintained separately and are **not** part of this
@@ -259,3 +275,7 @@ If you find this project useful, donations are appreciated:
 ## License
 
 See [`LICENSE`](LICENSE).
+
+## Changelog
+
+See [`CHANGELOG.md`](CHANGELOG.md).

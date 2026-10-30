@@ -40,17 +40,19 @@ function removeDomainToken(text, excludedDomain) {
 
 // B16: exact-match highlighting. "Nearest" matching lied about custom values
 // (quality 55 highlighted "60"); when nothing matches we show a "Custom" badge.
-let customBadgeEl = null;
+const customBadges = new WeakMap();
 function setCustomBadge(container, show) {
   if (!container) return;
-  if (show && !customBadgeEl) {
-    customBadgeEl = document.createElement("span");
-    customBadgeEl.textContent = "Custom";
-    customBadgeEl.style.cssText = "font-size:11px;opacity:.65;margin-left:8px;vertical-align:middle;";
-    container.appendChild(customBadgeEl);
-  } else if (!show && customBadgeEl) {
-    customBadgeEl.remove();
-    customBadgeEl = null;
+  let badge = customBadges.get(container);
+  if (show && !badge) {
+    badge = document.createElement("span");
+    badge.textContent = "Custom";
+    badge.style.cssText = "font-size:11px;opacity:.65;margin-left:8px;vertical-align:middle;";
+    container.appendChild(badge);
+    customBadges.set(container, badge);
+  } else if (!show && badge) {
+    badge.remove();
+    customBadges.delete(container);
   }
 }
 
@@ -210,7 +212,7 @@ excludeBtn.addEventListener("click", async () => {
 
 settingsBtn.addEventListener("click", () => {
   let url = chrome.runtime.getURL("options.html");
-  if (currentTabId != null) url += "?tab=" + currentTabId;
+  if (currentTabId != null && currentIsWeb) url += "?tab=" + currentTabId;
   // B20: some Chromium builds return undefined instead of a promise here.
   const maybePromise = chrome.tabs.create({ url });
   if (maybePromise && typeof maybePromise.catch === "function") {

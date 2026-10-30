@@ -88,7 +88,7 @@
   const isPrivateHttpUrl = absolute => PRIVATE_HOST_RE.some(pattern => pattern.test(absolute));
   // URLs the raw-URL network redirect cannot carry. KEEP IN SYNC with prehook.js
   // and CONFLICT_PATTERN in service-worker.js.
-  const CONFLICT_RE = /&(?:quality|l|bw|jpeg|max_width)=/;
+  const CONFLICT_RE = /&(?:quality|l|bw|jpeg|max_width)=/i;
 
   // Known lazy-loader attributes. These are signals only: their values are
   // never changed or proxied directly. The loader's eventual src/srcset write
@@ -161,6 +161,12 @@
     return false;
   }
 
+  // KEEP IN SYNC with the service worker's sameOpts(): settings equality is
+  // decided on exactly the DEFAULTS keys. NOTE: 0.2.3 deleted this helper as
+  // "unused" while its three onStorageChanged call sites remained — a
+  // ReferenceError on the first storage change killed live settings sync.
+  const sameOpts = (a, b) => !!a && !!b && Object.keys(DEFAULTS).every(k => a[k] === b[k]);
+
   // Skip decision for a RESOLVED absolute http(s) URL (O4: parsed once here).
   function shouldSkip(absolute) {
     if (!active) return true;
@@ -179,18 +185,21 @@
   function updateProxyConfig(next) {
     opts = next;
     let base = String(opts.proxyBase || "").trim();
+    let parsed = null;
     try {
-      const parsed = new URL(base);
-      if (!/^https?:$/.test(parsed.protocol)) base = "";
-      else { parsed.hash = ""; base = parsed.href; }
-    } catch { base = ""; }
+      parsed = new URL(base);
+      // KEEP IN SYNC with usableProxyBase() in service-worker.js: a trailing
+      // empty "?" survives in href and would make the separator emit "?&…".
+      if (!/^https?:$/.test(parsed.protocol)) { base = ""; parsed = null; }
+      else { parsed.hash = ""; base = parsed.href.endsWith("?") ? parsed.href.slice(0, -1) : parsed.href; }
+    } catch { base = ""; parsed = null; }
     const quality = Math.max(1, Math.min(100, Number(opts.quality ?? 60) || 60));
     const maxWidth = Number(opts.maxWidth) || 0;
     proxyConfig = { base, sep: base.includes("?") ? "&" : "?", quality,
       maxWidth: maxWidth > 0 ? maxWidth : 0, grayscale: !!opts.grayscale };
-    const parsed = safeURL(base);
+    // The validated URL above already yields origin/host — no second parse.
     proxyOrigin = parsed ? parsed.origin : "";
-    proxyHost = parsed ? parsed.hostname.toLowerCase() : "";
+    proxyHost = parsed ? parsed.host.toLowerCase() : "";
   }
 
   function applyOpts(next) {
@@ -210,7 +219,6 @@
     }
   }
 
-  const sameOpts = (a, b) => !!a && !!b && Object.keys(DEFAULTS).every(k => a[k] === b[k]);
 
   // Callers pass resolveHttp() output, so no re-validation is needed (R7).
   function buildProxyUrl(orig) {

@@ -34,8 +34,9 @@ const dirty = { proxyBase: false, excludeDomains: false, quality: false, width: 
 
 // B14: Settings remembers the tab that opened it (?tab=<id> from the popup).
 const openerTabId = (() => {
-  const v = Number(new URLSearchParams(location.search).get("tab"));
-  return Number.isFinite(v) && v > 0 ? v : null;
+  const raw = new URLSearchParams(location.search).get("tab");
+  const v = Number(raw);
+  return raw !== null && raw !== "" && Number.isInteger(v) && v >= 0 ? v : null;
 })();
 
 if (versionEl) {
@@ -67,11 +68,17 @@ async function reloadCurrentPage() {
   // B14: prefer the tab that opened Settings. Only http(s) tabs qualify below,
   // so this page itself (chrome-extension://) can never be reloaded by mistake.
   if (openerTabId != null) {
-    try { await chrome.tabs.reload(openerTabId); return; } catch {}
+    try {
+      const opener = await chrome.tabs.get(openerTabId);
+      if (isHttpUrl(opener.url)) {
+        await chrome.tabs.reload(openerTabId);
+        return;
+      }
+    } catch {}
   }
   try {
     const [active] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (active?.id && isHttpUrl(active.url)) {
+    if (active?.id != null && isHttpUrl(active.url)) {
       await chrome.tabs.reload(active.id);
       return;
     }
@@ -79,7 +86,7 @@ async function reloadCurrentPage() {
     const page = tabs
       .filter(tab => tab.id != null && isHttpUrl(tab.url))
       .sort((a, b) => Number(b.lastAccessed || 0) - Number(a.lastAccessed || 0))[0];
-    if (page?.id) await chrome.tabs.reload(page.id);
+    if (page?.id != null) await chrome.tabs.reload(page.id);
   } catch {}
 }
 

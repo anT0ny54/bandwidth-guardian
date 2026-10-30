@@ -109,7 +109,7 @@
   const isPrivateHttpUrl = absolute => PRIVATE_HOST_RE.some(pattern => pattern.test(absolute));
   // URLs the raw-URL redirect cannot carry (KEEP IN SYNC with CONFLICT_PATTERN
   // in service-worker.js and PROXY_PARAMETER in bandwidth-hero-proxy2).
-  const CONFLICT_RE = /&(?:quality|l|bw|jpeg|max_width)=/;
+  const CONFLICT_RE = /&(?:quality|l|bw|jpeg|max_width)=/i;
   // true when THIS layer (not the network redirect) must proxy the URL.
   const domHandles = absolute => !redirectLive || CONFLICT_RE.test(absolute);
   // Before settings arrive, only URLs that the DOM layer would have to proxy
@@ -188,8 +188,10 @@
     let base = String(opts.proxyBase || "").trim();
     try {
       const parsed = new URL(base);
+      // KEEP IN SYNC with usableProxyBase() in service-worker.js: a trailing
+      // empty "?" survives in href and would make the separator emit "?&…".
       if (!/^https?:$/.test(parsed.protocol)) base = "";
-      else { parsed.hash = ""; base = parsed.href; }
+      else { parsed.hash = ""; base = parsed.href.endsWith("?") ? parsed.href.slice(0, -1) : parsed.href; }
     } catch { base = ""; }
     const quality = Math.max(1, Math.min(100, Number(opts.quality ?? 60) || 60));
     const maxWidth = Number(opts.maxWidth) || 0;
@@ -420,7 +422,6 @@
 
   function rewriteSrcset(ss, el) {
     if (!ss) return ss;
-    if (pageExcluded) return ss;
     if (el) {
       const cached = srcsetCache.get(el);
       if (cached && (cached.input === ss || cached.output === ss)) return cached.output;
@@ -561,9 +562,12 @@
       if (srcset && el.dataset.bhPendingSrcset === undefined) {
         const rewritten = rewriteSrcset(srcset, el);
         if (rewritten !== srcset) {
-          if (isImg) armProxyFallback(el, "", srcset);
-          if (isImg) nativeSetSrcset(el, rewritten);
-          else nativeSourceSetSrcset(el, rewritten);
+          if (isImg) {
+            armProxyFallback(el, "", srcset);
+            nativeSetSrcset(el, rewritten);
+          } else {
+            nativeSourceSetSrcset(el, rewritten);
+          }
         }
       }
     } catch {}

@@ -7,8 +7,8 @@ export const DEFAULTS = {
   enabled:        true,
   saveData:       true,
   proxyBase:      "",
-  quality:        60,    // matches original compressionLevel default
-  grayscale:      true,  // matches original convertBw: true — grayscale ON by default
+  quality:        60,    // default compression quality (1–100)
+  grayscale:      true,  // grayscale ON by default (bw=1)
   maxWidth:       768,   // 0 = no limit; MV3-specific addition
   excludeDomains: "",
 };

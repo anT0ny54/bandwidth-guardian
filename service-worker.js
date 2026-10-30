@@ -117,7 +117,12 @@ function refreshRules() {
 // write/event storms and could clobber the mirror with stale partial state.
 function mirrorToLocal() {
   chrome.storage.sync.get(DEFAULTS, opts => {
+    if (!opts) opts = { ...DEFAULTS };
     setProxyOrigin(opts.proxyBase);
+    // Without an origin the queued early events can never match (they are only
+    // replayed once an origin exists); drop them so the queue cannot hold
+    // stale entries for the worker's whole lifetime on a proxy-less install.
+    if (!configuredProxyOrigin && earlyStatsEvents.length) earlyStatsEvents.length = 0;
     // B9: stats events that arrived before the origin was known are queued.
     if (configuredProxyOrigin && earlyStatsEvents.length) {
       const queued = earlyStatsEvents.splice(0);
@@ -156,10 +161,6 @@ chrome.storage.onChanged.addListener((changes, area) => {
   refreshRules();
   if ("enabled" in changes) updateIcon();
 });
-
-mirrorToLocal();
-refreshRules();
-updateIcon();
 
 // ── Extension icon ────────────────────────────────────────────────────────────
 const ICONS_ON  = { 16: "icons/icon-16.png", 32: "icons/icon-32.png", 48: "icons/icon-48.png", 128: "icons/icon-128.png" };
@@ -299,7 +300,10 @@ function flushStats() {
       finishStatsResetIfReady();
       return;
     }
-    const s = d.stats || { ...ZERO_STATS };
+    // Clone before merging: when `stats` is missing, Chromium can hand back
+    // the very ZERO_STATS object passed as the default — mutating it would
+    // poison every later spread/reset built from it.
+    const s = { ...(d.stats || ZERO_STATS) };
     s.filesProcessed += delta.filesProcessed;
     s.bytesProcessed += delta.bytesProcessed;
     s.bytesSaved     += delta.bytesSaved;
@@ -387,7 +391,9 @@ chrome.storage.local.get({ stats: ZERO_STATS, statsPending: null }, d => {
     }
     return;
   }
-  const s = d.stats || { ...ZERO_STATS };
+  // Clone for the same reason as flushStats: the default object can be the
+  // shared ZERO_STATS instance; never merge into it in place.
+  const s = { ...(d.stats || ZERO_STATS) };
   s.filesProcessed += files;
   s.bytesProcessed += bytes;
   s.bytesSaved     += saved;
@@ -407,6 +413,19 @@ let webRequestOrigin = null; // origin the current registration targets
 const PROXY_REQUEST_TYPES = ["image", "object"];
 function updateWebRequestListener(origin) {
   if (!chrome.webRequest || typeof chrome.webRequest.onCompleted !== "object") return;
+  // No proxy origin (or the proxy was cleared): drop any previous listener
+  // instead of keeping a never-matching dummy registration alive.
+  if (!origin) {
+    if (webRequestRegistered) {
+      try {
+        chrome.webRequest.onCompleted.removeListener(onProxyCompleted);
+        chrome.webRequest.onErrorOccurred?.removeListener(onProxyError);
+      } catch {}
+      webRequestRegistered = false;
+      webRequestOrigin = null;
+    }
+    return;
+  }
   // Every settings change (quality, grayscale, …) calls this through
   // mirrorToLocal(); re-registering is only needed when the origin changed.
   if (webRequestRegistered && origin === webRequestOrigin) return;
@@ -416,7 +435,7 @@ function updateWebRequestListener(origin) {
       chrome.webRequest.onErrorOccurred?.removeListener(onProxyError);
     }
   } catch {}
-  const urls = origin ? [origin + "/*"] : ["https://bandwidth-guardian.invalid/*"]; // never matches
+  const urls = [origin + "/*"];
   try {
     chrome.webRequest.onCompleted.addListener(
       onProxyCompleted,
@@ -426,10 +445,8 @@ function updateWebRequestListener(origin) {
     chrome.webRequest.onErrorOccurred?.addListener(onProxyError, { urls: urls, types: PROXY_REQUEST_TYPES });
     webRequestRegistered = true;
     webRequestOrigin = origin;
-  } catch { webRequestRegistered = false; }
+  } catch { webRequestRegistered = false; webRequestOrigin = null; }
 }
-updateWebRequestListener("");
-
 // B9: events can wake the worker before the async origin lookup finishes.
 const earlyStatsEvents = [];
 function onProxyCompleted(details) {
@@ -562,7 +579,7 @@ function bypassReady() {
 const BYPASSABLE_URL_RE = /^https?:\/\/[\x21-\x7e]+$/;
 const MAX_BYPASS_REGEX_LENGTH = 1900;
 function bypassCondition(url) {
-  if (!/[|*^]/.test(url)) return { urlFilter: "|" + url + "|" };
+  if (!/[|*^]/.test(url)) return { urlFilter: "|" + url + "|", isUrlFilterCaseSensitive: true };
   const regexFilter = "^" + url.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "$";
   if (regexFilter.length > MAX_BYPASS_REGEX_LENGTH) return null;
   return { regexFilter, isUrlFilterCaseSensitive: true };
@@ -588,43 +605,55 @@ function bypassUrlFromRule(rule) {
 function addBypass(tabId, urls) {
   const tab = Number.isInteger(tabId) && tabId >= 0 ? tabId : -1;
   const operation = bypassReady().then(async () => {
-    const addRules = [];
-    const addedKeys = new Map();
+    const candidates = [];
+    const candidateKeys = new Set();
     const alreadyPresent = new Set();
-    let regexesToAdd = 0;
     for (const url of urls) {
       if (!BYPASSABLE_URL_RE.test(url)) continue;
       const key = tab + " " + url;
       if (bypassRules.has(key)) { alreadyPresent.add(url); continue; }
-      if (addedKeys.has(key) || addRules.length >= BYPASS_LIMIT) continue;
+      if (candidateKeys.has(key)) continue;
       const baseCondition = bypassCondition(url);
       if (!baseCondition) continue;
-      if (baseCondition.regexFilter && bypassRegexRules.size + regexesToAdd >= BYPASS_REGEX_LIMIT) continue;
-      const id = bypassNextId++;
-      const condition = { ...baseCondition, resourceTypes: PROXY_REQUEST_TYPES };
-      if (tab >= 0) condition.tabIds = [tab];
-      addRules.push({ id, priority: PRIORITY_BYPASS, action: { type: "allow" }, condition });
-      addedKeys.set(key, { id, url, isRegex: !!baseCondition.regexFilter });
-      if (baseCondition.regexFilter) regexesToAdd++;
+      candidateKeys.add(key);
+      candidates.push({ key, url, baseCondition });
+      if (candidates.length >= BYPASS_LIMIT) break;
     }
-    if (!addRules.length) return Array.from(alreadyPresent);
 
-    // Compute evictions without mutating the live map. Commit the map only after
-    // Chrome confirms the rule update, and never evict a newly added rule here.
+    // Build evictions WITHOUT mutating the live map, and only evict when a
+    // validated candidate actually needs the slot. Otherwise a burst of
+    // too-long / regex-quota-exceeded candidates could discard useful older
+    // bypasses and still install nothing.
     const removeRuleIds = [];
     const nextRules = new Map(bypassRules);
     const nextRegexRules = new Set(bypassRegexRules);
-    const existingToKeep = Math.max(0, BYPASS_LIMIT - addRules.length);
-    while (nextRules.size > existingToKeep) {
-      const [oldKey, oldId] = nextRules.entries().next().value;
-      nextRules.delete(oldKey);
-      nextRegexRules.delete(oldKey);
-      removeRuleIds.push(oldId);
+    const addRules = [];
+    const addedKeys = new Map();
+    for (const c of candidates) {
+      let needsSlot = addRules.length >= BYPASS_LIMIT - nextRules.size;
+      if (needsSlot) {
+        const oldestKey = nextRules.keys().next().value;
+        // Evicting a non-regex oldest rule cannot make room under the regex
+        // quota, so skip a quota-blocked regex candidate instead of discarding
+        // a useful rule for nothing. An oldest regex rule does free one slot.
+        if (c.baseCondition.regexFilter && nextRegexRules.size >= BYPASS_REGEX_LIMIT &&
+            !nextRegexRules.has(oldestKey)) continue;
+        const oldest = nextRules.entries().next().value;
+        nextRules.delete(oldest[0]);
+        nextRegexRules.delete(oldest[0]);
+        removeRuleIds.push(oldest[1]);
+        needsSlot = false;
+      }
+      if (c.baseCondition.regexFilter && nextRegexRules.size >= BYPASS_REGEX_LIMIT) continue;
+      const id = bypassNextId++;
+      const condition = { ...c.baseCondition, resourceTypes: PROXY_REQUEST_TYPES };
+      if (tab >= 0) condition.tabIds = [tab];
+      addRules.push({ id, priority: PRIORITY_BYPASS, action: { type: "allow" }, condition });
+      addedKeys.set(c.key, { id, url: c.url, isRegex: !!c.baseCondition.regexFilter });
+      nextRules.set(c.key, id);
+      if (c.baseCondition.regexFilter) nextRegexRules.add(c.key);
     }
-    for (const [key, { id, isRegex }] of addedKeys) {
-      nextRules.set(key, id);
-      if (isRegex) nextRegexRules.add(key);
-    }
+    if (!addRules.length) return Array.from(alreadyPresent);
 
     try {
       await chrome.declarativeNetRequest.updateSessionRules({ removeRuleIds, addRules });
@@ -651,6 +680,12 @@ function addBypass(tabId, urls) {
 
 // Drop a closed tab's bypass rules (they can never match again).
 chrome.tabs?.onRemoved?.addListener(tabId => {
+  // Same per-tab cleanup for the retry-dedupe set: entries for a closed tab
+  // can never match again, so they should not have to drain through the
+  // 20,000-entry FIFO cap.
+  for (const key of fallbackSeen) {
+    if (key.startsWith(tabId + " ")) fallbackSeen.delete(key);
+  }
   bypassChain = bypassReady().then(async () => {
     const keys = [];
     const removeRuleIds = [];
@@ -783,7 +818,10 @@ function usableProxyBase(proxyBase) {
     const u = new URL(String(proxyBase || "").trim());
     if (!/^https?:$/.test(u.protocol)) return "";
     u.hash = "";
-    return u.href;
+    // A trailing empty "?" survives in href and would make the separator
+    // logic emit "?&jpeg=0…" — normalize it away.
+    const href = u.href;
+    return href.endsWith("?") ? href.slice(0, -1) : href;
   } catch { return ""; }
 }
 
@@ -846,25 +884,29 @@ function buildRules(opts, noHeaderMatch, suspended) {
     addRules.push({
       id: RULE_ID_REDIRECT_OBJECT, priority: PRIORITY_REDIRECT,
       action: { type: "redirect", redirect: { regexSubstitution: substitution } },
-      condition: Object.assign(redirectCondition(OBJECT_IMAGE_PATTERN, ["object"]), { isUrlFilterCaseSensitive: false })
+      condition: redirectCondition(OBJECT_IMAGE_PATTERN, ["object"])
     });
     // Loop guard: anything already addressed to the proxy is left alone.
     addRules.push({
       id: RULE_ID_ALLOW_PROXY, priority: PRIORITY_PROXY, action: { type: "allow" },
       condition: { urlFilter: "|" + proxyOrigin + "/", resourceTypes: PROXY_REQUEST_TYPES }
     });
+    // Note: isUrlFilterCaseSensitive only applies to urlFilter conditions;
+    // these are regexFilters (case-insensitive by design), so the flag would
+    // be ignored — the fifth review pass removed it from the <object> rule
+    // for the same reason.
     addRules.push({
       id: RULE_ID_ALLOW_SKIP, priority: PRIORITY_EXEMPT, action: { type: "allow" },
-      condition: { regexFilter: SKIP_PATTERN, isUrlFilterCaseSensitive: false, resourceTypes: PROXY_REQUEST_TYPES }
+      condition: { regexFilter: SKIP_PATTERN, resourceTypes: PROXY_REQUEST_TYPES }
     });
     addRules.push({
       id: RULE_ID_ALLOW_CONFLICT, priority: PRIORITY_EXEMPT, action: { type: "allow" },
-      condition: { regexFilter: CONFLICT_PATTERN, isUrlFilterCaseSensitive: true, resourceTypes: PROXY_REQUEST_TYPES }
+      condition: { regexFilter: CONFLICT_PATTERN, resourceTypes: PROXY_REQUEST_TYPES }
     });
     PRIVATE_HOST_PATTERNS.forEach(function(p, i) {
       addRules.push({
         id: RULE_ID_ALLOW_PRIVATE + i, priority: PRIORITY_EXEMPT, action: { type: "allow" },
-        condition: { regexFilter: p, isUrlFilterCaseSensitive: false, resourceTypes: PROXY_REQUEST_TYPES }
+        condition: { regexFilter: p, resourceTypes: PROXY_REQUEST_TYPES }
       });
     });
   }
@@ -915,6 +957,7 @@ function doRefreshRules(done) {
     } catch (e) { cb(e); }
   };
   chrome.storage.sync.get(DEFAULTS, function(opts) {
+    if (!opts) opts = { ...DEFAULTS };
     readSuspended(function(suspended) {
       // The published runtime reflects exactly the rule set Chrome accepted.
       const installed = addRules => {
@@ -936,3 +979,12 @@ function doRefreshRules(done) {
     });
   });
 }
+
+// Bootstrap only after every declaration above has been initialized; storage
+// callbacks must never observe temporal dead-zone state, even when a mock or
+// future implementation invokes them synchronously. updateIcon() reads the
+// ICONS_* consts, and relying on the async storage callback to dodge the TDZ
+// window is fragile.
+mirrorToLocal();
+refreshRules();
+updateIcon();
