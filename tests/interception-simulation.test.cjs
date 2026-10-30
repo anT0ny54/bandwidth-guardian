@@ -13,6 +13,18 @@ const content = fs.readFileSync(path.join(ROOT, 'content.js'), 'utf8');
 const popupSource = fs.readFileSync(path.join(ROOT, 'popup.js'), 'utf8');
 const serviceWorker = fs.readFileSync(path.join(ROOT, 'service-worker.js'), 'utf8');
 
+
+test('shared defaults are declared once and loaded before classic consumers', () => {
+  const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, 'manifest.json'), 'utf8'));
+  const isolated = manifest.content_scripts.find(cs => (cs.js || []).includes('content.js'));
+  assert.ok(isolated, 'isolated content script entry exists');
+  assert.deepEqual(isolated.js, ['defaults.js', 'content.js']);
+
+  assert.match(serviceWorker, /^importScripts\("defaults\.js"\);/m, 'worker imports shared defaults');
+  assert.doesNotMatch(serviceWorker, /const DEFAULTS = \{/);
+  assert.doesNotMatch(content, /const DEFAULTS = \{/);
+});
+
 function extractFunction(source, name) {
   const marker = new RegExp(`function\\s+${name}\\s*\\(`);
   const match = marker.exec(source);
@@ -199,7 +211,7 @@ test('every shipped script passes Node syntax checks', () => {
   for (const file of files) {
     const full = path.join(ROOT, file);
     // popup/options/defaults are ES modules: check them as .mjs content via stdin.
-    const esm = ['options.js', 'popup.js', 'defaults.js'].includes(file);
+    const esm = ['options.js', 'popup.js'].includes(file);
     const result = esm
       ? spawnSync(process.execPath, ['--input-type=module', '--check'], { encoding: 'utf8', input: fs.readFileSync(full, 'utf8') })
       : spawnSync(process.execPath, ['--check', full], { encoding: 'utf8' });
@@ -520,6 +532,84 @@ test('service worker builds exact bypass matches for URLs containing DNR filter 
     'wildcards in a failed URL must not widen the bypass');
   assert.deepEqual(JSON.parse(JSON.stringify(sandbox.makeCondition('https://cdn.example/a.png?x=1'))),
     { urlFilter: '|https://cdn.example/a.png?x=1|', isUrlFilterCaseSensitive: true });
+});
+
+
+test('fallback retry is not consumed when the DNR bypass update fails', async () => {
+  const sources = ['bypassCondition', 'bypassUrlFromRule', 'originalFromProxyUrl', 'addBypass', 'scheduleFallback', 'markFallbackSeen', 'flushFallbacks']
+    .map(name => extractFunction(serviceWorker, name));
+  const messages = [];
+  let timer = null;
+  const sandbox = {
+    Promise, Number, JSON, Error, Set, Map, RegExp, URL, decodeURIComponent,
+    setImmediate,
+    chrome: {
+      declarativeNetRequest: {
+        updateSessionRules: async () => { if (sandbox.__dnrFail) throw new Error('DNR update failed'); }
+      },
+      tabs: {
+        sendMessage: (...args) => { messages.push(args); return Promise.resolve(); }
+      }
+    },
+    __dnrFail: true,
+    setTimeout: callback => { timer = callback; return callback; },
+    clearTimeout: () => {}
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(`
+    const PROXY_REQUEST_TYPES = ["image", "object"];
+    const PRIORITY_BYPASS = 4;
+    const BYPASS_BASE_ID = 100000;
+    const BYPASS_LIMIT = 3000;
+    const BYPASS_REGEX_LIMIT = 900;
+    const BYPASSABLE_URL_RE = new RegExp("^https?://[\\x21-\\x7e]+$");
+    const MAX_BYPASS_REGEX_LENGTH = 1900;
+    let bypassRules = new Map();
+    let bypassRegexRules = new Set();
+    let bypassNextId = BYPASS_BASE_ID;
+    let bypassChain = null;
+    let configuredProxyOrigin = "https://proxy.example";
+    const CONFLICT_PATTERN = "&(?:quality|l|bw|jpeg|max_width)=";
+    const PROXY_PARAMETER_RE = new RegExp(CONFLICT_PATTERN);
+    function bypassReady() { return Promise.resolve(); }
+    ${sources[0]}
+    ${sources[1]}
+    ${sources[2]}
+    ${sources[3]}
+    let fallbackSeen = new Set();
+    let fallbackBatch = new Map();
+    let fallbackTimer = null;
+    ${sources[4]}
+    ${sources[5]}
+    ${sources[6]}
+    this.api = {
+      fail(details) { scheduleFallback(details); },
+      flush() {
+        const callback = fallbackTimer;
+        fallbackTimer = null;
+        if (callback) callback();
+        return new Promise(resolve => setImmediate(() => setImmediate(resolve)));
+      },
+      seenCount: () => fallbackSeen.size,
+      messageCount: () => messages.length
+    };
+  `, sandbox);
+  sandbox.api.messageCount = () => messages.length;
+
+  const original = 'https://cdn.example/fallback.png';
+  const proxyUrl = 'https://proxy.example/api?url=' + encodeURIComponent(original);
+  sandbox.api.fail({ url: proxyUrl, tabId: 7, frameId: 0 });
+  await sandbox.api.flush();
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(sandbox.api.messageCount(), 0, 'failed DNR update must not ask the page to retry');
+  assert.equal(sandbox.api.seenCount(), 0, 'failed DNR update must not consume the retry');
+
+  sandbox.__dnrFail = false;
+  sandbox.api.fail({ url: proxyUrl, tabId: 7, frameId: 0 });
+  await sandbox.api.flush();
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(sandbox.api.seenCount(), 1, 'successful DNR update consumes exactly one retry');
+  assert.equal(sandbox.api.messageCount(), 1, 'confirmed bypass asks the page to retry');
 });
 
 test('service worker waits for startup recovery, serializes concurrent stats resets, and preserves later activity', () => {
