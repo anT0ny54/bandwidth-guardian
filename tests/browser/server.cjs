@@ -98,7 +98,7 @@ function createServer({ pagesDir }) {
   const server = http.createServer(async (req, res) => {
     const host = String(req.headers.host || '').split(':')[0];
     const u = new URL(req.url, `http://${req.headers.host}`);
-    const entry = { host, path: u.pathname, url: `http://${req.headers.host}${req.url}`, dest: req.headers['sec-fetch-dest'] || '' };
+    const entry = { host, path: u.pathname, url: `http://${req.headers.host}${req.url}` };
     if (u.pathname !== '/favicon.ico') log.push(entry);
 
     try {
