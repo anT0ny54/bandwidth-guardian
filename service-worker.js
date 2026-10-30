@@ -29,16 +29,9 @@
 //  DNR Rule 2 (CSP) and Rule 3 (Save-Data) are unchanged in purpose.
 // ══════════════════════════════════════════════════════════════════════════════
 
-// KEEP IN SYNC with defaults.js.
-const DEFAULTS = {
-  enabled:         true,
-  saveData:        true,
-  proxyBase:       "",
-  quality:         60,
-  grayscale:       true,
-  maxWidth:        768,
-  excludeDomains:  "",
-};
+// Shared frozen defaults for every extension context. Relative to this service
+// worker script, so no chrome.runtime.getURL() is needed during startup.
+importScripts("defaults.js");
 // STRICT detected image types: a proxy response is only ever accounted when its
 // Content-Type is one of these (documented in README "What gets proxied").
 const IMAGE_CONTENT_TYPES = new Set(["image/jpeg", "image/png", "image/webp", "image/gif", "image/tiff", "image/jxl"]);
@@ -579,6 +572,9 @@ function bypassReady() {
 const BYPASSABLE_URL_RE = /^https?:\/\/[\x21-\x7e]+$/;
 const MAX_BYPASS_REGEX_LENGTH = 1900;
 function bypassCondition(url) {
+  // Reserve room for the two urlFilter anchors so plain filters remain below the
+  // same conservative limit used for escaped regex filters.
+  if (url.length > MAX_BYPASS_REGEX_LENGTH - 2) return null;
   if (!/[|*^]/.test(url)) return { urlFilter: "|" + url + "|", isUrlFilterCaseSensitive: true };
   const regexFilter = "^" + url.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "$";
   if (regexFilter.length > MAX_BYPASS_REGEX_LENGTH) return null;
@@ -738,8 +734,8 @@ function scheduleFallback(details) {
   const tabId = typeof details.tabId === "number" ? details.tabId : -1;
   const key = tabId + " " + original;
   if (fallbackSeen.has(key)) return;
-  fallbackSeen.add(key);
-  if (fallbackSeen.size > 20000) fallbackSeen.delete(fallbackSeen.values().next().value);
+  // Do not consume the retry yet. Only a confirmed DNR bypass makes the retry
+  // safe; a failed update must leave the URL eligible for a later attempt.
   const frameId = typeof details.frameId === "number" ? details.frameId : 0;
   const bk = tabId + ":" + frameId;
   if (!fallbackBatch.has(bk)) fallbackBatch.set(bk, { tabId, frameId, items: new Map() });
@@ -747,6 +743,12 @@ function scheduleFallback(details) {
   // 250 ms lets the renderer finish the failed response first; a CSS rule
   // re-inserted while the failed load is still settling can reuse it.
   if (!fallbackTimer) fallbackTimer = setTimeout(flushFallbacks, 250);
+}
+
+function markFallbackSeen(tabId, original) {
+  const key = tabId + " " + original;
+  fallbackSeen.add(key);
+  if (fallbackSeen.size > 20000) fallbackSeen.delete(fallbackSeen.values().next().value);
 }
 
 function flushFallbacks() {
@@ -761,6 +763,7 @@ function flushFallbacks() {
       const items = Array.from(b.items, ([original, proxyUrl]) => ({ original, proxyUrl }))
         .filter(item => allowed.has(item.original));
       if (!items.length) return;
+      for (const item of items) markFallbackSeen(b.tabId, item.original);
       try {
         const p = chrome.tabs.sendMessage(b.tabId, { type: "bh-retry", items }, { frameId: b.frameId });
         if (p && typeof p.catch === "function") p.catch(() => {});

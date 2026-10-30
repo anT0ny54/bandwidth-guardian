@@ -31,15 +31,15 @@ PY
 
 # Fast preflight: validate every shipped JavaScript file before packaging.
 # This catches syntax regressions early and requires only the Node runtime.
-# Classic scripts (service worker, prehook, content) must be checked AS
-# classic scripts: copying them to .mjs checks them as ES modules, which
-# rejects classic-script-only constructs they are allowed to use and gives
-# false confidence for files that ship as classic scripts.
+# Classic scripts (service worker, prehook, content, shared defaults) must be
+# checked AS classic scripts: copying them to .mjs checks them as ES modules,
+# which rejects classic-script-only constructs they are allowed to use and
+# gives false confidence for files that ship as classic scripts.
 CHECK_TMP="$(mktemp -d)"
 for js in service-worker.js prehook.js content.js popup.js options.js defaults.js; do
   case "$js" in
-    popup.js|options.js|defaults.js) ext="mjs" ;;  # ES module syntax
-    *)                               ext="js"  ;;  # classic script
+    popup.js|options.js) ext="mjs" ;;  # ES module syntax
+    *)                   ext="js"  ;;  # classic script
   esac
   cp "$ROOT_DIR/$js" "$CHECK_TMP/${js%.js}.$ext"
   node --check "$CHECK_TMP/${js%.js}.$ext" >/dev/null || {

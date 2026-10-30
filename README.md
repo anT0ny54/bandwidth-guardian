@@ -40,7 +40,10 @@ excluded domains and private-network hosts are never proxied.
 ## How it works
 
 Interception happens in two layers, so an image request is rewritten exactly
-once and before Chrome starts it.
+once and before Chrome starts it. Shared settings defaults live in one frozen,
+classic `defaults.js`; the service worker imports it, the isolated content
+script receives it before `content.js`, and the extension pages load it before
+their module scripts.
 
 1. **Network layer (primary), `service-worker.js`.** A declarativeNetRequest
    `redirect` rule (`regexFilter ^https?://.+`, resource type `image`, plus
@@ -98,7 +101,10 @@ once and before Chrome starts it.
   so a reload does not try the proxy again. Bypass matching is case-sensitive,
   so a bypass for one URL can never match a different-cased path of the same
   host.
-  Bypass rules are removed when the tab closes.
+  Retry bookkeeping is committed only after the DNR update confirms the exact
+  bypass; failed updates leave the URL eligible for a later retry. Plain and
+  escaped-regex filters are preflighted against the same conservative size
+  limit before submission. Bypass rules are removed when the tab closes.
 - If the proxy itself is unreachable (6 connection-level failures within 30 s),
   the redirect is suspended for 2 minutes and pages load images directly; it
   then resumes automatically.
@@ -176,8 +182,9 @@ BHP2_DIR=../bhp2 node --test --test-concurrency=1 \
 ```
 
 Pass the test files explicitly: Node 21+ no longer accepts a bare `tests/`
-directory for `node --test`. Without `CHROME_PATH` the browser suite skips
-itself.
+directory for `node --test`. The simulation suite also covers the shared-default
+loading contract, oversized bypass filters and DNR-failure retry bookkeeping.
+Without `CHROME_PATH` the browser suite skips itself.
 
 ### Known limits
 
@@ -225,16 +232,12 @@ asset. Bump `manifest.json`'s version when publishing a distinct release.
 
 The shipped code is periodically re-audited for dead/redundant code,
 cross-layer conflicts, bugs and optimization opportunities (details in
-`CHANGELOG.md`). A thirteenth pass re-read every shipped file end to end and
-fixed a settings-sync regression (the `sameOpts` helper was deleted while its
-call sites remained in `content.js`, so the first storage change in a tab threw
-a ReferenceError) and a stats-merging hazard in `service-worker.js` (deltas
-could be merged into the shared zero-stats default object; stats are now
-cloned before merging). A fourteenth pass corrected the build preflight
-(classic scripts are now syntax-checked as classic scripts, not as ES
-modules) and fixed a stale-queue edge case in the service worker (early
-webRequest events queued before the proxy origin was known are now dropped
-when no proxy is configured). No version bump.
+`CHANGELOG.md`). The latest pass centralized the defaults into one frozen
+classic `defaults.js`, corrected the build/test preflight so classic files are
+checked in their real script mode, fixed fallback bookkeeping so a failed DNR
+bypass update cannot consume the page's one retry, and added a conservative
+length guard for plain `urlFilter` bypasses. The simulation suite covers those
+regressions. No version bump.
 
 ## 🔗 Related projects (not part of this repository)
 

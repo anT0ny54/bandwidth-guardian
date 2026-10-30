@@ -31,16 +31,6 @@
 
 (function () {
   "use strict";
-  // KEEP IN SYNC WITH defaults.js.
-  const DEFAULTS = {
-    enabled:         true,
-    saveData:        true,
-    proxyBase:       "",
-    quality:         60,
-    grayscale:       true,
-    maxWidth:        768,
-    excludeDomains:  ""
-  };
   // KEEP IN SYNC with prehook.js.
   const DEFAULT_SETTINGS_EVENT = "bh-settings-update";
   // Written by the service worker: is the network redirect live, and is the

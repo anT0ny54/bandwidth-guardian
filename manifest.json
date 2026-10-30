@@ -4,7 +4,7 @@
   "name": "__MSG_extensionName__",
   "short_name": "BW Guardian",
   "description": "__MSG_extensionDescription__",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "minimum_chrome_version": "128",
   "action": {
     "default_popup": "popup.html",
@@ -38,8 +38,12 @@
   },
   "content_scripts": [
     {
-      "matches": ["<all_urls>"],
-      "js": ["prehook.js"],
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "prehook.js"
+      ],
       "run_at": "document_start",
       "all_frames": true,
       "world": "MAIN",
@@ -47,8 +51,13 @@
       "match_about_blank": true
     },
     {
-      "matches": ["<all_urls>"],
-      "js": ["content.js"],
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "defaults.js",
+        "content.js"
+      ],
       "run_at": "document_start",
       "all_frames": true,
       "match_origin_as_fallback": true,

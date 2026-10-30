@@ -1,5 +1,3 @@
-import { DEFAULTS } from "./defaults.js";
-
 const $ = id => document.getElementById(id);
 
 const enabledEl      = $("enabled");
