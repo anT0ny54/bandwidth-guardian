@@ -72,7 +72,7 @@ const PRIVATE_HOST_PATTERNS = [
   // Split in three: one combined regex exceeds the 2KB RE2 memory limit.
   "^https?://(?:localhost|[^/?#:]*\\.localhost|[^/?#:]*\\.local|[^/?#:.\\[]+)(?::[0-9]+)?(?:[/?#]|$)",
   "^https?://(?:127|10|192\\.168|172\\.(?:1[6-9]|2[0-9]|3[01])|169\\.254)\\.[0-9.]+(?::[0-9]+)?(?:[/?#]|$)",
-  "^https?://\\[(?:::1|f[cd][0-9a-f]*:[0-9a-f:]*|fe80:[0-9a-f:%.a-z]*)\\](?::[0-9]+)?(?:[/?#]|$)"
+  "^https?://\\[(?:::1|f[cd][0-9a-f]*:[0-9a-f:]*|fe[89ab][0-9a-f]:[0-9a-f:%.a-z]*|::ffff:(?:7f[0-9a-f]{2}|a[0-9a-f]{2}|c0a8|ac1[0-9a-f]|a9fe):[0-9a-f]{1,4})\\](?::[0-9]+)?(?:[/?#]|$)"
 ];
 // <object>/<embed> are only redirected when the URL clearly names one of the
 // strictly supported raster types — documents/plugins must never be proxied.
@@ -599,7 +599,10 @@ function bypassUrlFromRule(rule) {
 }
 
 function addBypass(tabId, urls) {
-  const tab = Number.isInteger(tabId) && tabId >= 0 ? tabId : -1;
+  // Session allow rules without tabIds are global. A request without a real tab
+  // cannot be retried safely, so never turn an unknown tab (-1) into a global bypass.
+  if (!Number.isInteger(tabId) || tabId < 0) return Promise.resolve([]);
+  const tab = tabId;
   const operation = bypassReady().then(async () => {
     const candidates = [];
     const candidateKeys = new Set();
@@ -626,7 +629,7 @@ function addBypass(tabId, urls) {
     const addRules = [];
     const addedKeys = new Map();
     for (const c of candidates) {
-      let needsSlot = addRules.length >= BYPASS_LIMIT - nextRules.size;
+      const needsSlot = addRules.length >= BYPASS_LIMIT - nextRules.size;
       if (needsSlot) {
         const oldestKey = nextRules.keys().next().value;
         // Evicting a non-regex oldest rule cannot make room under the regex
@@ -638,7 +641,6 @@ function addBypass(tabId, urls) {
         nextRules.delete(oldest[0]);
         nextRegexRules.delete(oldest[0]);
         removeRuleIds.push(oldest[1]);
-        needsSlot = false;
       }
       if (c.baseCondition.regexFilter && nextRegexRules.size >= BYPASS_REGEX_LIMIT) continue;
       const id = bypassNextId++;
@@ -718,28 +720,29 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   bypassReady().then(() => {
     const urls = [];
     for (const k of bypassRules.keys()) if (k.startsWith(prefix)) urls.push(k.slice(prefix.length));
-    sendResponse({ urls: urls.slice(-1000) });
+    // BYPASS_LIMIT bounds this list; returning all active entries ensures a
+    // reloaded document also knows about failed URLs older than the last 1,000.
+    sendResponse({ urls });
   });
   return true;
 });
 
-// Failures are batched per frame so an image-heavy page sends one message.
+// Failures are batched per tab because DNR bypass rules are tab-scoped and the
+// retry notification must update every frame's MAIN-world failed-URL set.
 const fallbackSeen  = new Set();  // "tabId url": a URL is retried once per tab
-const fallbackBatch = new Map();  // "tabId:frameId" -> { tabId, frameId, items: Map(original -> proxyUrl) }
+const fallbackBatch = new Map();  // tabId -> { tabId, items: Map(original -> proxyUrl) }
 let fallbackTimer   = null;
 
 function scheduleFallback(details) {
   const original = originalFromProxyUrl(details.url);
-  if (!original) return;
-  const tabId = typeof details.tabId === "number" ? details.tabId : -1;
+  if (!original || !Number.isInteger(details.tabId) || details.tabId < 0) return;
+  const tabId = details.tabId;
   const key = tabId + " " + original;
   if (fallbackSeen.has(key)) return;
   // Do not consume the retry yet. Only a confirmed DNR bypass makes the retry
   // safe; a failed update must leave the URL eligible for a later attempt.
-  const frameId = typeof details.frameId === "number" ? details.frameId : 0;
-  const bk = tabId + ":" + frameId;
-  if (!fallbackBatch.has(bk)) fallbackBatch.set(bk, { tabId, frameId, items: new Map() });
-  fallbackBatch.get(bk).items.set(original, details.url);
+  if (!fallbackBatch.has(tabId)) fallbackBatch.set(tabId, { tabId, items: new Map() });
+  fallbackBatch.get(tabId).items.set(original, details.url);
   // 250 ms lets the renderer finish the failed response first; a CSS rule
   // re-inserted while the failed load is still settling can reuse it.
   if (!fallbackTimer) fallbackTimer = setTimeout(flushFallbacks, 250);
@@ -765,7 +768,9 @@ function flushFallbacks() {
       if (!items.length) return;
       for (const item of items) markFallbackSeen(b.tabId, item.original);
       try {
-        const p = chrome.tabs.sendMessage(b.tabId, { type: "bh-retry", items }, { frameId: b.frameId });
+        // The bypass is tab-scoped. Broadcast to every frame so conflict URLs
+        // are also remembered by each frame's prehook (not just the failing one).
+        const p = chrome.tabs.sendMessage(b.tabId, { type: "bh-retry", items });
         if (p && typeof p.catch === "function") p.catch(() => {});
       } catch {}
     }).catch(() => {});
@@ -819,7 +824,7 @@ function parseExcluded(text) {
 function usableProxyBase(proxyBase) {
   try {
     const u = new URL(String(proxyBase || "").trim());
-    if (!/^https?:$/.test(u.protocol)) return "";
+    if (!/^https?:$/.test(u.protocol) || u.searchParams.has("url")) return "";
     u.hash = "";
     // A trailing empty "?" survives in href and would make the separator
     // logic emit "?&jpeg=0…" — normalize it away.
@@ -949,7 +954,12 @@ function publishRuntime(runtime) {
 function doRefreshRules(done) {
   const finish = () => { if (typeof done === "function") done(); };
   if (!chrome.declarativeNetRequest || typeof chrome.declarativeNetRequest.updateDynamicRules !== "function") {
-    finish();
+    // Without DNR, the DOM interception layer must own all eligible URLs.
+    // Preserve the circuit-breaker state while publishing that no redirect is live.
+    readSuspended(suspended => {
+      publishRuntime({ redirect: false, suspended });
+      finish();
+    });
     return;
   }
   // updateDynamicRules can fail asynchronously (lastError) OR throw
@@ -976,7 +986,33 @@ function doRefreshRules(done) {
         update(noHeaderMatch, function(err2) {
           if (!err2) { installed(noHeaderMatch); return; }
           const headersOnly = buildRules(opts, true, true);
-          update(headersOnly, function() { installed(headersOnly); });
+          update(headersOnly, function(err3) {
+            if (!err3) { installed(headersOnly); return; }
+
+            // A rejected update is atomic: Chrome keeps the previously installed
+            // dynamic rules. Do not publish the uninstalled fallback shape, or
+            // the DOM layer can choose the wrong mode (and double-proxy images).
+            // Read the live rules and publish only what Chrome actually retained.
+            const publishCurrentRules = rules => {
+              if (!chrome.runtime.lastError && Array.isArray(rules)) {
+                publishRuntime({
+                  redirect: rules.some(rule => rule.id === RULE_ID_REDIRECT_IMAGE),
+                  suspended
+                });
+              }
+              // If inspection also fails, preserve the last known runtime state.
+              finish();
+            };
+            try {
+              if (typeof chrome.declarativeNetRequest.getDynamicRules === "function") {
+                chrome.declarativeNetRequest.getDynamicRules(publishCurrentRules);
+              } else {
+                finish();
+              }
+            } catch {
+              finish();
+            }
+          });
         });
       });
     });

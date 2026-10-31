@@ -61,6 +61,16 @@ function fmtBytes(n) {
   return n + " B";
 }
 
+// The extension appends its own `url=` query parameter to every proxy URL.
+// A pre-existing `url` parameter would be ambiguous to the proxy's parser.
+function isValidProxyBase(value) {
+  try {
+    const parsed = new URL(value);
+    return (parsed.protocol === "http:" || parsed.protocol === "https:") &&
+      !parsed.searchParams.has("url");
+  } catch { return false; }
+}
+
 async function reloadCurrentPage() {
   const isHttpUrl = url => /^https?:\/\//i.test(String(url || ""));
   // B14: prefer the tab that opened Settings. Only http(s) tabs qualify below,
@@ -280,16 +290,11 @@ async function save() {
   // B3: an empty proxyBase is allowed — it means "proxying disabled". Validate
   // only when a value was entered, so quality/width/exclusions are savable
   // without a proxy and the proxy can actually be cleared.
-  if (proxyBase !== "") {
-    try {
-      const parsedProxy = new URL(proxyBase);
-      if (parsedProxy.protocol !== "http:" && parsedProxy.protocol !== "https:") throw new Error("bad protocol");
-    } catch {
-      proxyBaseEl.classList.add("invalid");
-      showToast("Proxy URL must be a valid http:// or https:// URL", "err");
-      proxyBaseEl.focus();
-      return;
-    }
+  if (proxyBase !== "" && !isValidProxyBase(proxyBase)) {
+    proxyBaseEl.classList.add("invalid");
+    showToast("Use a valid http(s) proxy URL without a ?url= parameter", "err");
+    proxyBaseEl.focus();
+    return;
   }
   const quality = readQuality();
   const maxWidth = readWidth();
@@ -315,10 +320,10 @@ async function save() {
 
 async function testProxy() {
   const url = (proxyBaseEl.value || "").trim();
-  try {
-    const parsedTest = new URL(url);
-    if (parsedTest.protocol !== "http:" && parsedTest.protocol !== "https:") throw new Error("bad protocol");
-  } catch { showToast("Enter a valid proxy URL first", "err"); return; }
+  if (!isValidProxyBase(url)) {
+    showToast("Enter a valid http(s) proxy URL without a ?url= parameter", "err");
+    return;
+  }
   const orig = testProxyBtn.textContent;
   testProxyBtn.textContent = "Testing…"; testProxyBtn.disabled = true;
   const ctrl = new AbortController();

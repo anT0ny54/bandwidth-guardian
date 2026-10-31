@@ -64,24 +64,30 @@ their module scripts.
    - **Exemptions** (higher priority than the redirect): excluded domains
      (both as request host and page/initiator), favicons, `.ico`/`.svg`,
      `data:`/`blob:` (never matched), localhost,
-     `*.local`, single-label intranet hosts and private/link-local IP
-     literals (a public proxy cannot reach them; bandwidth-hero-proxy2 answers
-     403 for them).
+     `*.local`, single-label intranet hosts, private/link-local IPv4 and IPv6
+     literals (including IPv4-mapped IPv6 and the full `fe80::/10` link-local
+     range; a public proxy cannot reach them).
    - **Conflict URLs:** URLs containing `&quality=`, `&l=`, `&bw=`, `&jpeg=` or
      `&max_width=` (matched case-insensitively, like DNR regex filters) would
      be truncated by the raw contract, so the network rule skips them and the
-     DOM layer proxies them URL-encoded instead.
+     DOM layer proxies them URL-encoded on supported DOM surfaces (`src`,
+     `srcset`, image preloads and inline `style` attributes). Conflict URLs
+     originating only in stylesheet/CSSOM rules cannot be rewritten by these
+     DOM hooks and remain direct; ordinary stylesheet and CSSOM URLs still use
+     the network redirect.
 2. **DOM layer, `prehook.js` (MAIN world, `document_start`) and `content.js`.**
    Intercepts supported image `src`/`srcset` setters, preload-link `href`/`imagesrcset`
-   attributes, and inline background styles. The network layer, not these hooks, covers
-   posters, SVG `<image>`, objects/embeds, CSSOM and stylesheet requests. The
+   attributes, and `url()` references in inline `style` attributes (including
+   background, border-image, list-style, mask and cursor declarations). The
+   network layer, not these hooks, covers posters, SVG `<image>`, objects/embeds,
+   CSSOM rules and stylesheet requests. The
    network rule handles ordinary requests; the DOM layer handles conflict URLs
    on supported surfaces and hands everything else
    to the network layer untouched (so nothing is wrapped twice). If Chrome
    rejects the network rule, the DOM layer provides best-effort fallback for
    observed `<img>`/`<source>` setters and parser insertions, image preloads, and
-   inline background images. That fallback cannot replace network-layer coverage
-   for every mechanism (in particular cross-origin stylesheets, CSSOM-generated
+   `url()` references in inline `style` attributes. That fallback cannot
+   replace network-layer coverage for every mechanism (in particular cross-origin stylesheets, CSSOM-generated
    CSS images, SVG `<image>`, video posters, and `<object>`/`<embed>`). Full
    coverage requires the DNR rules to install successfully. Private/intranet and
    excluded-host exemptions still apply in DOM fallback mode.
@@ -92,8 +98,8 @@ their module scripts.
   reported by `webRequest`; the original URL gets an **exact-match per-tab
   session bypass rule** and the page is asked to re-request that one URL
   **directly, once** (`<img>`, `<picture>`, poster, SVG `<image>`,
-  `<object>/<embed>`, inline styles (`URL(...)` matching is
-  case-insensitive), same-origin CSS rules; cross-origin
+  `<object>/<embed>`, inline style-attribute `url()` values (`URL(...)` matching
+  is case-insensitive), same-origin CSS rules; cross-origin
   `<link>` sheets are reloaded once when the URL was not found anywhere
   accessible). URLs containing DNR filter metacharacters use an escaped regex
   match rather than a wildcard-prone URL filter, subject to browser rule size
@@ -102,9 +108,17 @@ their module scripts.
   so a bypass for one URL can never match a different-cased path of the same
   host.
   Retry bookkeeping is committed only after the DNR update confirms the exact
-  bypass; failed updates leave the URL eligible for a later retry. Plain and
-  escaped-regex filters are preflighted against the same conservative size
-  limit before submission. Bypass rules are removed when the tab closes.
+  bypass; failed updates leave the URL eligible for a later retry. The failed
+  URL is then broadcast to every frame in the tab, matching the tab-wide bypass
+  scope, and the complete bounded bypass list is supplied to newly loaded
+  documents. Requests without a valid tab ID are not given a global bypass.
+  Plain and escaped-regex filters are preflighted against the same conservative
+  size limit before submission. Bypass rules are removed when the tab closes.
+  A failed element is guarded per URL rather than permanently: when a page
+  reuses an image node for a different source, including while a retry is still
+  pending, its stale fallback markers, metadata and timers are cleared in both
+  execution worlds. Timer ownership checks prevent a cancelled callback already
+  queued by the browser from restoring over the newer source.
 - If the proxy itself is unreachable (6 connection-level failures within 30 s),
   the redirect is suspended for 2 minutes and pages load images directly; it
   then resumes automatically.
@@ -125,7 +139,7 @@ can then block the proxy on that browser configuration.
 |---|---|---|
 | `enabled` | `true` | Master switch for image compression |
 | `saveData` | `true` | Send `Save-Data: on` on requests (applies even when compression is off) |
-| `proxyBase` | `""` | Your proxy URL; empty = no proxy configured (nothing is compressed) |
+| `proxyBase` | `""` | HTTP(S) proxy URL; must not already contain the reserved `url` query parameter. Empty = no proxy configured (nothing is compressed). |
 | `quality` | `60` | 1–100 |
 | `grayscale` | `true` | Server-side grayscale (`bw=1`) |
 | `maxWidth` | `768` | `0` = no limit |
@@ -183,7 +197,7 @@ BHP2_DIR=../bhp2 node --test --test-concurrency=1 \
 
 Pass the test files explicitly: Node 21+ no longer accepts a bare `tests/`
 directory for `node --test`. The simulation suite also covers the shared-default
-loading contract, oversized bypass filters and DNR-failure retry bookkeeping.
+loading contract, oversized bypass filters, DNR-failure retry bookkeeping, live-rule state recovery, reserved proxy query validation and case-insensitive CSS fallback.
 Without `CHROME_PATH` the browser suite skips itself.
 
 ### Known limits
@@ -232,12 +246,12 @@ asset. Bump `manifest.json`'s version when publishing a distinct release.
 
 The shipped code is periodically re-audited for dead/redundant code,
 cross-layer conflicts, bugs and optimization opportunities (details in
-`CHANGELOG.md`). The latest pass centralized the defaults into one frozen
-classic `defaults.js`, corrected the build/test preflight so classic files are
-checked in their real script mode, fixed fallback bookkeeping so a failed DNR
-bypass update cannot consume the page's one retry, and added a conservative
-length guard for plain `urlFilter` bypasses. The simulation suite covers those
-regressions. No version bump.
+`CHANGELOG.md`). The latest pass keeps the DOM fallback synchronized with the
+actual dynamic rules retained by Chrome when every DNR installation attempt is
+rejected; rejects proxy base URLs that already define the reserved `url` query
+parameter; and retries stylesheet rules with case-insensitive CSS `url()`
+matching. It also removes a dead slot-state assignment in bypass-rule handling.
+The simulation suite covers each regression. No version bump.
 
 ## 🔗 Related projects (not part of this repository)
 

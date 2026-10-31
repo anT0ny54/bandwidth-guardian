@@ -20,7 +20,7 @@
 //   Catches what prehook cannot:
 //   A) HTML-parser-created <img>/<source> nodes — the C++ parser bypasses JS
 //      setters; rewriting cancels the in-flight original request.
-//   B) Inline CSS background-image via el.style.backgroundImage.
+//   B) URL references in any inline CSS style declaration.
 //   Parser-created <link rel=preload as=image> hrefs are handled by prehook's
 //   MutationObserver (registered first), so no preload handling is needed here.
 //
@@ -72,7 +72,7 @@
   const PRIVATE_HOST_PATTERNS = [
     "^https?://(?:localhost|[^/?#:]*\\.localhost|[^/?#:]*\\.local|[^/?#:.\\[]+)(?::[0-9]+)?(?:[/?#]|$)",
     "^https?://(?:127|10|192\\.168|172\\.(?:1[6-9]|2[0-9]|3[01])|169\\.254)\\.[0-9.]+(?::[0-9]+)?(?:[/?#]|$)",
-    "^https?://\\[(?:::1|f[cd][0-9a-f]*:[0-9a-f:]*|fe80:[0-9a-f:%.a-z]*)\\](?::[0-9]+)?(?:[/?#]|$)"
+    "^https?://\\[(?:::1|f[cd][0-9a-f]*:[0-9a-f:]*|fe[89ab][0-9a-f]:[0-9a-f:%.a-z]*|::ffff:(?:7f[0-9a-f]{2}|a[0-9a-f]{2}|c0a8|ac1[0-9a-f]|a9fe):[0-9a-f]{1,4})\\](?::[0-9]+)?(?:[/?#]|$)"
   ];
   const PRIVATE_HOST_RE = PRIVATE_HOST_PATTERNS.map(pattern => new RegExp(pattern, "i"));
   const isPrivateHttpUrl = absolute => PRIVATE_HOST_RE.some(pattern => pattern.test(absolute));
@@ -103,7 +103,7 @@
   const proxyUrlCache = new Map();
   const PROXY_CACHE_LIMIT = 512;
   const doneImg = new WeakSet();
-  const doneBg = new WeakSet();
+  const doneStyle = new WeakSet();
   const fallbackHandlers = new WeakSet();
   const fallbackMeta = new WeakMap();
   // Pending one-shot restores claimed at error time but deliberately deferred
@@ -180,7 +180,7 @@
       parsed = new URL(base);
       // KEEP IN SYNC with usableProxyBase() in service-worker.js: a trailing
       // empty "?" survives in href and would make the separator emit "?&…".
-      if (!/^https?:$/.test(parsed.protocol)) { base = ""; parsed = null; }
+      if (!/^https?:$/.test(parsed.protocol) || parsed.searchParams.has("url")) { base = ""; parsed = null; }
       else { parsed.hash = ""; base = parsed.href.endsWith("?") ? parsed.href.slice(0, -1) : parsed.href; }
     } catch { base = ""; parsed = null; }
     const quality = Math.max(1, Math.min(100, Number(opts.quality ?? 60) || 60));
@@ -330,8 +330,13 @@
   // claims a given failure; a different value means the page re-armed a new
   // URL (lazy promotion) and a re-claim is required.
   const PENDING_ORIGINAL_ATTR = "data-bh-pending-original";
+  const FALLBACK_REARM_EVENT = "bh-image-rearmed";
 
   function restoreOriginal(el, meta) {
+    // Validate ownership before clearing anything: a stale callback must not
+    // discard metadata that now belongs to a newer source on the same element.
+    const token = meta.originalSrc ? resolveHttp(meta.originalSrc) : meta.originalSrcset;
+    if (fallbackMeta.get(el) !== meta || el.getAttribute(PENDING_ORIGINAL_ATTR) !== token) return;
     fallbackMeta.delete(el);
     const t = fallbackTimers.get(el);
     if (t !== undefined) { clearTimeout(t); fallbackTimers.delete(el); }
@@ -371,6 +376,12 @@
       if (!proxyOrigin || curURL.origin !== proxyOrigin) return; // B5
       const meta = fallbackMeta.get(el);
       if (!meta) return; // this world never armed the element
+      // Record the exact responsive candidate locally as soon as the proxy
+      // fails, so a delayed worker notification cannot re-arm that same URL.
+      try {
+        const original = curURL.searchParams.get("url");
+        if (original) failedUrls.add(stripHash(original));
+      } catch {}
       // Claim token: the original this world's meta currently represents.
       // A lazy loader may promote a new URL after the first failure; the
       // setter patches then re-arm meta, and the token mismatch lets the new
@@ -394,18 +405,40 @@
       meta.failedProxyUrl = cur;
       const oldT = fallbackTimers.get(el);
       if (oldT !== undefined) clearTimeout(oldT);
-      fallbackTimers.set(el, setTimeout(() => {
-        if (destroyed) return;
+      const timer = setTimeout(() => {
+        // A cancelled callback can already be queued. It may act only while
+        // this exact timer still owns the element's pending restore.
+        if (destroyed || fallbackTimers.get(el) !== timer) return;
+        fallbackTimers.delete(el);
         const m = fallbackMeta.get(el);
         if (m) restoreOriginal(el, m);
-      }, 1500)); // > the worker's 250 ms fallback flush + slow DNR commits
+      }, 1500); // > the worker's 250 ms fallback flush + slow DNR commits
+      fallbackTimers.set(el, timer);
     }, true);
+    // Keep one load listener per element. Sites reuse image nodes after
+    // successful loads; making this listener one-shot leaves the permanent
+    // fallbackHandlers marker set and prevents cleanup for later sources.
     el.addEventListener("load", () => {
       fallbackMeta.delete(el);
       const t = fallbackTimers.get(el);
       if (t !== undefined) { clearTimeout(t); fallbackTimers.delete(el); }
-    }, { capture: true, once: true });
+    }, { capture: true });
   }
+
+  // MAIN-world prehook dispatches this synchronously when it detects that a
+  // failed/pending image element has been recycled for a different URL. Clear
+  // the isolated world's separate WeakMaps before a stale timer can claim it.
+  function onFallbackRearm(event) {
+    // composedPath preserves the original image target across open shadow roots
+    // where event.target is retargeted to the host.
+    const path = event && typeof event.composedPath === "function" ? event.composedPath() : null;
+    const el = path && path.length ? path[0] : event && event.target;
+    if (!el || el.tagName !== "IMG") return;
+    fallbackMeta.delete(el);
+    const timer = fallbackTimers.get(el);
+    if (timer !== undefined) { clearTimeout(timer); fallbackTimers.delete(el); }
+  }
+  document.addEventListener(FALLBACK_REARM_EVENT, onFallbackRearm, true);
 
   // ── A) Parser-created <img src> / <source srcset> ──────────────────────────
   function rewriteImg(el) {
@@ -448,30 +481,30 @@
     if (rewrote) doneImg.add(el);
   }
 
-  // ── B) Inline background-image ──────────────────────────────────────────────
-  function rewriteBg(el) {
-    if (!el || doneBg.has(el) || failedEls.has(el)) return;
+  // ── B) Inline CSS URL references (all declarations, not just backgrounds) ──
+  function rewriteInlineStyles(el) {
+    if (!el || doneStyle.has(el) || failedEls.has(el)) return;
     if (!active) return;
-    const bg = el.style.backgroundImage;
-    if (!bg) return;
+    const style = el.getAttribute("style");
+    if (!style || !/\burl\(/i.test(style)) return;
 
     const urlRe = /url\(\s*(?:(['"])(.*?)\1|([^)]*?))\s*\)/gi;
     let touched = false;
-    const output = bg.replace(urlRe, (full, quote, quoted, bare) => {
+    const output = style.replace(urlRe, (full, quote, quoted, bare) => {
       const raw = String(quote ? quoted : bare || "").trim();
       const absolute = raw ? resolveHttp(raw) : null;
       if (!absolute || shouldSkip(absolute)) return full;
       touched = true;
       return `url("${buildProxyUrl(absolute)}")`;
     });
-    if (!touched || output === bg) return;
-    el.style.backgroundImage = output;
-    doneBg.add(el);
+    if (!touched || output === style) return;
+    el.setAttribute("style", output);
+    doneStyle.add(el);
   }
 
   function processCandidate(el) {
     rewriteImg(el);
-    rewriteBg(el);
+    rewriteInlineStyles(el);
   }
 
   const CANDIDATE_SELECTOR = "img,source";
@@ -482,7 +515,7 @@
   function rewriteAll() {
     if (destroyed || !active) return;
     document.querySelectorAll(CANDIDATE_SELECTOR).forEach(processCandidate);
-    document.querySelectorAll(STYLE_SELECTOR).forEach(rewriteBg);
+    document.querySelectorAll(STYLE_SELECTOR).forEach(rewriteInlineStyles);
   }
 
   function scheduleInitialRewrite() {
@@ -497,14 +530,14 @@
 
   const addedRoots = [];
   const imageTargets = new Set();
-  const bgTargets = new Set();
+  const styleTargets = new Set();
 
   function processMutations(mutations) {
     if (destroyed || !active) return;
     // R8: reusable collections, cleared once at the start of each flush.
     addedRoots.length = 0;
     imageTargets.clear();
-    bgTargets.clear();
+    styleTargets.clear();
 
     for (const m of mutations) {
       if (m.type === "childList") {
@@ -525,7 +558,8 @@
             imageTargets.add(t);
           }
         } else if (m.attributeName === "style") {
-          if (t.style && t.style.backgroundImage) { doneBg.delete(t); bgTargets.add(t); }
+          const style = t.getAttribute("style");
+          if (style && /\burl\(/i.test(style)) { doneStyle.delete(t); styleTargets.add(t); }
         }
       }
     }
@@ -533,16 +567,14 @@
     for (const root of addedRoots) {
       processCandidate(root);
       root.querySelectorAll(CANDIDATE_SELECTOR).forEach(processCandidate);
-      // #17: style-attribute candidates from THIS batch only (R5: nodeType is
-      // always 1 here — it was filtered on push — so no re-checks are needed).
-      // Case-insensitive, matching STYLE_SELECTOR ([style*='url(' i]): an
-      // uppercase "URL(" on the added root itself was previously missed.
+      // Style-attribute candidates from this batch only. Check the added root
+      // itself as well as descendants; CSS function names are case-insensitive.
       const rootStyle = root.getAttribute("style");
-      if (rootStyle && /\burl\(/i.test(rootStyle)) rewriteBg(root);
-      root.querySelectorAll(STYLE_SELECTOR).forEach(rewriteBg);
+      if (rootStyle && /\burl\(/i.test(rootStyle)) rewriteInlineStyles(root);
+      root.querySelectorAll(STYLE_SELECTOR).forEach(rewriteInlineStyles);
     }
     imageTargets.forEach(rewriteImg);
-    bgTargets.forEach(rewriteBg);
+    styleTargets.forEach(rewriteInlineStyles);
   }
 
   const MUTATION_RECORD_LIMIT = 2000;
@@ -579,6 +611,7 @@
     try { mo && mo.disconnect(); } catch {}
     try { chrome.storage.onChanged.removeListener(onStorageChanged); } catch {}
     try { chrome.runtime.onMessage.removeListener(onRuntimeMessage); } catch {}
+    try { document.removeEventListener(FALLBACK_REARM_EVENT, onFallbackRearm, true); } catch {}
     pendingMutations = [];
     proxyUrlCache.clear();
   }
@@ -611,7 +644,12 @@
     try {
       chrome.runtime.sendMessage({ type: "bh-failed-list" }, res => {
         void chrome.runtime.lastError;
-        if (res && Array.isArray(res.urls)) failedUrls = new Set(res.urls.filter(u => typeof u === "string"));
+        if (res && Array.isArray(res.urls)) {
+          for (const url of res.urls) if (typeof url === "string") failedUrls.add(stripHash(url));
+          // The 400 ms settings wait may already have expired. Keep MAIN-world
+          // interception in sync when the worker's response arrives late.
+          if (opts) publishPrehookSettings(opts);
+        }
         clearTimeout(timer); resolve();
       });
     } catch { clearTimeout(timer); resolve(); }

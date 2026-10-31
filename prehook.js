@@ -54,8 +54,13 @@
   // claims a given failure; a different value means the page re-armed a new
   // URL (lazy promotion) and a re-claim is required.
   const PENDING_ORIGINAL_ATTR = "data-bh-pending-original";
+  const FALLBACK_REARM_EVENT = "bh-image-rearmed";
 
   function restoreOriginal(el, meta) {
+    // Validate ownership before clearing anything: a stale callback must not
+    // discard metadata that now belongs to a newer source on the same element.
+    const token = meta.originalSrc ? resolveHttp(meta.originalSrc) : meta.originalSrcset;
+    if (fallbackMeta.get(el) !== meta || el.getAttribute(PENDING_ORIGINAL_ATTR) !== token) return;
     fallbackMeta.delete(el);
     const t = fallbackTimers.get(el);
     if (t !== undefined) { clearTimeout(t); fallbackTimers.delete(el); }
@@ -70,8 +75,8 @@
       return;
     }
     try { el.setAttribute(RESTORED_ATTR, ""); } catch {}
-    // Never proxy this element again, otherwise the restored original is
-    // re-proxied and a failing proxy is hit in an endless loop.
+    // Keep this element on the direct path for the failed URL. A later setter
+    // call clears the marker only when it supplies a different, non-failed URL.
     markFailed(el);
     try { if (meta.originalSrcset) nativeSetSrcset(el, meta.originalSrcset); } catch {}
     try { if (meta.originalSrc) nativeSetSrc(el, meta.originalSrc); } catch {}
@@ -103,7 +108,7 @@
   const PRIVATE_HOST_PATTERNS = [
     "^https?://(?:localhost|[^/?#:]*\\.localhost|[^/?#:]*\\.local|[^/?#:.\\[]+)(?::[0-9]+)?(?:[/?#]|$)",
     "^https?://(?:127|10|192\\.168|172\\.(?:1[6-9]|2[0-9]|3[01])|169\\.254)\\.[0-9.]+(?::[0-9]+)?(?:[/?#]|$)",
-    "^https?://\\[(?:::1|f[cd][0-9a-f]*:[0-9a-f:]*|fe80:[0-9a-f:%.a-z]*)\\](?::[0-9]+)?(?:[/?#]|$)"
+    "^https?://\\[(?:::1|f[cd][0-9a-f]*:[0-9a-f:]*|fe[89ab][0-9a-f]:[0-9a-f:%.a-z]*|::ffff:(?:7f[0-9a-f]{2}|a[0-9a-f]{2}|c0a8|ac1[0-9a-f]|a9fe):[0-9a-f]{1,4})\\](?::[0-9]+)?(?:[/?#]|$)"
   ];
   const PRIVATE_HOST_RE = PRIVATE_HOST_PATTERNS.map(pattern => new RegExp(pattern, "i"));
   const isPrivateHttpUrl = absolute => PRIVATE_HOST_RE.some(pattern => pattern.test(absolute));
@@ -121,6 +126,38 @@
   const isConfiguredProxyUrl = u => {
     try { return !!proxyOrigin && new URL(u).origin === proxyOrigin; } catch { return false; }
   };
+
+  // FAILED_ATTR is a one-shot guard for the URL that failed, not a permanent
+  // ban on the DOM element. Sites routinely recycle <img> nodes in galleries,
+  // virtual lists and lazy loaders. Re-arm a node when it receives a genuinely
+  // new URL, while keeping URLs already known to fail on the direct path.
+  function clearFailedForReplacement(el, values) {
+    // The pending restore phase is also reusable: FAILED_ATTR is only added
+    // after the bypass is confirmed, while RESTORED/PENDING are set earlier.
+    if (!isFailed(el) && !el.hasAttribute(RESTORED_ATTR) && !el.hasAttribute(PENDING_ORIGINAL_ATTR)) return;
+    const candidates = Array.isArray(values) ? values : [values];
+    let hasReplacement = false;
+    for (const value of candidates) {
+      const u = safeURL(String(value || ""));
+      if (!u || !/^https?:$/.test(u.protocol)) continue;
+      u.hash = "";
+      if (isConfiguredProxyUrl(u.href) || failedUrls.has(u.href)) continue;
+      hasReplacement = true;
+      break;
+    }
+    if (!hasReplacement) return;
+    // Notify the isolated world too: its WeakMaps are not shared with MAIN.
+    // The event only disarms stale fallback state; it never changes page data.
+    try { el.dispatchEvent(new Event(FALLBACK_REARM_EVENT, { bubbles: true, composed: true })); } catch {}
+    try {
+      el.removeAttribute(FAILED_ATTR);
+      el.removeAttribute(RESTORED_ATTR);
+      el.removeAttribute(PENDING_ORIGINAL_ATTR);
+    } catch {}
+    fallbackMeta.delete(el);
+    const timer = fallbackTimers.get(el);
+    if (timer !== undefined) { clearTimeout(timer); fallbackTimers.delete(el); }
+  }
 
   let srcsetCache = new WeakMap();
   let destroyed = false;
@@ -143,6 +180,12 @@
       if (!isConfiguredProxyUrl(cur)) return;
       const meta = fallbackMeta.get(el);
       if (!meta) return; // this world never armed the element
+      // Record the exact responsive candidate that failed (not every srcset
+      // candidate), including when the worker's retry notification is delayed.
+      try {
+        const original = new URL(cur).searchParams.get("url");
+        if (original) { const u = new URL(original); u.hash = ""; failedUrls.add(u.href); }
+      } catch {}
       // Claim token: the original this world's meta currently represents.
       // A lazy loader may promote a new URL after the first failure; the
       // setter patches then re-arm meta, and the token mismatch lets the new
@@ -168,19 +211,26 @@
       meta.failedProxyUrl = cur;
       const oldT = fallbackTimers.get(el);
       if (oldT !== undefined) clearTimeout(oldT);
-      fallbackTimers.set(el, setTimeout(() => {
-        if (destroyed) return;
+      const timer = setTimeout(() => {
+        // A cancelled callback can already be queued. It may act only while
+        // this exact timer still owns the element's pending restore.
+        if (destroyed || fallbackTimers.get(el) !== timer) return;
+        fallbackTimers.delete(el);
         const m = fallbackMeta.get(el);
         if (m) restoreOriginal(el, m);
-      }, 1500)); // > the worker's 250 ms fallback flush + slow DNR commits
+      }, 1500); // > the worker's 250 ms fallback flush + slow DNR commits
+      fallbackTimers.set(el, timer);
     }, true);
     // B5: a successful load disarms the fallback (a later, unrelated failing
     // src must not trigger a restore).
+    // Keep one load listener per element. Sites reuse image nodes after
+    // successful loads; making this listener one-shot leaves the permanent
+    // fallbackHandlers marker set and prevents cleanup for later sources.
     el.addEventListener("load", () => {
       fallbackMeta.delete(el);
       const t = fallbackTimers.get(el);
       if (t !== undefined) { clearTimeout(t); fallbackTimers.delete(el); }
-    }, { capture: true, once: true });
+    }, { capture: true });
   }
 
   function updateProxyConfig(next) {
@@ -190,7 +240,7 @@
       const parsed = new URL(base);
       // KEEP IN SYNC with usableProxyBase() in service-worker.js: a trailing
       // empty "?" survives in href and would make the separator emit "?&…".
-      if (!/^https?:$/.test(parsed.protocol)) base = "";
+      if (!/^https?:$/.test(parsed.protocol) || parsed.searchParams.has("url")) base = "";
       else { parsed.hash = ""; base = parsed.href.endsWith("?") ? parsed.href.slice(0, -1) : parsed.href; }
     } catch { base = ""; }
     const quality = Math.max(1, Math.min(100, Number(opts.quality ?? 60) || 60));
@@ -580,6 +630,7 @@
     get: srcDesc.get,
     set(value) {
       try {
+        clearFailedForReplacement(this, [String(value)]);
         const decided = isFailed(this) ? String(value) : decideSrc(String(value));
         if (decided === null) {
           this.dataset.bhPendingSrc = String(value);
@@ -602,6 +653,7 @@
       set(value) {
         try {
           const v = String(value || "");
+          clearFailedForReplacement(this, parseSrcset(v).map(candidate => candidate.url));
           if (!ready || !opts) {
             if (!srcsetNeedsHold(v)) { nativeSetSrcset(this, v); return; }
             this.dataset.bhPendingSrcset = v;
@@ -720,6 +772,7 @@
 
       if (this instanceof HTMLImageElement && (n === "src" || n === "srcset")) {
         if (n === "src") {
+          clearFailedForReplacement(this, [String(value)]);
           const decided = isFailed(this) ? String(value) : decideSrc(String(value));
           if (decided === null) {
             this.dataset.bhPendingSrc = String(value);
@@ -730,6 +783,7 @@
           return setAttr.call(this, "src", decided);
         }
         const v = String(value || "");
+        clearFailedForReplacement(this, parseSrcset(v).map(candidate => candidate.url));
         if (!ready || !opts) {
           if (!srcsetNeedsHold(v)) return setAttr.call(this, "srcset", v);
           this.dataset.bhPendingSrcset = v;
@@ -815,8 +869,8 @@
   // ── One-shot fallback retry ───────────────────────────────────────────────
   // The service worker saw the PROXY fail for these original URLs and has
   // already installed a per-tab bypass rule for each, so re-requesting them now
-  // goes straight to the origin and can never reach the proxy again. Every
-  // element is retried at most once (FAILED_ATTR) — no loops.
+  // goes straight to the origin and can never reach the proxy again. A failed
+  // URL is retried at most once; its element may later receive a different URL.
   const RELOADED_ATTR = "data-bh-reloaded";
   const CSS_URL_RE = /url\(\s*(?:(['"])(.*?)\1|([^)]*?))\s*\)/gi;
   const stripHash = u => { const r = safeURL(u); if (!r) return null; r.hash = ""; return r.href; };
@@ -869,7 +923,7 @@
           continue;
         }
         const text = r.cssText;
-        if (!text || text.indexOf("url(") < 0) continue;
+        if (!text || !/\burl\(/i.test(text)) continue;
         if (r.constructor && r.constructor.name !== "CSSStyleRule" && r.cssRules) {
           hit = retryRules(r, base, has, seen) || hit;
           continue;
@@ -956,12 +1010,12 @@
           }
           // Inline styles (any element, including the ones above).
           const style = el.getAttribute("style");
-          if (style && /\burl\(/i.test(style) && !el.hasAttribute(FAILED_ATTR + "-style")) {
+          if (style && /\burl\(/i.test(style)) {
             let next = style;
             for (const [p, o] of proxyToOriginal) if (next.includes(p)) next = next.split(p).join(o); // DOM-layer rewrite
             if (next !== style || cssUrls(style, el.baseURI).some(has)) {
-              try { el.setAttribute(FAILED_ATTR + "-style", ""); } catch {}
-              markFailed(el);
+              // Do not set FAILED_ATTR on the whole element: this background
+              // can be replaced later, and the per-URL failed set is sufficient.
               // Chrome skips re-parsing an identical style string, so toggle
               // insignificant trailing whitespace to force fresh image values.
               if (next === style) next = /\s$/.test(style) ? style.replace(/\s+$/, "") : style + " ";
