@@ -53,6 +53,9 @@ function createDomHarness() {
   const observers = [];
   const documentListeners = new Map();
   const windowListeners = new Map();
+  const timerCallbacks = new Map();
+  const cancelledTimers = new Set();
+  let nextTimerId = 0;
   const baseURI = 'https://page.example/articles/';
 
   function dataName(name) {
@@ -79,9 +82,23 @@ function createDomHarness() {
     getAttribute(name) { return this._attrs.has(String(name).toLowerCase()) ? this._attrs.get(String(name).toLowerCase()) : null; }
     hasAttribute(name) { return this._attrs.has(String(name).toLowerCase()); }
     removeAttribute(name) { this._attrs.delete(String(name).toLowerCase()); }
-    addEventListener(type, fn) {
+    addEventListener(type, fn, options = {}) {
       if (!this._listeners.has(type)) this._listeners.set(type, []);
-      this._listeners.get(type).push(fn);
+      const once = !!(options && typeof options === 'object' && options.once);
+      this._listeners.get(type).push({ fn, once });
+    }
+    dispatchEvent(event) {
+      this._dispatchedEvents ||= [];
+      this._dispatchedEvents.push(event.type);
+      const listeners = this._listeners.get(event.type) || [];
+      for (const entry of [...listeners]) {
+        entry.fn.call(this, event);
+        if (entry.once) {
+          const index = listeners.indexOf(entry);
+          if (index !== -1) listeners.splice(index, 1);
+        }
+      }
+      return true;
     }
     querySelectorAll(selector) {
       const tags = selector.split(',').map(s => s.trim().match(/^[a-z]+/i)?.[0]?.toUpperCase()).filter(Boolean);
@@ -167,7 +184,15 @@ function createDomHarness() {
   const context = {
     document, window, location: { hostname: 'page.example' },
     Element, HTMLImageElement, HTMLSourceElement, HTMLLinkElement, MutationObserver,
-    URL, setTimeout: () => 1, clearTimeout() {}, console, Math, WeakRef
+    Event: class Event { constructor(type, options = {}) { this.type = type; Object.assign(this, options); } },
+    URL,
+    setTimeout: (callback, delay = 0) => {
+      const id = ++nextTimerId;
+      timerCallbacks.set(id, { callback, delay });
+      return id;
+    },
+    clearTimeout: id => { cancelledTimers.add(id); },
+    console, Math, WeakRef
   };
   vm.createContext(context);
   vm.runInContext(prehook, context, { filename: 'prehook.js' });
@@ -196,7 +221,8 @@ function createDomHarness() {
     observer.callback([{ type: 'childList', addedNodes: [root] }]);
   }
 
-  return { context, document, documentElement, observers, Element, HTMLImageElement, HTMLSourceElement, HTMLLinkElement, publishSettings, notifyAdded };
+  return { context, document, documentElement, observers, Element, HTMLImageElement, HTMLSourceElement, HTMLLinkElement,
+    timerCallbacks, cancelledTimers, publishSettings, notifyAdded };
 }
 
 function assertProxied(url, original) {
@@ -373,20 +399,75 @@ test('parser-created responsive preload without href holds conflicting imagesrcs
   assert.equal(candidates[1][1], '1600w');
 });
 
-test('content script rewrites URLs in inline CSS background-image', () => {
-  const rewriteBgSource = extractFunction(content, 'rewriteBg');
+test('content script rewrites URL references across inline CSS declarations', () => {
+  const rewriteSource = extractFunction(content, 'rewriteInlineStyles');
   const sandbox = {
-    doneBg: new WeakSet(), active: true, failedEls: { has: () => false },
+    doneStyle: new WeakSet(), active: true, failedEls: { has: () => false },
     shouldSkip(url) { try { return !/^https?:$/.test(new URL(url).protocol) || new URL(url).origin === 'https://proxy.example'; } catch { return true; } },
     resolveHttp(url) { try { const u = new URL(url, 'https://page.example/'); return /^https?:$/.test(u.protocol) ? u.href : null; } catch { return null; } },
     buildProxyUrl(url) { return 'https://proxy.example/convert?url=' + encodeURIComponent(url); }
   };
   vm.createContext(sandbox);
-  vm.runInContext(`${rewriteBgSource}\nthis.__rewriteBg = rewriteBg;`, sandbox);
-  const el = { style: { backgroundImage: 'linear-gradient(red, blue), url("https://cdn.example/a.jpg?x=1&y=2"), url(https://cdn.example/b.webp)' } };
-  sandbox.__rewriteBg(el);
-  assert.match(el.style.backgroundImage, /https:\/\/proxy\.example\/convert\?url=/);
-  assert.equal((el.style.backgroundImage.match(/https:\/\/proxy\.example\/convert/g) || []).length, 2);
+  vm.runInContext(`${rewriteSource}\nthis.__rewrite = rewriteInlineStyles;`, sandbox);
+  const originalStyle = 'background-image:linear-gradient(red, blue), url("https://cdn.example/a.jpg?x=1&y=2"); border-image-source:url(https://cdn.example/b.webp); mask-image:URL(https://cdn.example/c.png)';
+  const el = {
+    getAttribute(name) { return name === 'style' ? this._style : null; },
+    setAttribute(name, value) { if (name === 'style') this._style = String(value); },
+    _style: originalStyle
+  };
+  sandbox.__rewrite(el);
+  assert.equal((el._style.match(/https:\/\/proxy\.example\/convert\?url=/g) || []).length, 3);
+  for (const original of ['https://cdn.example/a.jpg?x=1&y=2', 'https://cdn.example/b.webp', 'https://cdn.example/c.png']) {
+    assert.ok(el._style.includes(encodeURIComponent(original)), `rewritten style retains ${original}`);
+  }
+});
+
+test('fallback load cleanup remains armed after an image element is reused', () => {
+  const h = createDomHarness();
+  h.publishSettings({ redirect: false });
+  const image = new h.HTMLImageElement();
+
+  image.src = 'https://cdn.example/first-success.png';
+  image.dispatchEvent({ type: 'load' });
+
+  const second = 'https://cdn.example/second-success.png';
+  image.src = second;
+  image.dispatchEvent({ type: 'error' });
+  const timerEntry = [...h.timerCallbacks.entries()].filter(([, entry]) => entry.delay === 1500).at(-1);
+  assert.ok(timerEntry, 'second proxy error schedules a fallback timer');
+
+  image.dispatchEvent({ type: 'load' });
+  assert.ok(h.cancelledTimers.has(timerEntry[0]), 'the second successful load cancels its fallback timer');
+  timerEntry[1].callback();
+  assert.equal(image.getAttribute('src'), image.src, 'a stale timer cannot restore the successfully loaded proxy URL');
+
+  // Both execution worlds use the same one-per-element listener lifecycle.
+  for (const source of [prehook, content]) {
+    const arm = extractFunction(source, 'armProxyFallback');
+    assert.doesNotMatch(arm, /capture:\s*true,\s*once:\s*true/);
+  }
+});
+
+test('private host guards cover all IPv6 link-local space and private IPv4-mapped IPv6', () => {
+  const h = createDomHarness();
+  h.publishSettings({ redirect: false });
+  const privateUrls = [
+    'http://[fe80::1]/image.png',
+    'http://[fe90::1]/image.png',
+    'http://[fea0::1]/image.png',
+    'http://[febf::1]/image.png',
+    'http://[::ffff:127.0.0.1]/image.png',
+    'http://[::ffff:10.0.0.1]/image.png',
+    'http://[::ffff:192.168.1.1]/image.png',
+    'http://[::ffff:172.16.0.1]/image.png',
+    'http://[::ffff:172.31.255.255]/image.png',
+    'http://[::ffff:169.254.1.1]/image.png'
+  ];
+  for (const url of privateUrls) {
+    const image = new h.HTMLImageElement();
+    image.src = url;
+    assert.equal(image.getAttribute('src'), url, `${url} must stay direct`);
+  }
 });
 
 test('DOM fallback preserves private/intranet exemptions and normalizes proxy URLs', () => {
@@ -424,6 +505,86 @@ test('DOM fallback preserves private/intranet exemptions and normalizes proxy UR
   const invalidProxyImage = new h.HTMLImageElement();
   invalidProxyImage.src = publicUrl;
   assert.equal(invalidProxyImage.getAttribute('src'), publicUrl, 'invalid proxy values do not activate rewriting');
+});
+
+test('a reused image element is re-armed for a new URL but keeps known failures direct', () => {
+  const h = createDomHarness();
+  const failed = 'https://cdn.example/known-failure.png';
+  h.publishSettings({ redirect: false, failed: [failed] });
+
+  const propertyImage = new h.HTMLImageElement();
+  propertyImage.setAttribute('data-bh-failed', '');
+  propertyImage.setAttribute('data-bh-restored', '');
+  propertyImage.setAttribute('data-bh-pending-original', failed);
+  propertyImage.src = failed;
+  assert.equal(propertyImage.getAttribute('src'), failed, 'the same failed URL remains direct');
+  assert.ok(propertyImage.hasAttribute('data-bh-failed'), 'same failed URL keeps its one-shot guard');
+  const fresh = 'https://cdn.example/reused-node-new.png';
+  propertyImage.src = fresh;
+  assertProxied(propertyImage.getAttribute('src'), fresh);
+  for (const marker of ['data-bh-failed', 'data-bh-restored', 'data-bh-pending-original']) {
+    assert.equal(propertyImage.hasAttribute(marker), false, `${marker} clears for a new URL`);
+  }
+
+  const attributeImage = new h.HTMLImageElement();
+  attributeImage.setAttribute('data-bh-failed', '');
+  attributeImage.setAttribute('data-bh-pending-original', failed);
+  const freshAttribute = 'https://cdn.example/reused-node-attribute.png';
+  attributeImage.setAttribute('src', freshAttribute);
+  assertProxied(attributeImage.getAttribute('src'), freshAttribute);
+
+  const srcsetImage = new h.HTMLImageElement();
+  srcsetImage.setAttribute('data-bh-failed', '');
+  srcsetImage.setAttribute('data-bh-restored', '');
+  srcsetImage.setAttribute('data-bh-pending-original', failed);
+  const freshSrcset = 'https://cdn.example/reused-node-srcset.png';
+  srcsetImage.srcset = `${failed} 1x, ${freshSrcset} 2x`;
+  const candidates = srcsetImage.getAttribute('srcset').split(', ').map(part => part.split(' ')[0]);
+  assert.equal(candidates[0], failed, 'known failed srcset candidate remains direct');
+  assertProxied(candidates[1], freshSrcset);
+  assert.equal(srcsetImage.hasAttribute('data-bh-failed'), false, 'new srcset clears stale element marker');
+  assert.equal(srcsetImage.hasAttribute('data-bh-restored'), false, 'new srcset clears stale restore marker');
+
+  // Before bypass confirmation, RESTORED/PENDING are present but FAILED is
+  // not yet set. Reusing the node in this window must still disarm old state.
+  const pendingImage = new h.HTMLImageElement();
+  pendingImage.setAttribute('data-bh-restored', '');
+  pendingImage.setAttribute('data-bh-pending-original', failed);
+  const pendingReplacement = 'https://cdn.example/pending-replacement.png';
+  pendingImage.src = pendingReplacement;
+  assertProxied(pendingImage.getAttribute('src'), pendingReplacement);
+  assert.equal(pendingImage.hasAttribute('data-bh-restored'), false);
+  assert.equal(pendingImage.hasAttribute('data-bh-pending-original'), false);
+  assert.ok(pendingImage._dispatchedEvents.includes('bh-image-rearmed'),
+    'MAIN-world rearm notification lets the isolated world clear its separate fallback state');
+});
+
+test('a cancelled fallback timeout cannot restore a newer source on a recycled element', () => {
+  const h = createDomHarness();
+  h.publishSettings({ redirect: false });
+  const image = new h.HTMLImageElement();
+  const first = 'https://cdn.example/first-failure.png';
+  image.src = first;
+  image.dispatchEvent({ type: 'error' });
+  const firstTimer = [...h.timerCallbacks.entries()].filter(([, entry]) => entry.delay === 1500).at(-1)?.[0];
+  assert.ok(firstTimer, 'first proxy error schedules a fallback timeout');
+
+  const second = 'https://cdn.example/second-failure.png';
+  image.src = second;
+  image.dispatchEvent({ type: 'error' });
+  const secondTimer = [...h.timerCallbacks.entries()].filter(([, entry]) => entry.delay === 1500).at(-1)?.[0];
+  assert.ok(secondTimer && secondTimer !== firstTimer, 'new failure owns a distinct timeout');
+  assert.ok(h.cancelledTimers.has(firstTimer), 'rearm cancels the old timeout');
+  assert.equal(image.getAttribute('data-bh-pending-original'), new URL(second).href);
+
+  // Simulate a cancelled callback that had already entered the task queue.
+  h.timerCallbacks.get(firstTimer).callback();
+  assert.equal(image.getAttribute('src'), image.src, 'stale callback must not replace the current proxy URL');
+  assert.equal(image.getAttribute('data-bh-pending-original'), new URL(second).href,
+    'stale callback leaves the newer restore claim intact');
+
+  h.timerCallbacks.get(secondTimer).callback();
+  assert.equal(image.getAttribute('src'), new URL(second).href, 'the current timeout restores its own original URL');
 });
 
 test('duplicated patterns stay in sync across prehook, content script and service worker', () => {
@@ -516,6 +677,35 @@ test('service worker never broadens CSP removal when response-header matching is
   assert.equal(suspendedRules.some(rule => rule.id === 10), false, 'suspension disables redirects');
 });
 
+test('CSS fallback retries uppercase URL() references in stylesheet rules', () => {
+  const safeURL = (value, base) => { try { return new URL(value, base); } catch { return null; } };
+  const stripHash = value => { const url = new URL(value); url.hash = ''; return url.href; };
+  const sandbox = {
+    URL, Set, CSS_URL_RE: /url\(\s*(?:(['\"])(.*?)\1|([^)]*?))\s*\)/gi,
+    document: { baseURI: 'https://page.example/' },
+    safeURL, stripHash
+  };
+  vm.createContext(sandbox);
+  const helpers = [extractFunction(prehook, 'cssUrls'), extractFunction(prehook, 'retryRules')].join('\n');
+  vm.runInContext(`${helpers}\nthis.retry = retryRules;`, sandbox);
+
+  const original = 'https://cdn.example/failed-background.png';
+  const cssText = '.hero { background-image: URL("https://cdn.example/failed-background.png"); }';
+  const rules = [{ constructor: { name: 'CSSStyleRule' }, cssText }];
+  const inserted = [];
+  const sheet = {
+    get cssRules() { return rules; },
+    deleteRule(index) { rules.splice(index, 1); },
+    insertRule(text, index) {
+      inserted.push(text);
+      rules.splice(index, 0, { constructor: { name: 'CSSStyleRule' }, cssText: text });
+    }
+  };
+  const hit = sandbox.retry(sheet, 'https://page.example/', url => url === original, new Set());
+  assert.equal(hit, true, 'uppercase URL() still identifies the failed image URL');
+  assert.deepEqual(inserted, [cssText], 'the matching stylesheet rule is reinserted to retry it');
+});
+
 test('service worker builds exact bypass matches for URLs containing DNR filter metacharacters', () => {
   const helper = extractFunction(serviceWorker, 'bypassCondition');
   const decode = extractFunction(serviceWorker, 'bypassUrlFromRule');
@@ -539,13 +729,17 @@ test('fallback retry is not consumed when the DNR bypass update fails', async ()
   const sources = ['bypassCondition', 'bypassUrlFromRule', 'originalFromProxyUrl', 'addBypass', 'scheduleFallback', 'markFallbackSeen', 'flushFallbacks']
     .map(name => extractFunction(serviceWorker, name));
   const messages = [];
+  const installedUpdates = [];
   let timer = null;
   const sandbox = {
     Promise, Number, JSON, Error, Set, Map, RegExp, URL, decodeURIComponent,
     setImmediate,
     chrome: {
       declarativeNetRequest: {
-        updateSessionRules: async () => { if (sandbox.__dnrFail) throw new Error('DNR update failed'); }
+        updateSessionRules: async update => {
+          if (sandbox.__dnrFail) throw new Error('DNR update failed');
+          installedUpdates.push(update);
+        }
       },
       tabs: {
         sendMessage: (...args) => { messages.push(args); return Promise.resolve(); }
@@ -591,7 +785,8 @@ test('fallback retry is not consumed when the DNR bypass update fails', async ()
         return new Promise(resolve => setImmediate(() => setImmediate(resolve)));
       },
       seenCount: () => fallbackSeen.size,
-      messageCount: () => messages.length
+      messageCount: () => messages.length,
+      addBypass: (tabId, urls) => addBypass(tabId, urls)
     };
   `, sandbox);
   sandbox.api.messageCount = () => messages.length;
@@ -606,10 +801,26 @@ test('fallback retry is not consumed when the DNR bypass update fails', async ()
 
   sandbox.__dnrFail = false;
   sandbox.api.fail({ url: proxyUrl, tabId: 7, frameId: 0 });
+  const secondOriginal = 'https://cdn.example/frame-two.png';
+  const secondProxy = 'https://proxy.example/api?url=' + encodeURIComponent(secondOriginal);
+  sandbox.api.fail({ url: secondProxy, tabId: 7, frameId: 4 });
   await sandbox.api.flush();
   await new Promise(resolve => setTimeout(resolve, 10));
-  assert.equal(sandbox.api.seenCount(), 1, 'successful DNR update consumes exactly one retry');
-  assert.equal(sandbox.api.messageCount(), 1, 'confirmed bypass asks the page to retry');
+  assert.equal(sandbox.api.seenCount(), 2, 'successful DNR update consumes each retry once');
+  assert.equal(sandbox.api.messageCount(), 1, 'same-tab failures from different frames are batched');
+  assert.equal(messages[0].length, 2, 'retry notification is broadcast to all frames, not frame-scoped');
+  assert.equal(messages[0][0], 7);
+  assert.equal(messages[0][1].items.length, 2);
+  assert.deepEqual(JSON.parse(JSON.stringify(installedUpdates[0].addRules[0].condition.tabIds)), [7],
+    'bypass rule is limited to the failing tab');
+
+  const unknownOriginal = 'https://cdn.example/no-tab.png';
+  await sandbox.api.addBypass(-1, [unknownOriginal]);
+  sandbox.api.fail({ url: 'https://proxy.example/api?url=' + encodeURIComponent(unknownOriginal), tabId: -1, frameId: 0 });
+  await sandbox.api.flush();
+  assert.equal(installedUpdates.length, 1, 'unknown tab must never install a global DNR allow rule');
+  assert.equal(sandbox.api.seenCount(), 2, 'unknown-tab failure is not consumed as a successful retry');
+  assert.equal(sandbox.api.messageCount(), 1, 'unknown-tab failure is not sent to a page');
 });
 
 test('service worker waits for startup recovery, serializes concurrent stats resets, and preserves later activity', () => {
@@ -694,6 +905,78 @@ test('service worker gates stats mirrors and flushes until startup recovery fini
     'pending activity is mirrored and scheduled for a normal flush after startup');
 });
 
+test('service worker publishes the actual runtime after every DNR update is rejected', async () => {
+  const runScenario = async ({ failures, currentRules, inspectFails = false }) => {
+    const published = [];
+    let updateCount = 0;
+    let finished = 0;
+    const chrome = {
+      runtime: { lastError: null },
+      declarativeNetRequest: {
+        updateDynamicRules(_update, callback) {
+          updateCount++;
+          setImmediate(() => {
+            chrome.runtime.lastError = updateCount <= failures ? { message: 'update rejected' } : null;
+            callback();
+            chrome.runtime.lastError = null;
+          });
+        },
+        getDynamicRules(callback) {
+          setImmediate(() => {
+            chrome.runtime.lastError = inspectFails ? { message: 'read rejected' } : null;
+            callback(currentRules);
+            chrome.runtime.lastError = null;
+          });
+        }
+      },
+      storage: { sync: { get(_defaults, callback) { callback({ enabled: true, proxyBase: 'https://proxy.example' }); } } }
+    };
+    const sandbox = {
+      chrome, RULE_ID_REDIRECT_IMAGE: 10, ALL_RULE_IDS: [1, 2, 10], DEFAULTS: {}, setImmediate,
+      readSuspended(callback) { callback(false); },
+      buildRules(_opts, _noHeaderMatch, suspended) { return suspended ? [{ id: 2 }] : [{ id: 10 }]; },
+      publishRuntime(value) { published.push(value); }
+    };
+    vm.createContext(sandbox);
+    vm.runInContext(`${extractFunction(serviceWorker, 'doRefreshRules')}\nthis.run = doRefreshRules;`, sandbox);
+    await new Promise(resolve => sandbox.run(() => { finished++; resolve(); }));
+    return { published, updateCount, finished };
+  };
+
+  const retainedRedirect = await runScenario({ failures: 3, currentRules: [{ id: 10 }] });
+  assert.deepEqual(JSON.parse(JSON.stringify(retainedRedirect.published)), [{ redirect: true, suspended: false }],
+    'a rejected update must not tell content scripts that the retained redirect disappeared');
+  assert.equal(retainedRedirect.updateCount, 3);
+  assert.equal(retainedRedirect.finished, 1);
+
+  const noRedirect = await runScenario({ failures: 3, currentRules: [] });
+  assert.deepEqual(JSON.parse(JSON.stringify(noRedirect.published)), [{ redirect: false, suspended: false }],
+    'when no redirect rule exists, the DOM fallback may safely take ownership');
+
+  const headerOnlyAccepted = await runScenario({ failures: 2, currentRules: [] });
+  assert.deepEqual(JSON.parse(JSON.stringify(headerOnlyAccepted.published)), [{ redirect: false, suspended: false }],
+    'a successfully installed header-only fallback leaves DOM interception available');
+
+  const inspectionFailed = await runScenario({ failures: 3, currentRules: [{ id: 10 }], inspectFails: true });
+  assert.deepEqual(inspectionFailed.published, [], 'failed inspection preserves the last known runtime instead of inventing one');
+  assert.equal(inspectionFailed.finished, 1, 'all error paths release the refresh lock');
+});
+
+test('service worker activates DOM fallback when the DNR API is unavailable', () => {
+  const published = [];
+  let finished = 0;
+  const sandbox = {
+    chrome: {},
+    readSuspended(callback) { callback(true); },
+    publishRuntime(value) { published.push(value); }
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(`${extractFunction(serviceWorker, 'doRefreshRules')}\nthis.run = doRefreshRules;`, sandbox);
+  sandbox.run(() => { finished++; });
+  assert.deepEqual(JSON.parse(JSON.stringify(published)), [{ redirect: false, suspended: true }]);
+  assert.equal(finished, 1, 'missing DNR API still releases the refresh lifecycle');
+});
+
 test('architecture markers: network redirect is the primary layer, DOM layers defer to it', () => {
   assert.match(serviceWorker, /type: "redirect", redirect: \{ regexSubstitution: substitution \}/);
   assert.match(serviceWorker, /RULE_ID_ALLOW_PROXY/);
@@ -704,6 +987,20 @@ test('architecture markers: network redirect is the primary layer, DOM layers de
   assert.match(prehook, /function retryFailed\(/);
   assert.ok(prehook.includes('/\\burl\\(/i.test(style)'),
     'inline-style fallback retry is case-insensitive');
+});
+
+test('late failed-list responses merge into content state and republish to prehook', () => {
+  assert.match(content, /for \(const url of res\.urls\) if \(typeof url === "string"\) failedUrls\.add\(stripHash\(url\)\)/);
+  assert.match(content, /if \(opts\) publishPrehookSettings\(opts\)/);
+  assert.doesNotMatch(content, /failedUrls = new Set\(res\.urls/);
+  assert.match(prehook, /el\.getAttribute\(PENDING_ORIGINAL_ATTR\) !== token/);
+  assert.match(content, /el\.getAttribute\(PENDING_ORIGINAL_ATTR\) !== token/);
+  assert.match(prehook, /bh-image-rearmed/);
+  assert.match(content, /document\.addEventListener\(FALLBACK_REARM_EVENT, onFallbackRearm, true\)/);
+  assert.match(prehook, /fallbackTimers\.get\(el\) !== timer/);
+  assert.match(content, /fallbackTimers\.get\(el\) !== timer/);
+  assert.doesNotMatch(prehook, /setAttribute\(FAILED_ATTR \+ "-style"/,
+    'style fallback must not permanently blacklist its entire element');
 });
 
 test('prehook excludes domains with the same tokenizer as the other layers (any whitespace, commas, URLs)', () => {
@@ -721,6 +1018,39 @@ test('prehook excludes domains with the same tokenizer as the other layers (any 
   assertProxied(other.getAttribute('src'), 'https://f.example/x.png');
 });
 
+test('proxy bases cannot predefine the reserved url query parameter', () => {
+  const sb = { URL };
+  vm.createContext(sb);
+  vm.runInContext(['usableProxyBase', 'setProxyOrigin'].map(n => extractFunction(serviceWorker, n)).join('\n') +
+    '\nvar configuredProxyOrigin = "";\nthis.set = v => { setProxyOrigin(v); return configuredProxyOrigin; };', sb);
+  assert.equal(sb.set('https://proxy.example/convert?token=abc'), 'https://proxy.example');
+  assert.equal(sb.set('https://proxy.example/convert?url=stale'), '');
+  assert.equal(sb.set('https://proxy.example/convert?token=abc&url=stale'), '');
+
+  const h = createDomHarness();
+  h.publishSettings({ redirect: false, proxyBase: 'https://proxy.example/convert?url=stale' });
+  const img = new h.HTMLImageElement();
+  const original = 'https://cdn.example/image.png';
+  img.src = original;
+  assert.equal(img.getAttribute('src'), original, 'DOM fallback must not build an ambiguous proxy URL');
+
+  const contentSandbox = {
+    URL,
+    opts: { proxyBase: 'https://proxy.example/convert?url=stale', quality: 60, maxWidth: 768, grayscale: false },
+    proxyConfig: null, proxyOrigin: '', proxyHost: ''
+  };
+  vm.createContext(contentSandbox);
+  vm.runInContext(`${extractFunction(content, 'updateProxyConfig')}\nthis.apply = updateProxyConfig;`, contentSandbox);
+  contentSandbox.apply(contentSandbox.opts);
+  assert.equal(contentSandbox.proxyConfig.base, '', 'isolated-world fallback uses the same validation');
+
+  const optionsSandbox = { URL };
+  vm.createContext(optionsSandbox);
+  vm.runInContext(`${extractFunction(fs.readFileSync(path.join(ROOT, 'options.js'), 'utf8'), 'isValidProxyBase')}\nthis.validate = isValidProxyBase;`, optionsSandbox);
+  assert.equal(optionsSandbox.validate('https://proxy.example/convert?token=abc'), true);
+  assert.equal(optionsSandbox.validate('https://proxy.example/convert?url=stale'), false);
+});
+
 test('service worker only derives a proxy origin from http(s) proxy URLs', () => {
   const sb = { URL };
   vm.createContext(sb);
@@ -728,7 +1058,7 @@ test('service worker only derives a proxy origin from http(s) proxy URLs', () =>
     '\nvar configuredProxyOrigin = "";\nthis.set = v => { setProxyOrigin(v); return configuredProxyOrigin; };', sb);
   assert.equal(sb.set('https://proxy.example/convert?k=1#frag'), 'https://proxy.example');
   assert.equal(sb.set('http://localhost:3000/api'), 'http://localhost:3000');
-  for (const bad of ['', '   ', 'not a url', 'ftp://proxy.example/x', 'javascript:alert(1)', 'data:text/plain,hi']) {
+  for (const bad of ['', '   ', 'not a url', 'ftp://proxy.example/x', 'javascript:alert(1)', 'data:text/plain,hi', 'https://proxy.example/convert?url=stale']) {
     assert.equal(sb.set(bad), '', `${JSON.stringify(bad)} must not produce an origin`);
   }
 });
