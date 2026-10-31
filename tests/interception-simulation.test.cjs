@@ -11,6 +11,7 @@ const ROOT = path.resolve(__dirname, '..');
 const prehook = fs.readFileSync(path.join(ROOT, 'prehook.js'), 'utf8');
 const content = fs.readFileSync(path.join(ROOT, 'content.js'), 'utf8');
 const popupSource = fs.readFileSync(path.join(ROOT, 'popup.js'), 'utf8');
+const optionsSource = fs.readFileSync(path.join(ROOT, 'options.js'), 'utf8');
 const serviceWorker = fs.readFileSync(path.join(ROOT, 'service-worker.js'), 'utf8');
 
 
@@ -706,6 +707,100 @@ test('CSS fallback retries uppercase URL() references in stylesheet rules', () =
   assert.deepEqual(inserted, [cssText], 'the matching stylesheet rule is reinserted to retry it');
 });
 
+test('picture fallback restores a failed conflict-proxy source candidate to its original URL', () => {
+  const sandbox = {
+    URL,
+    safeURL(value, base) { try { return new URL(value, base); } catch { return null; } }
+  };
+  vm.createContext(sandbox);
+  vm.runInContext([
+    extractFunction(prehook, 'parseSrcset'),
+    extractFunction(prehook, 'retryPictureSources')
+  ].join('\n') + '\nthis.retry = retryPictureSources;', sandbox);
+
+  const original = 'https://cdn.example/picture-conflict.png?w=40&quality=80';
+  const proxy = `https://proxy.example/convert?url=${encodeURIComponent(original)}&jpeg=0&bw=0&quality=60`;
+  const source = {
+    baseURI: 'https://page.example/',
+    value: `${proxy} 2x, https://cdn.example/other.png 3x`,
+    getAttribute(name) { return name === 'srcset' ? this.value : null; }
+  };
+  const picture = { querySelectorAll(selector) { return selector === 'source' ? [source] : []; } };
+  const proxyToOriginal = new Map([[proxy, original]]);
+  const matched = [];
+  const has = value => { if (value === original) matched.push(value); return value === original; };
+  const setAttribute = function (name, value) { if (name === 'srcset') this.value = String(value); };
+
+  assert.equal(sandbox.retry(picture, 'https://page.example/', has, proxyToOriginal, setAttribute), true);
+  assert.deepEqual(matched, [original], 'the proxy candidate is checked against its original failed URL');
+  assert.equal(source.value, `${original} 2x, https://cdn.example/other.png 3x`, 'only the failed candidate is restored and descriptors are preserved');
+});
+
+test('picture fallback retries a raw DNR source candidate without changing other candidates', () => {
+  const sandbox = {
+    URL,
+    safeURL(value, base) { try { return new URL(value, base); } catch { return null; } }
+  };
+  vm.createContext(sandbox);
+  vm.runInContext([
+    extractFunction(prehook, 'parseSrcset'),
+    extractFunction(prehook, 'retryPictureSources')
+  ].join('\n') + '\nthis.retry = retryPictureSources;', sandbox);
+
+  const original = 'https://cdn.example/picture-raw.png?token=one';
+  const other = 'https://cdn.example/picture-other.png';
+  const source = {
+    baseURI: 'https://page.example/',
+    value: `${other} 1x, ${original} 2x`,
+    getAttribute(name) { return name === 'srcset' ? this.value : null; }
+  };
+  const picture = { querySelectorAll(selector) { return selector === 'source' ? [source] : []; } };
+  const matched = [];
+  const setAttribute = function (name, value) { if (name === 'srcset') this.value = String(value); };
+
+  assert.equal(sandbox.retry(picture, 'https://page.example/', value => {
+    if (value === original) matched.push(value);
+    return value === original;
+  }, new Map(), setAttribute), true);
+  assert.deepEqual(matched, [original], 'the raw DNR URL matches the failed original');
+  assert.equal(source.value, `${other} 1x, ${original} 2x`, 'other candidates and descriptors remain intact');
+});
+
+test('a changed picture source clears stale fallback state on its parent image', () => {
+  const image = {};
+  const received = [];
+  const sandbox = {
+    clearFailedForReplacement(target, values) { received.push({ target, values }); }
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(`${extractFunction(prehook, 'clearPictureImageFailure')}\nthis.clear = clearPictureImageFailure;`, sandbox);
+
+  const picture = { querySelector(selector) { return selector === 'img' ? image : null; } };
+  const source = { closest(selector) { return selector === 'picture' ? picture : null; } };
+  const candidates = ['https://cdn.example/new-source.png'];
+  sandbox.clear(source, candidates);
+  assert.equal(received.length, 1);
+  assert.equal(received[0].target, image);
+  assert.equal(received[0].values, candidates);
+});
+
+test('incoming quality and width changes update reset baselines without clobbering dirty inputs', () => {
+  const sandbox = { dirty: { quality: true, width: true } };
+  vm.createContext(sandbox);
+  vm.runInContext(`${extractFunction(optionsSource, 'mergeIncomingSetting')}\nthis.merge = mergeIncomingSetting;`, sandbox);
+
+  const applied = [];
+  assert.equal(sandbox.merge({ newValue: 45 }, 'quality', 60, value => applied.push(value)), 45);
+  assert.equal(sandbox.merge({ newValue: 720 }, 'width', 1280, value => applied.push(value)), 720);
+  assert.deepEqual(applied, [], 'dirty controls keep their current edits');
+
+  sandbox.dirty.quality = false;
+  sandbox.dirty.width = false;
+  assert.equal(sandbox.merge({ newValue: 45 }, 'quality', 60, value => applied.push(value)), 45);
+  assert.equal(sandbox.merge({ newValue: 720 }, 'width', 1280, value => applied.push(value)), 720);
+  assert.deepEqual(applied, [45, 720], 'clean controls apply the newest stored values');
+});
+
 test('service worker builds exact bypass matches for URLs containing DNR filter metacharacters', () => {
   const helper = extractFunction(serviceWorker, 'bypassCondition');
   const decode = extractFunction(serviceWorker, 'bypassUrlFromRule');
@@ -738,6 +833,7 @@ test('fallback retry is not consumed when the DNR bypass update fails', async ()
       declarativeNetRequest: {
         updateSessionRules: async update => {
           if (sandbox.__dnrFail) throw new Error('DNR update failed');
+          if (sandbox.__dnrGate) await new Promise(resolve => { sandbox.__releaseDnr = resolve; });
           installedUpdates.push(update);
         }
       },
@@ -746,6 +842,8 @@ test('fallback retry is not consumed when the DNR bypass update fails', async ()
       }
     },
     __dnrFail: true,
+    __dnrGate: false,
+    __releaseDnr: null,
     setTimeout: callback => { timer = callback; return callback; },
     clearTimeout: () => {}
   };
@@ -771,6 +869,7 @@ test('fallback retry is not consumed when the DNR bypass update fails', async ()
     ${sources[2]}
     ${sources[3]}
     let fallbackSeen = new Set();
+    let fallbackPending = new Set();
     let fallbackBatch = new Map();
     let fallbackTimer = null;
     ${sources[4]}
@@ -814,13 +913,132 @@ test('fallback retry is not consumed when the DNR bypass update fails', async ()
   assert.deepEqual(JSON.parse(JSON.stringify(installedUpdates[0].addRules[0].condition.tabIds)), [7],
     'bypass rule is limited to the failing tab');
 
+  // Keep one DNR operation in flight while the same URL fails again. A second
+  // flush must not send a duplicate retry after it observes the installed rule.
+  const overlappingOriginal = 'https://cdn.example/overlapping.png';
+  const overlappingProxy = 'https://proxy.example/api?url=' + encodeURIComponent(overlappingOriginal);
+  sandbox.__dnrGate = true;
+  sandbox.api.fail({ url: overlappingProxy, tabId: 7, frameId: 0 });
+  const firstFlush = sandbox.api.flush();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(typeof sandbox.__releaseDnr, 'function', 'first bypass update is held in flight');
+  sandbox.api.fail({ url: overlappingProxy, tabId: 7, frameId: 2 });
+  await sandbox.api.flush();
+  sandbox.__dnrGate = false;
+  sandbox.__releaseDnr();
+  await firstFlush;
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(sandbox.api.messageCount(), 2, 'an overlapping failure emits only one retry message');
+  assert.equal(sandbox.api.seenCount(), 3, 'the overlapping URL is consumed exactly once');
+
+  const updatesBeforeUnknownTab = installedUpdates.length;
+  const seenBeforeUnknownTab = sandbox.api.seenCount();
+  const messagesBeforeUnknownTab = sandbox.api.messageCount();
   const unknownOriginal = 'https://cdn.example/no-tab.png';
   await sandbox.api.addBypass(-1, [unknownOriginal]);
   sandbox.api.fail({ url: 'https://proxy.example/api?url=' + encodeURIComponent(unknownOriginal), tabId: -1, frameId: 0 });
   await sandbox.api.flush();
-  assert.equal(installedUpdates.length, 1, 'unknown tab must never install a global DNR allow rule');
-  assert.equal(sandbox.api.seenCount(), 2, 'unknown-tab failure is not consumed as a successful retry');
-  assert.equal(sandbox.api.messageCount(), 1, 'unknown-tab failure is not sent to a page');
+  assert.equal(installedUpdates.length, updatesBeforeUnknownTab, 'unknown tab must never install a global DNR allow rule');
+  assert.equal(sandbox.api.seenCount(), seenBeforeUnknownTab, 'unknown-tab failure is not consumed as a successful retry');
+  assert.equal(sandbox.api.messageCount(), messagesBeforeUnknownTab, 'unknown-tab failure is not sent to a page');
+});
+
+test('closing a tab removes queued fallback work without cancelling other tabs', () => {
+  const clearedTimers = [];
+  const sandbox = { clearTimeout: id => clearedTimers.push(id) };
+  vm.createContext(sandbox);
+  vm.runInContext(`
+    const fallbackSeen = new Set([
+      '7 https://cdn.example/old.png',
+      '8 https://cdn.example/keep.png'
+    ]);
+    const fallbackPending = new Set([
+      '7 https://cdn.example/queued.png',
+      '8 https://cdn.example/keep.png'
+    ]);
+    const fallbackBatch = new Map([
+      [7, { tabId: 7, items: new Map([['https://cdn.example/queued.png', 'proxy7']]) }],
+      [8, { tabId: 8, items: new Map([['https://cdn.example/keep.png', 'proxy8']]) }]
+    ]);
+    let fallbackTimer = 123;
+    ${extractFunction(serviceWorker, 'clearQueuedFallbacks')}
+    this.clearQueuedFallbacks = clearQueuedFallbacks;
+    this.snapshot = () => ({
+      seen: Array.from(fallbackSeen),
+      pending: Array.from(fallbackPending),
+      batchTabs: Array.from(fallbackBatch.keys()),
+      timer: fallbackTimer
+    });
+  `, sandbox);
+
+  sandbox.clearQueuedFallbacks(7);
+  assert.deepEqual(JSON.parse(JSON.stringify(sandbox.snapshot())), {
+    seen: ['8 https://cdn.example/keep.png'],
+    pending: ['8 https://cdn.example/keep.png'],
+    batchTabs: [8],
+    timer: 123
+  }, 'closing one tab drops only its retry state and preserves the shared timer');
+  assert.deepEqual(clearedTimers, [], 'the shared timer stays active while another tab has queued work');
+
+  sandbox.clearQueuedFallbacks(8);
+  assert.deepEqual(JSON.parse(JSON.stringify(sandbox.snapshot())), {
+    seen: [], pending: [], batchTabs: [], timer: null
+  }, 'closing the final queued tab empties all retry state');
+  assert.deepEqual(clearedTimers, [123], 'the timer is cancelled when no queued batches remain');
+});
+
+test('runtime-state storage writes stay ordered when publications overlap', async () => {
+  const reads = [];
+  const writes = [];
+  const sandbox = {
+    Promise,
+    chrome: { storage: { local: {
+      get: (_defaults, callback) => reads.push(callback),
+      set: (value, callback) => writes.push({ value, callback })
+    } } }
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(`
+    let lastRuntime = null;
+    let runtimePublishRevision = 0;
+    let runtimeWriteQueue = Promise.resolve();
+    ${extractFunction(serviceWorker, 'publishRuntime')}
+    this.api = { publishRuntime };
+  `, sandbox);
+
+  const first = { redirect: true, suspended: false };
+  const latest = { redirect: false, suspended: true };
+  sandbox.api.publishRuntime(first);
+  sandbox.api.publishRuntime(latest);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(reads.length, 1, 'the first queued read starts before the newer one');
+  reads[0]({ bhRuntime: null });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(reads.length, 2, 'the newer publication is processed after the stale read');
+  reads[1]({ bhRuntime: null });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(writes.length, 1, 'the stale revision is never written');
+  assert.deepEqual(JSON.parse(JSON.stringify(writes[0].value)), { bhRuntime: latest });
+  writes[0].callback();
+
+  const next = { redirect: true, suspended: true };
+  const final = { redirect: false, suspended: false };
+  sandbox.api.publishRuntime(next);
+  await new Promise(resolve => setImmediate(resolve));
+  reads[2]({ bhRuntime: latest });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(writes.length, 2, 'the next state write is held open');
+  sandbox.api.publishRuntime(final);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(reads.length, 3, 'later publications wait for the outstanding write');
+  writes[1].callback();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(reads.length, 4, 'the final state is read only after the previous write completes');
+  reads[3]({ bhRuntime: next });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(writes.length, 3);
+  assert.deepEqual(JSON.parse(JSON.stringify(writes[2].value)), { bhRuntime: final });
+  writes[2].callback();
 });
 
 test('service worker waits for startup recovery, serializes concurrent stats resets, and preserves later activity', () => {
