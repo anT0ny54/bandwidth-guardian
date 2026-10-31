@@ -286,12 +286,13 @@ test.describe('Bandwidth Guardian in Chrome', { skip: SKIP }, () => {
   test('URLs the raw contract cannot carry (&quality= …) are proxied once, encoded, by the DOM layer', async () => {
     const page = await open('conflict.html');
     await page.waitForFunction(() => Array.from(document.images).every(i => i.complete && i.naturalWidth > 0), null, { timeout: 8000 });
-    await until(() => proxied('/img/conflict/bg.png').length, 4000);
+    await until(() => proxied('/img/conflict/bg.png').length && proxied('/img/conflict/border.png').length, 4000);
     const js = `${C}/img/conflict/js.png?w=50&quality=80&l=1`;
     assert.equal(proxiedUrl(js).length, 1, 'full URL incl. &quality=&l= reached the proxy');
     assert.equal(directUrl(js).length, 0, 'JS-assigned conflict URL never fetched directly');
     assert.equal(proxiedUrl(`${C}/img/conflict/parser.png?w=50&quality=80`).length, 1);
     assert.equal(proxiedUrl(`${C}/img/conflict/bg.png?w=40&bw=1`).length, 1);
+    assert.equal(proxiedUrl(`${C}/img/conflict/border.png?w=40&quality=75`).length, 1, 'non-background inline CSS declarations are intercepted too');
     const enc = log().filter(e => isProxy(e) && e.original === js)[0];
     assert.ok(/[?&]url=http%3A%2F%2F/.test(enc.url), 'encoded form');
     assertNoDuplicates('/img/conflict/');
@@ -304,9 +305,9 @@ test.describe('Bandwidth Guardian in Chrome', { skip: SKIP }, () => {
     const statsBefore = await settledStats();
     const page = await open('fallback.html');
     await page.waitForFunction(() => ['f1', 'f2', 'f3'].every(id => { const i = document.getElementById(id); return i.complete && i.naturalWidth > 0; }), null, { timeout: 8000 });
-    await until(() => ['inline', 'upper', 'sheet', 'xorigin', 'pseudo', 'poster', 'svg', 'closed'].every(k => direct(`/img/fallback/proxyfail-${k}`).length), 8000);
+    await until(() => ['inline', 'upper', 'sheet', 'sheet-upper', 'xorigin', 'pseudo', 'poster', 'svg', 'closed'].every(k => direct(`/img/fallback/proxyfail-${k}`).length), 8000);
     await sleep(1500); // give any loop a chance to show up
-    const names = ['proxyfail-1.png', 'proxyfail-ss.png', 'proxy403.png', 'proxyfail-originfail.png', 'proxyfail-inline.png', 'proxyfail-upper.png', 'proxyfail-sheet.png',
+    const names = ['proxyfail-1.png', 'proxyfail-ss.png', 'proxy403.png', 'proxyfail-originfail.png', 'proxyfail-inline.png', 'proxyfail-upper.png', 'proxyfail-sheet.png', 'proxyfail-sheet-upper.png',
       'proxyfail-xorigin.png', 'proxyfail-pseudo.png', 'proxyfail-poster.png', 'proxyfail-svg.png', 'proxyfail-closed.png'];
     for (const n of names) {
       assert.equal(proxied('/img/fallback/' + n).length, 1, `${n}: one proxy attempt`);
@@ -319,13 +320,25 @@ test.describe('Bandwidth Guardian in Chrome', { skip: SKIP }, () => {
     for (const id of ['f1', 'f2', 'f3', 'fc']) assert.ok(st.find(i => i.id === id).w > 0, id + ' rendered after fallback');
     assert.equal(st.find(i => i.id === 'f4').w, 0, 'origin also broken: stays broken, no retry storm');
     assert.ok((await page.evaluate(() => window.__closed())).every(([c, w]) => c && w > 0), 'closed shadow root image recovered');
+
+    // The same DOM node must become eligible for a different URL after its
+    // first failure. This URL uses the DOM conflict path, not the DNR redirect.
+    const reusedUrl = `${C}/img/reused-node/reused-node.png?w=40&quality=80`;
+    await page.evaluate(url => { document.getElementById('f1').src = url; }, reusedUrl);
+    await page.waitForFunction(() => {
+      const image = document.getElementById('f1');
+      return image.complete && image.naturalWidth > 0;
+    }, null, { timeout: 8000 });
+    assert.equal(proxiedUrl(reusedUrl).length, 1, 'reused image node proxies its new URL once');
+    assert.equal(directUrl(reusedUrl).length, 0, 'reused image node does not fall back to direct prematurely');
+
     // Reload: bypass rules are per tab, so the same URLs now go direct immediately.
     const before = proxied('/img/fallback/').length;
     await page.reload({ waitUntil: 'load' });
     await sleep(800);
     assert.deepEqual(proxied('/img/fallback/').slice(before).map(e => e.original), [], 'no new proxy attempts for known-bad URLs in this tab');
     await page.close();
-    assert.equal(await settledStats(), statsBefore, 'failed responses are not counted');
+    assert.equal(await settledStats(), statsBefore + 1, 'failed responses are not counted; only the recycled-node success is');
   });
 
   test('statistics count only strict image types', async () => {
