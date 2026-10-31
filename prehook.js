@@ -159,6 +159,19 @@
     if (timer !== undefined) { clearTimeout(timer); fallbackTimers.delete(el); }
   }
 
+  // A failed <picture><img> may keep its fallback markers when the page later
+  // changes only a <source srcset>. Treat a fresh source candidate as a new
+  // image URL too, otherwise retryFailed() would keep skipping the parent img.
+  function clearPictureImageFailure(source, values) {
+    if (!source || typeof source.closest !== "function") return;
+    let image = null;
+    try {
+      const picture = source.closest("picture");
+      image = picture && picture.querySelector("img");
+    } catch {}
+    if (image) clearFailedForReplacement(image, values);
+  }
+
   let srcsetCache = new WeakMap();
   let destroyed = false;
   let preloadObserver = null;
@@ -578,6 +591,9 @@
       const isImg = el instanceof HTMLImageElement;
       const isSource = !!sourceProto && el instanceof HTMLSourceElement;
       if (!isImg && !isSource) return;
+      if (isSource) {
+        clearPictureImageFailure(el, parseSrcset(el.getAttribute("srcset") || "").map(c => c.url));
+      }
 
       if (!ready || !opts) {
         if (isImg) {
@@ -680,6 +696,7 @@
       set(value) {
         try {
           const v = String(value || "");
+          clearPictureImageFailure(this, parseSrcset(v).map(candidate => candidate.url));
           if (!ready || !opts) {
             if (!srcsetNeedsHold(v)) { nativeSourceSetSrcset(this, v); return; }
             this.dataset.bhPendingSrcset = v;
@@ -798,6 +815,7 @@
 
       if (this instanceof HTMLSourceElement && n === "srcset") {
         const v = String(value || "");
+        clearPictureImageFailure(this, parseSrcset(v).map(candidate => candidate.url));
         if (!ready || !opts) {
           if (!srcsetNeedsHold(v)) return setAttr.call(this, "srcset", v);
           this.dataset.bhPendingSrcset = v;
@@ -907,6 +925,36 @@
     return out;
   }
 
+  // Picture <source> candidates do not have an independent error target, so
+  // their parent <img> is retried when a candidate fails. Handle both raw DNR
+  // URLs and conflict URLs that the DOM layer already changed into proxy URLs.
+  function retryPictureSources(pic, base, has, proxyToOriginal, setAttribute) {
+    let hit = false;
+    let sources;
+    try { sources = pic.querySelectorAll("source"); } catch { return false; }
+    for (const source of sources) {
+      const srcset = source.getAttribute("srcset");
+      if (srcset === null) continue;
+      let sourceHit = false;
+      const rewritten = parseSrcset(srcset).map(({ url, desc }) => {
+        const resolved = safeURL(url, source.baseURI || base);
+        if (!resolved || !/^https?:$/.test(resolved.protocol)) return url + (desc ? " " + desc : "");
+        resolved.hash = "";
+        const original = proxyToOriginal.get(resolved.href);
+        if (!has(original || resolved.href)) return url + (desc ? " " + desc : "");
+        sourceHit = true;
+        return (original || url) + (desc ? " " + desc : "");
+      }).join(", ");
+      if (sourceHit) {
+        // Rewriting a proxy candidate back to its original URL also ensures
+        // that the already-installed per-tab bypass is what serves the retry.
+        try { setAttribute.call(source, "srcset", rewritten); } catch {}
+        hit = true;
+      }
+    }
+    return hit;
+  }
+
   // Re-parse CSS rules (including @media/@supports/@layer/@container groups,
   // pseudo-element rules and @import-ed sheets) whose url() references a
   // failed URL. Re-insertion creates fresh image values, so Chrome re-requests
@@ -946,13 +994,22 @@
       const o = it && typeof it.original === "string" ? stripHash(it.original) : null;
       if (!o) continue;
       originals.add(o);
-      if (typeof it.proxyUrl === "string") proxyToOriginal.set(it.proxyUrl, o);
+      if (typeof it.proxyUrl === "string") {
+        proxyToOriginal.set(it.proxyUrl, o);
+        const proxy = safeURL(it.proxyUrl);
+        if (proxy) { proxy.hash = ""; proxyToOriginal.set(proxy.href, o); }
+      }
       failedUrls.add(o); // never hand it to the proxy again on this page
     }
     if (!originals.size) return;
     const matched = new Set(); // originals located in an accessible place
     const has = abs => { if (!abs || !originals.has(abs)) return false; matched.add(abs); return true; };
-    const hasRel = (v, base) => { const r = v ? safeURL(v, base || document.baseURI) : null; if (!r) return false; r.hash = ""; return has(r.href); };
+    const hasRel = (v, base) => {
+      const r = v ? safeURL(v, base || document.baseURI) : null;
+      if (!r) return false;
+      r.hash = "";
+      return has(proxyToOriginal.get(r.href) || r.href);
+    };
     const reset = (el, name) => { const v = el.getAttribute(name); if (v !== null) setAttr.call(el, name, v); };
     const crossOrigin = [];
 
@@ -987,10 +1044,7 @@
             let hit = (src && hasRel(src, el.baseURI)) || (el.currentSrc && hasRel(el.currentSrc)) ||
               (ss && parseSrcset(ss).some(c => hasRel(c.url, el.baseURI)));
             const pic = el.parentElement && el.parentElement.localName === "picture" ? el.parentElement : null;
-            if (!hit && pic) {
-              hit = Array.from(pic.querySelectorAll("source")).some(s =>
-                parseSrcset(s.getAttribute("srcset") || "").some(c => hasRel(c.url, el.baseURI)));
-            }
+            if (pic) hit = retryPictureSources(pic, el.baseURI, has, proxyToOriginal, setAttr) || hit;
             if (!hit) continue;
             markFailed(el);
             if (ss !== null) setAttr.call(el, "srcset", ss);

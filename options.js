@@ -30,6 +30,14 @@ let savedWidth   = DEFAULTS.maxWidth;
 // changes (e.g. the popup's "Exclude this site") never clobber unsaved edits.
 const dirty = { proxyBase: false, excludeDomains: false, quality: false, width: false };
 
+// Keep the latest stored value as the reset baseline even while an input is
+// dirty. The UI remains untouched until the user clears their custom edit.
+function mergeIncomingSetting(change, field, fallback, apply) {
+  const value = change.newValue ?? fallback;
+  if (!dirty[field]) apply(value);
+  return value;
+}
+
 // B14: Settings remembers the tab that opened it (?tab=<id> from the popup).
 const openerTabId = (() => {
   const raw = new URLSearchParams(location.search).get("tab");
@@ -197,13 +205,11 @@ chrome.storage.onChanged.addListener((changes, area) => {
   if (changes.excludeDomains && !dirty.excludeDomains) {
     excludeEl.value = changes.excludeDomains.newValue || "";
   }
-  if (changes.quality && !dirty.quality) {
-    savedQuality = changes.quality.newValue ?? DEFAULTS.quality;
-    setQualityUI(savedQuality);
+  if (changes.quality) {
+    savedQuality = mergeIncomingSetting(changes.quality, "quality", DEFAULTS.quality, setQualityUI);
   }
-  if (changes.maxWidth && !dirty.width) {
-    savedWidth = changes.maxWidth.newValue ?? DEFAULTS.maxWidth;
-    setWidthUI(savedWidth);
+  if (changes.maxWidth) {
+    savedWidth = mergeIncomingSetting(changes.maxWidth, "width", DEFAULTS.maxWidth, setWidthUI);
   }
 });
 

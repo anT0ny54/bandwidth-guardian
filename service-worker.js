@@ -190,9 +190,12 @@ function headerInt(map, name) {
 
 function isGuardianProxyUrl(url) {
   if (!configuredProxyOrigin) return false;
+  const s = String(url || "");
+  // Cheap prefilter: the webRequest listener is already narrowed to this
+  // origin, so nearly every candidate matches; skip the URL parse otherwise.
+  if (!s.startsWith(configuredProxyOrigin + "/")) return false;
   try {
-    const u = new URL(String(url || ""));
-    return u.origin === configuredProxyOrigin && u.searchParams.has("url"); // R9: parse once
+    return new URL(s).searchParams.has("url"); // R9: parse once
   } catch { return false; }
 }
 
@@ -631,23 +634,25 @@ function addBypass(tabId, urls) {
     for (const c of candidates) {
       const needsSlot = addRules.length >= BYPASS_LIMIT - nextRules.size;
       if (needsSlot) {
-        const oldestKey = nextRules.keys().next().value;
+        const oldest = nextRules.entries().next().value;
+        // Hardened: never read oldest[0] on a theoretically empty map.
+        if (!oldest) continue;
         // Evicting a non-regex oldest rule cannot make room under the regex
         // quota, so skip a quota-blocked regex candidate instead of discarding
         // a useful rule for nothing. An oldest regex rule does free one slot.
         if (c.baseCondition.regexFilter && nextRegexRules.size >= BYPASS_REGEX_LIMIT &&
-            !nextRegexRules.has(oldestKey)) continue;
-        const oldest = nextRules.entries().next().value;
+            !nextRegexRules.has(oldest[0])) continue;
         nextRules.delete(oldest[0]);
         nextRegexRules.delete(oldest[0]);
         removeRuleIds.push(oldest[1]);
       }
       if (c.baseCondition.regexFilter && nextRegexRules.size >= BYPASS_REGEX_LIMIT) continue;
       const id = bypassNextId++;
-      const condition = { ...c.baseCondition, resourceTypes: PROXY_REQUEST_TYPES };
-      if (tab >= 0) condition.tabIds = [tab];
+      // tab >= 0 is guaranteed by addBypass's early return; the conditional
+      // branch was dead code.
+      const condition = { ...c.baseCondition, resourceTypes: PROXY_REQUEST_TYPES, tabIds: [tab] };
       addRules.push({ id, priority: PRIORITY_BYPASS, action: { type: "allow" }, condition });
-      addedKeys.set(c.key, { id, url: c.url, isRegex: !!c.baseCondition.regexFilter });
+      addedKeys.set(c.key, { id, url: c.url });
       nextRules.set(c.key, id);
       if (c.baseCondition.regexFilter) nextRegexRules.add(c.key);
     }
@@ -678,12 +683,10 @@ function addBypass(tabId, urls) {
 
 // Drop a closed tab's bypass rules (they can never match again).
 chrome.tabs?.onRemoved?.addListener(tabId => {
-  // Same per-tab cleanup for the retry-dedupe set: entries for a closed tab
-  // can never match again, so they should not have to drain through the
-  // 20,000-entry FIFO cap.
-  for (const key of fallbackSeen) {
-    if (key.startsWith(tabId + " ")) fallbackSeen.delete(key);
-  }
+  // A tab may close while its 250 ms fallback batch is still queued. Drop that
+  // work before it reaches addBypass(), otherwise a dead tab can consume a
+  // session-rule slot after the removal handler has already run.
+  clearQueuedFallbacks(tabId);
   bypassChain = bypassReady().then(async () => {
     const keys = [];
     const removeRuleIds = [];
@@ -729,16 +732,38 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
 // Failures are batched per tab because DNR bypass rules are tab-scoped and the
 // retry notification must update every frame's MAIN-world failed-URL set.
-const fallbackSeen  = new Set();  // "tabId url": a URL is retried once per tab
-const fallbackBatch = new Map();  // tabId -> { tabId, items: Map(original -> proxyUrl) }
-let fallbackTimer   = null;
+const fallbackSeen    = new Set();  // "tabId url": a URL is retried once per tab
+const fallbackPending = new Set();  // URLs queued or being installed; prevents overlapping flushes
+const fallbackBatch   = new Map();  // tabId -> { tabId, items: Map(original -> proxyUrl) }
+let fallbackTimer     = null;
+
+function clearQueuedFallbacks(tabId) {
+  const prefix = tabId + " ";
+  for (const key of fallbackSeen) {
+    if (key.startsWith(prefix)) fallbackSeen.delete(key);
+  }
+  for (const key of fallbackPending) {
+    if (key.startsWith(prefix)) fallbackPending.delete(key);
+  }
+  fallbackBatch.delete(tabId);
+  // The timer is shared by all tabs; keep it while any other tab still has
+  // queued work, and cancel it once the queue is empty.
+  if (!fallbackBatch.size && fallbackTimer !== null) {
+    clearTimeout(fallbackTimer);
+    fallbackTimer = null;
+  }
+}
 
 function scheduleFallback(details) {
   const original = originalFromProxyUrl(details.url);
   if (!original || !Number.isInteger(details.tabId) || details.tabId < 0) return;
   const tabId = details.tabId;
   const key = tabId + " " + original;
-  if (fallbackSeen.has(key)) return;
+  if (fallbackSeen.has(key) || fallbackPending.has(key)) return;
+  // Reserve the URL while it is queued or being installed. Without this
+  // in-flight guard, a second batch can pass the dedupe check before the first
+  // DNR update completes and broadcast the same retry twice.
+  fallbackPending.add(key);
   // Do not consume the retry yet. Only a confirmed DNR bypass makes the retry
   // safe; a failed update must leave the URL eligible for a later attempt.
   if (!fallbackBatch.has(tabId)) fallbackBatch.set(tabId, { tabId, items: new Map() });
@@ -750,8 +775,10 @@ function scheduleFallback(details) {
 
 function markFallbackSeen(tabId, original) {
   const key = tabId + " " + original;
+  if (fallbackSeen.has(key)) return false;
   fallbackSeen.add(key);
   if (fallbackSeen.size > 20000) fallbackSeen.delete(fallbackSeen.values().next().value);
+  return true;
 }
 
 function flushFallbacks() {
@@ -761,19 +788,26 @@ function flushFallbacks() {
   for (const b of batches) {
     const originals = Array.from(b.items.keys());
     addBypass(b.tabId, originals).then(bypassed => {
-      if (b.tabId < 0 || !chrome.tabs?.sendMessage || !bypassed?.length) return;
+      // Release each reservation after the DNR result is known. Failed or
+      // capacity-limited entries remain eligible for a later request.
+      for (const original of originals) fallbackPending.delete(b.tabId + " " + original);
+      // b.tabId >= 0 is guaranteed by scheduleFallback; the negative-tab
+      // branch here was dead code.
+      if (!chrome.tabs?.sendMessage || !bypassed?.length) return;
       const allowed = new Set(bypassed);
       const items = Array.from(b.items, ([original, proxyUrl]) => ({ original, proxyUrl }))
-        .filter(item => allowed.has(item.original));
+        .filter(item => allowed.has(item.original) && markFallbackSeen(b.tabId, item.original));
       if (!items.length) return;
-      for (const item of items) markFallbackSeen(b.tabId, item.original);
       try {
         // The bypass is tab-scoped. Broadcast to every frame so conflict URLs
         // are also remembered by each frame's prehook (not just the failing one).
         const p = chrome.tabs.sendMessage(b.tabId, { type: "bh-retry", items });
         if (p && typeof p.catch === "function") p.catch(() => {});
       } catch {}
-    }).catch(() => {});
+    }).catch(() => {
+      // A rejected update must not strand the reservation or consume the retry.
+      for (const original of originals) fallbackPending.delete(b.tabId + " " + original);
+    });
   }
 }
 
@@ -940,15 +974,30 @@ function buildRules(opts, noHeaderMatch, suspended) {
 // if it is not (rule rejected), they fall back to full DOM rewriting; while
 // the breaker is open they proxy nothing.
 let lastRuntime = null;
+let runtimePublishRevision = 0;
+let runtimeWriteQueue = Promise.resolve();
 function publishRuntime(runtime) {
   const same = lastRuntime && lastRuntime.redirect === runtime.redirect && lastRuntime.suspended === runtime.suspended;
   if (same) return;
   lastRuntime = runtime;
-  chrome.storage.local.get({ bhRuntime: null }, d => {
-    const cur = d.bhRuntime;
-    if (cur && cur.redirect === runtime.redirect && cur.suspended === runtime.suspended) return;
-    chrome.storage.local.set({ bhRuntime: runtime });
-  });
+  const revision = ++runtimePublishRevision;
+  // Serialize the read/compare/write sequence. Overlapping storage callbacks
+  // could otherwise finish out of order and leave content scripts with a stale
+  // redirect state after a quick settings or circuit-breaker transition.
+  runtimeWriteQueue = runtimeWriteQueue.then(() => new Promise(resolve => {
+    try {
+      chrome.storage.local.get({ bhRuntime: null }, d => {
+        if (revision !== runtimePublishRevision) { resolve(); return; }
+        const cur = d?.bhRuntime;
+        if (cur && cur.redirect === runtime.redirect && cur.suspended === runtime.suspended) {
+          resolve();
+          return;
+        }
+        try { chrome.storage.local.set({ bhRuntime: runtime }, resolve); }
+        catch { resolve(); }
+      });
+    } catch { resolve(); }
+  })).catch(() => {});
 }
 
 function doRefreshRules(done) {

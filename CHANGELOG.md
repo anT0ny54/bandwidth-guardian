@@ -5,13 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.2.4] — current release
+## [0.2.5] — current release
 
 ### Changed
 - Removed a dead bypass-slot assignment; the decision is immutable after the
   capacity check and eviction step.
+- Marked `build.sh` executable so the documented `./build.sh` command works
+  from a fresh checkout as well as the CI workflow's `bash ./build.sh` call.
 
 ### Fixed
+- A repeated failure for the same tab-scoped URL could enter a second fallback
+  batch while its first DNR bypass update was still pending, causing duplicate
+  retry notifications. In-flight reservations now deduplicate those requests
+  and are released after the DNR result, so failed updates remain retryable.
+- Rapid runtime transitions could complete their asynchronous storage callbacks
+  out of order and leave an older redirect state persisted last. Runtime-state
+  read/compare/write operations are now serialized, and obsolete queued
+  revisions are skipped.
+- Closing a tab while its 250 ms fallback batch was queued could leave stale
+  retry work available for a later DNR update. Tab teardown now drops that
+  tab's queued batch and retry reservations, while preserving the shared timer
+  for other tabs and cancelling it when the queue becomes empty.
+- A failed conflict URL selected through `<picture><source srcset>` could remain
+  stuck on its proxy URL because the `<source>` has no independent error target.
+  The MAIN-world retry now maps that proxy candidate back to its original URL
+  and restores it through the tab's confirmed DNR bypass. Replacing a picture
+  source also clears stale failure state on its parent image.
+- Settings changes received from another extension view now update the saved
+  quality and width reset baselines even while those fields contain unsaved
+  edits. The active edit is left untouched, and clearing it restores the latest
+  stored value instead of a stale one.
 - Fallback cleanup now remains armed across successful loads on a reused image
   element. Previously, a one-shot `load` listener was removed after the first
   success while its registration marker remained set, leaving later fallback
@@ -50,16 +73,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Private-network exclusions now cover IPv4-mapped private IPv6 addresses and
   the full IPv6 link-local `fe80::/10` range in all three interception layers.
 
+### Changed
+- Service worker: merged the duplicate oldest-bypass lookup in the session-rule
+  eviction path into a single iterator step; removed the never-read `isRegex`
+  bookkeeping field, an always-true `tab >= 0` conditional on tab-scoped bypass
+  conditions, and a dead `tabId < 0` guard in the retry broadcast (tab IDs are
+  validated before batching reaches it).
+
+### Fixed
+- The bypass eviction path read `oldest[0]` on a map that was only non-empty by
+  an arithmetic coincidence; an explicit empty-map guard now skips the candidate
+  instead of risking a TypeError if the capacity constants ever change.
+
 ### Maintenance
+- Re-audited every shipped file end to end (manifest, service worker, both DOM
+  layers, popup, options, build script): verified cross-layer pattern sync
+  (conflict/skip/private-host patterns, proxy-base validation, quality clamp),
+  all DOM ids against both HTML pages, and script load order. No changes were
+  needed in content.js, prehook.js, popup.js, options.js, popup.html,
+  options.html, build.sh, defaults.js or the manifest. `isGuardianProxyUrl`
+  gained an origin string-prefix prefilter, avoiding a full `URL` parse for the
+  rare non-proxy candidate event. All 38 simulation tests and JavaScript syntax
+  checks pass. No version bump.
 - Added simulation regressions for element reuse during pending and completed
   retries, stale timeout callbacks, delayed failure-list synchronization,
   unknown-tab bypass protection, cross-frame retry batching, unavailable DNR
   APIs, mapped IPv6 and link-local addresses. Added a real-Chrome regression
   that reuses a failed image node for a new conflict URL, plus simulation
-  regressions for repeated load cleanup and non-background inline CSS URL
-  declarations.
-- Re-read the complete project before modification. Syntax checks and build
-  validation pass; all 32 simulation tests pass. The real-Chrome suite remains
-  unexecuted because `playwright-core` is not installed in this environment;
-  the browser regression is included for a configured browser-test environment.
-- Updated this existing release entry and README only; no version bump.
+  regressions for repeated load cleanup, non-background inline CSS URL
+  declarations, picture-source proxy recovery/re-arming, external settings
+  updates while custom quality/width inputs are dirty, overlapping fallback
+  batches, tab-close cleanup of queued fallback batches, and out-of-order
+  runtime-state storage callbacks.
+- Re-audited the complete patch and its runtime dependencies. All 38 simulation
+  tests, JavaScript syntax checks and the reproducible build pass. The real-Chrome
+  suite remains unexecuted because `playwright-core` is unavailable in this
+  environment; its regressions now wait for the actual picture-source requests
+  and cover a second source failure after re-arming.
+- Updated this existing release entry and README; no version bump.

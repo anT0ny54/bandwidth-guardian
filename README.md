@@ -250,8 +250,27 @@ cross-layer conflicts, bugs and optimization opportunities (details in
 actual dynamic rules retained by Chrome when every DNR installation attempt is
 rejected; rejects proxy base URLs that already define the reserved `url` query
 parameter; and retries stylesheet rules with case-insensitive CSS `url()`
-matching. It also removes a dead slot-state assignment in bypass-rule handling.
-The simulation suite covers each regression. No version bump.
+matching. It also restores failed conflict URLs selected through
+`<picture><source srcset>` to their original URL during the confirmed direct
+retry, clears stale parent-image failure state when a source is replaced, and
+keeps the options page's quality/width reset baselines current when settings
+change elsewhere without overwriting active edits. It also deduplicates
+same-URL fallback failures while a DNR bypass is being installed, drops queued
+fallback batches when their tab closes (without cancelling other tabs' shared
+timer), and serializes runtime-state storage writes so a stale callback cannot
+overwrite a newer redirect state. A subsequent full re-read of every shipped
+file hardened the bypass-rule eviction path against an empty-map edge case,
+removed four pieces of dead or redundant service-worker code (duplicate
+eviction lookup, unread bookkeeping field, two provably-dead guards), and added
+a cheap origin-prefix prefilter to proxy-URL detection; the cross-layer pattern
+sync, DOM ids and script load order were re-verified with no further changes
+needed. All 38 simulation tests, JavaScript syntax checks, and the
+reproducible build pass. The browser suite includes
+picture-source fallback, re-arm, and repeat-failure coverage, but could not run
+here because `playwright-core` is unavailable. The documented
+`./build.sh` command is executable from a fresh checkout. No additional runtime
+code was safe to remove: the remaining shared helpers and fallback paths are
+referenced by active flows. No version bump.
 
 ## 🔗 Related projects (not part of this repository)
 
