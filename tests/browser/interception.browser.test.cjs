@@ -304,11 +304,11 @@ test.describe('Bandwidth Guardian in Chrome', { skip: SKIP }, () => {
   test('fallback: a failed proxy response is retried ONCE directly, renders, and never loops', async () => {
     const statsBefore = await settledStats();
     const page = await open('fallback.html');
-    await page.waitForFunction(() => ['f1', 'f2', 'f3'].every(id => { const i = document.getElementById(id); return i.complete && i.naturalWidth > 0; }), null, { timeout: 8000 });
+    await page.waitForFunction(() => ['f1', 'f2', 'f3', 'fpimg'].every(id => { const i = document.getElementById(id); return i.complete && i.naturalWidth > 0; }), null, { timeout: 8000 });
     await until(() => ['inline', 'upper', 'sheet', 'sheet-upper', 'xorigin', 'pseudo', 'poster', 'svg', 'closed'].every(k => direct(`/img/fallback/proxyfail-${k}`).length), 8000);
     await sleep(1500); // give any loop a chance to show up
     const names = ['proxyfail-1.png', 'proxyfail-ss.png', 'proxy403.png', 'proxyfail-originfail.png', 'proxyfail-inline.png', 'proxyfail-upper.png', 'proxyfail-sheet.png', 'proxyfail-sheet-upper.png',
-      'proxyfail-xorigin.png', 'proxyfail-pseudo.png', 'proxyfail-poster.png', 'proxyfail-svg.png', 'proxyfail-closed.png'];
+      'proxyfail-xorigin.png', 'proxyfail-pseudo.png', 'proxyfail-poster.png', 'proxyfail-svg.png', 'proxyfail-closed.png', 'proxyfail-picture.png'];
     for (const n of names) {
       assert.equal(proxied('/img/fallback/' + n).length, 1, `${n}: one proxy attempt`);
       assert.equal(direct('/img/fallback/' + n).length, 1, `${n}: one direct retry`);
@@ -317,14 +317,40 @@ test.describe('Bandwidth Guardian in Chrome', { skip: SKIP }, () => {
     assert.equal(proxiedUrl(conflict).length, 1);
     assert.equal(directUrl(conflict).length, 1, 'DOM-layer element fallback');
     const st = await imgState(page, 'img');
-    for (const id of ['f1', 'f2', 'f3', 'fc']) assert.ok(st.find(i => i.id === id).w > 0, id + ' rendered after fallback');
+    for (const id of ['f1', 'f2', 'f3', 'fc', 'fpimg']) assert.ok(st.find(i => i.id === id).w > 0, id + ' rendered after fallback');
     assert.equal(st.find(i => i.id === 'f4').w, 0, 'origin also broken: stays broken, no retry storm');
     assert.ok((await page.evaluate(() => window.__closed())).every(([c, w]) => c && w > 0), 'closed shadow root image recovered');
+
+    // <source> has no independent error target. When its candidate changes
+    // after failure, the parent <img> must be re-armed and retry the new URL.
+    const pictureSourceUrl = `${C}/img/reused-node/picture-source.png?w=40&quality=80`;
+    await page.evaluate(url => { document.querySelector('#fp source').srcset = `${url} 1x`; }, pictureSourceUrl);
+    await until(() => proxiedUrl(pictureSourceUrl).length === 1, 8000);
+    await page.waitForFunction(() => {
+      const image = document.getElementById('fpimg');
+      return image.complete && image.naturalWidth > 0;
+    }, null, { timeout: 8000 });
+    assert.equal(proxiedUrl(pictureSourceUrl).length, 1, 'a changed picture source is eligible for a fresh proxy attempt');
+    assert.equal(directUrl(pictureSourceUrl).length, 0, 'the new picture source does not fall back prematurely');
+
+    // A second failure after re-arming must still restore the new source, not
+    // leave the parent image stuck behind its previous one-shot failure state.
+    const pictureFailureUrl = `${C}/img/reused-node/proxyfail-picture-reused.png?w=40&quality=80`;
+    await page.evaluate(url => { document.querySelector('#fp source').srcset = `${url} 1x`; }, pictureFailureUrl);
+    await until(() => proxiedUrl(pictureFailureUrl).length === 1, 8000);
+    await until(() => directUrl(pictureFailureUrl).length === 1, 8000);
+    await page.waitForFunction(() => {
+      const image = document.getElementById('fpimg');
+      return image.complete && image.naturalWidth > 0;
+    }, null, { timeout: 8000 });
+    assert.equal(proxiedUrl(pictureFailureUrl).length, 1, 'the re-armed source is proxied once');
+    assert.equal(directUrl(pictureFailureUrl).length, 1, 'the re-armed source recovers with one direct retry');
 
     // The same DOM node must become eligible for a different URL after its
     // first failure. This URL uses the DOM conflict path, not the DNR redirect.
     const reusedUrl = `${C}/img/reused-node/reused-node.png?w=40&quality=80`;
     await page.evaluate(url => { document.getElementById('f1').src = url; }, reusedUrl);
+    await until(() => proxiedUrl(reusedUrl).length === 1, 8000);
     await page.waitForFunction(() => {
       const image = document.getElementById('f1');
       return image.complete && image.naturalWidth > 0;
@@ -338,7 +364,7 @@ test.describe('Bandwidth Guardian in Chrome', { skip: SKIP }, () => {
     await sleep(800);
     assert.deepEqual(proxied('/img/fallback/').slice(before).map(e => e.original), [], 'no new proxy attempts for known-bad URLs in this tab');
     await page.close();
-    assert.equal(await settledStats(), statsBefore + 1, 'failed responses are not counted; only the recycled-node success is');
+    assert.equal(await settledStats(), statsBefore + 2, 'failed responses are not counted; only the recycled img and picture-source successes are');
   });
 
   test('statistics count only strict image types', async () => {
