@@ -21,6 +21,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   status, confirms proxy reachability and resets the failure window.
 
 ### Fixed
+- The statistics flush timer ran before the crash-recovery journal timer, so
+  normal activity could be committed without ever being journaled. The journal
+  is now written first, the flush waits for any pending journal write, and new
+  activity arriving during a journal write receives an updated snapshot.
+- A failed local-storage read or commit during a stats flush could discard the
+  in-memory batch. Failed batches are now restored to the pending queue, startup
+  recovery reads retry with increasing backoff without allowing new journal
+  writes to overwrite the previous snapshot, and failed recovery commits
+  requeue the journal for the regular flush.
+- A failed crash-journal write cleared its in-flight flag but did not retry,
+  leaving pending activity vulnerable before the normal flush. Journal writes
+  now retry with capped exponential backoff, and a stats reset clears the
+  backoff. While a journal write or retry is pending, the normal flush waits
+  without polling every 750 ms; a successful journal write resumes the flush.
 - A repeated failure for the same tab-scoped URL could enter a second fallback
   batch while its first DNR bypass update was still pending, causing duplicate
   retry notifications. In-flight reservations now deduplicate those requests
@@ -89,7 +103,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   has been extended. Added SOCKS proxy-path and DNS-server failures to the
   connection-level allowlist based on Chromium's current network error types.
 - Kept shared URL patterns synchronized across the service worker and both DOM
-  interception layers. All 42 simulation tests, shipped-script syntax checks
+  interception layers. All 47 simulation tests, shipped-script syntax checks
   and the reproducible build pass. The real-Chrome suite remains unexecuted
   because `playwright-core` is unavailable in this environment. The manifest
   version remains `0.2.6`.
