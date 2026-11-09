@@ -450,14 +450,15 @@ test.describe('Bandwidth Guardian in Chrome', { skip: SKIP }, () => {
   test('circuit breaker: an unreachable proxy stops being used, pages keep working, then it recovers', async () => {
     srv.state.proxyDown = true;
     let page = await ctx.newPage();
-    await page.goto(`${PAGE}/many.html?n=12&tag=down`, { waitUntil: 'load' });
+    await page.goto(`${PAGE}/many.html?n=2&tag=down`, { waitUntil: 'load' });
     await page.waitForFunction(() => Array.from(document.images).every(i => i.complete && i.naturalWidth > 0), null, { timeout: 15000 });
     const runtime = await until(async () => {
       const r = (await sw.evaluate(() => chrome.storage.local.get('bhRuntime'))).bhRuntime;
       return r && r.suspended ? r : null;
     }, 5000);
     assert.ok(runtime && runtime.suspended, 'breaker open');
-    assert.equal(direct('/img/down/').length, 12, 'every image recovered directly');
+    assert.equal(proxied('/img/down/').length, 2, 'exactly two proxy failures trigger the breaker');
+    assert.equal(direct('/img/down/').length, 2, 'both images recover directly');
     await page.close();
     page = await ctx.newPage();
     await page.goto(`${PAGE}/many.html?n=4&tag=down2`, { waitUntil: 'load' });
