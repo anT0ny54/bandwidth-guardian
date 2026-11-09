@@ -122,8 +122,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   once per element by the style selector pass.
 
 ### Maintenance
-- The real-Chrome fallback test now lists the proxied requests it made when its
-  statistics count does not match, so a CI mismatch can be traced to a URL.
+- The real-Chrome fallback test derives its expected statistics count from the
+  proxied requests it actually made (every request not designed to fail is a
+  counted success), instead of a hard-coded number. Its failure message lists
+  the proxied requests.
 - Removed unused bypass bookkeeping and duplicate eviction scans; eviction
   now safely skips a candidate when no oldest entry exists.
 - Prevented an outdated breaker alarm from clearing a newer 40-second
