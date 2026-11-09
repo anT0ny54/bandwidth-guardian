@@ -1294,7 +1294,7 @@ test('service worker reads proxy stats headers case-insensitively from one pass'
   assert.deepEqual(run(undefined), { received: 0, saved: 0 });
 });
 
-test('eleventh review: conflict detection matches DNR casing and srcset restore normalizes proxy host', () => {
+test('conflict detection matches DNR casing and srcset restore normalizes proxy host', () => {
   const grabConflict = source => {
     const m = /const CONFLICT_RE = \/([^/]+)\/([a-z]*);/.exec(source);
     assert.ok(m, 'CONFLICT_RE declaration present');
@@ -1318,4 +1318,246 @@ test('eleventh review: conflict detection matches DNR casing and srcset restore 
     /proxyHost = parsed \? parsed\.host\.toLowerCase\(\) : "";\n/,
     'content.js normalizes proxy host casing before srcset restore matching'
   );
+});
+
+
+
+test('HTTP errors use per-image fallback but do not count as connection failures', () => {
+  const calls = [];
+  const sandbox = {
+    isGuardianProxyUrl(url) { return String(url).startsWith('https://proxy.example/'); },
+    headerMap(headers) {
+      return new Map((headers || []).map(header => [String(header.name).toLowerCase(), header.value]));
+    },
+    noteGlobalProxyFailure() { calls.push('breaker'); },
+    noteProxyResponse() { calls.push('response'); },
+    scheduleFallback(details) { calls.push(`fallback:${details.statusCode}`); },
+    IMAGE_CONTENT_TYPES: new Set(['image/jpeg']),
+    getProxyResponseStats() { return { received: 100, saved: 20 }; },
+    recordStats() { calls.push('stats'); }
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(`${extractFunction(serviceWorker, 'handleProxyCompleted')}\nthis.run = handleProxyCompleted;`, sandbox);
+
+  for (const statusCode of [403, 429, 503, 520, 530]) {
+    calls.length = 0;
+    sandbox.run({
+      url: 'https://proxy.example/convert?url=https://origin.example/photo.jpg',
+      statusCode,
+      responseHeaders: [{ name: 'content-type', value: 'text/html' }]
+    });
+    assert.deepEqual(calls, ['response', `fallback:${statusCode}`],
+      `HTTP ${statusCode} must retry this image directly without opening the connection breaker`);
+  }
+
+  calls.length = 0;
+  sandbox.run({
+    url: 'https://proxy.example/convert?url=https://origin.example/photo.jpg',
+    statusCode: 200,
+    responseHeaders: [{ name: 'content-type', value: 'text/html' }]
+  });
+  assert.deepEqual(calls, ['response', 'fallback:200'],
+    'a reachable proxy that returns a non-image 2xx confirms connectivity and still retries the image directly');
+});
+
+test('an HTTP error response resets earlier connection failures without opening the breaker', () => {
+  const constantsStart = serviceWorker.indexOf('const BREAKER_THRESHOLD');
+  const constantsEnd = serviceWorker.indexOf('let breakerFailures', constantsStart);
+  assert.ok(constantsStart >= 0 && constantsEnd > constantsStart, 'breaker constants exist');
+  const constants = serviceWorker.slice(constantsStart, constantsEnd);
+  let now = 50_000;
+  const stored = {};
+  const alarms = [];
+  let refreshes = 0;
+  const sandbox = {
+    Date: { now: () => now },
+    chrome: {
+      storage: { session: {
+        set(value, callback) { Object.assign(stored, value); callback(); }
+      } },
+      alarms: { create(name, info) { alarms.push({ name, ...info }); } }
+    },
+    isGuardianProxyUrl(url) { return String(url).startsWith('https://proxy.example/'); },
+    headerMap(headers) {
+      return new Map((headers || []).map(header => [String(header.name).toLowerCase(), header.value]));
+    },
+    noteProxyResponse() { breakerFailures = []; },
+    scheduleFallback() {},
+    IMAGE_CONTENT_TYPES: new Set(['image/jpeg']),
+    getProxyResponseStats() { return { received: 100, saved: 20 }; },
+    recordStats() {},
+    refreshRules() { refreshes++; }
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(`${constants}\nlet breakerFailures = [];\n${extractFunction(serviceWorker, 'noteProxyResponse')}\n${extractFunction(serviceWorker, 'noteGlobalProxyFailure')}\n${extractFunction(serviceWorker, 'handleProxyCompleted')}\nthis.api = { fail: noteGlobalProxyFailure, completed: handleProxyCompleted };`, sandbox);
+
+  sandbox.api.fail();
+  now += 1_000;
+  sandbox.api.completed({
+    url: 'https://proxy.example/convert?url=https://origin.example/photo.jpg',
+    statusCode: 503,
+    responseHeaders: [{ name: 'content-type', value: 'text/html' }]
+  });
+  now += 1_000;
+  sandbox.api.fail();
+
+  assert.equal(stored.bhSuspendedUntil, undefined,
+    'a completed HTTP 503 resets the prior transport failure, so the next failure is only the first');
+  assert.deepEqual(alarms, [], 'an HTTP response between transport errors must not trip the breaker');
+  assert.equal(refreshes, 0, 'the redirect rules remain active');
+});
+
+test('only recognized transport and DNS proxy errors count toward the breaker', () => {
+  const calls = [];
+  const constantsStart = serviceWorker.indexOf('const IGNORED_NET_ERRORS');
+  const constantsEnd = serviceWorker.indexOf('\nfunction onProxyError', constantsStart);
+  assert.ok(constantsStart >= 0 && constantsEnd > constantsStart, 'network error classifications exist');
+  const constants = serviceWorker.slice(constantsStart, constantsEnd);
+  const sandbox = {
+    isGuardianProxyUrl(url) { return String(url).startsWith('https://proxy.example/'); },
+    noteGlobalProxyFailure() { calls.push('breaker'); },
+    scheduleFallback() { calls.push('fallback'); }
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(`${constants}\n${extractFunction(serviceWorker, 'handleProxyError')}\nthis.run = handleProxyError;`, sandbox);
+  const url = 'https://proxy.example/convert?url=https://origin.example/photo.jpg';
+
+  const connectionErrors = [
+    'net::ERR_CONNECTION_CLOSED',
+    'net::ERR_CONNECTION_RESET',
+    'net::ERR_CONNECTION_REFUSED',
+    'net::ERR_CONNECTION_ABORTED',
+    'net::ERR_CONNECTION_FAILED',
+    'net::ERR_CONNECTION_TIMED_OUT',
+    'net::ERR_PROXY_CONNECTION_FAILED',
+    'net::ERR_SOCKS_CONNECTION_FAILED',
+    'net::ERR_SOCKS_CONNECTION_HOST_UNREACHABLE',
+    'net::ERR_NAME_NOT_RESOLVED',
+    'net::ERR_NAME_RESOLUTION_FAILED',
+    'net::ERR_DNS_TIMED_OUT',
+    'net::ERR_DNS_MALFORMED_RESPONSE',
+    'net::ERR_DNS_SERVER_FAILED',
+    'net::ERR_INTERNET_DISCONNECTED',
+    'net::ERR_ADDRESS_UNREACHABLE'
+  ];
+  for (const error of connectionErrors) {
+    calls.length = 0;
+    sandbox.run({ url, error });
+    assert.deepEqual(calls, ['breaker', 'fallback'], `${error} is a proxy reachability failure`);
+  }
+
+  const otherFailures = [
+    'net::ERR_BLOCKED_BY_RESPONSE',
+    'net::ERR_BLOCKED_BY_ORB',
+    'net::ERR_CERT_AUTHORITY_INVALID',
+    'net::ERR_PROXY_CERTIFICATE_INVALID',
+    'net::ERR_SSL_PROTOCOL_ERROR',
+    'net::ERR_BLOCKED_BY_CSP',
+    'net::ERR_NETWORK_ACCESS_DENIED',
+    'net::ERR_TUNNEL_CONNECTION_FAILED',
+    'net::ERR_EMPTY_RESPONSE',
+    'net::ERR_TIMED_OUT',
+    'net::ERR_FAILED'
+  ];
+  for (const error of otherFailures) {
+    calls.length = 0;
+    sandbox.run({ url, error });
+    assert.deepEqual(calls, ['fallback'], `${error} must recover the image without opening the global breaker`);
+  }
+
+  for (const error of ['net::ERR_ABORTED', 'net::ERR_BLOCKED_BY_CLIENT', 'net::ERR_BLOCKED_BY_ADMINISTRATOR',
+    'net::ERR_CACHE_MISS', 'net::ERR_NETWORK_CHANGED']) {
+    calls.length = 0;
+    sandbox.run({ url, error });
+    assert.deepEqual(calls, [], `${error} remains ignored without fallback or breaker accounting`);
+  }
+
+  calls.length = 0;
+  sandbox.run({ url: 'https://other.example/convert', error: 'net::ERR_CONNECTION_REFUSED' });
+  assert.deepEqual(calls, [], 'errors from other origins are ignored');
+});
+
+test('service worker opens the breaker after two failures inside 10 seconds and auto-resumes after 40 seconds', () => {
+  const constantsStart = serviceWorker.indexOf('const BREAKER_THRESHOLD');
+  const constantsEnd = serviceWorker.indexOf('let breakerFailures', constantsStart);
+  assert.ok(constantsStart >= 0 && constantsEnd > constantsStart, 'breaker constants exist');
+  const constants = serviceWorker.slice(constantsStart, constantsEnd);
+  const alarmStart = serviceWorker.indexOf('chrome.alarms?.onAlarm?.addListener');
+  const alarmEnd = serviceWorker.indexOf('\n\nfunction readSuspended', alarmStart);
+  assert.ok(alarmStart >= 0 && alarmEnd > alarmStart, 'breaker resume alarm listener exists');
+  const alarmListener = serviceWorker.slice(alarmStart, alarmEnd);
+
+  let now = 1_000_000;
+  const stored = {};
+  const alarms = [];
+  const removed = [];
+  let registeredAlarmListener = null;
+  let refreshes = 0;
+  const sandbox = {
+    Date: { now: () => now },
+    chrome: {
+      runtime: { lastError: null },
+      storage: { session: {
+        set(value, callback) { Object.assign(stored, value); callback(); },
+        get(_defaults, callback) { callback({ bhSuspendedUntil: stored.bhSuspendedUntil || 0 }); },
+        remove(key, callback) { delete stored[key]; removed.push(key); callback(); }
+      } },
+      alarms: {
+        create(name, info) { alarms.push({ name, ...info }); },
+        onAlarm: { addListener(callback) { registeredAlarmListener = callback; } }
+      }
+    },
+    refreshRules() { refreshes++; }
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(`${constants}\nlet breakerFailures = [];\n${extractFunction(serviceWorker, 'noteProxyResponse')}\n${extractFunction(serviceWorker, 'noteGlobalProxyFailure')}\n${extractFunction(serviceWorker, 'scheduleBreakerResume')}\n${extractFunction(serviceWorker, 'resumeBreakerIfExpired')}\n${alarmListener}\nthis.api = { fail: noteGlobalProxyFailure, response: noteProxyResponse };`, sandbox);
+
+  sandbox.api.fail();
+  assert.equal(Object.keys(stored).length, 0, 'one failure does not open the breaker');
+
+  now += 10_000;
+  sandbox.api.fail();
+  assert.equal(Object.keys(stored).length, 0, 'failures exactly 10 seconds apart are outside the rolling window');
+
+  sandbox.api.response(); // Any completed HTTP response resets the failure count.
+  sandbox.api.fail();
+  assert.equal(Object.keys(stored).length, 0, 'one failure after success is insufficient');
+  now += 9_999;
+  sandbox.api.fail();
+
+  const firstUntil = stored.bhSuspendedUntil;
+  const firstAlarm = alarms[0];
+  assert.equal(firstUntil, now + 40_000, 'the suspension lasts exactly 40 seconds');
+  assert.equal(refreshes, 1, 'opening the breaker immediately removes redirect rules');
+  assert.deepEqual(firstAlarm, { name: 'bh-breaker-resume', when: firstUntil + 50 },
+    'the automatic resume alarm is scheduled just after the cooldown expires');
+  assert.equal(typeof registeredAlarmListener, 'function', 'the service worker registers the resume alarm handler');
+
+  registeredAlarmListener({ name: 'unrelated-alarm' });
+  assert.deepEqual(removed, [], 'unrelated alarms do not affect the breaker');
+
+  // Requests already in flight can still fail after the first open transition.
+  // A second pair extends the stored deadline while the first alarm is pending.
+  now += 30_000;
+  sandbox.api.fail();
+  now += 5_000;
+  sandbox.api.fail();
+  const extendedUntil = stored.bhSuspendedUntil;
+  assert.equal(extendedUntil, now + 40_000, 'new failures extend the current suspension');
+  assert.equal(refreshes, 2, 'the extended suspension also refreshes the redirect rules');
+
+  // Deliver the old alarm at its original deadline. It must reschedule instead
+  // of clearing the newer stored deadline and re-enabling redirects early.
+  now = firstAlarm.when;
+  registeredAlarmListener({ name: 'bh-breaker-resume' });
+  assert.equal(stored.bhSuspendedUntil, extendedUntil, 'a stale alarm preserves the newer suspension');
+  assert.deepEqual(removed, [], 'a stale alarm never removes the active suspension');
+  assert.deepEqual(alarms.at(-1), { name: 'bh-breaker-resume', when: extendedUntil + 50 },
+    'a stale alarm is moved to the current expiry');
+  assert.equal(refreshes, 2, 'a stale alarm does not reinstall redirect rules');
+
+  now = extendedUntil + 50;
+  registeredAlarmListener({ name: 'bh-breaker-resume' });
+  assert.deepEqual(removed, ['bhSuspendedUntil'], 'the current alarm clears the expired suspension');
+  assert.equal(refreshes, 3, 'clearing suspension reinstalls the normal redirect rules');
 });
