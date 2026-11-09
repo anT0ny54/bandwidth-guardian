@@ -9,7 +9,7 @@
 </head><body>
 <img id="f1" src="http://cdn.test:__PORT__/img/fallback/proxyfail-1.png">
 <img id="f2" srcset="http://cdn.test:__PORT__/img/fallback/proxyfail-ss.png 1x, http://cdn.test:__PORT__/img/fallback/proxyfail-ss2.png 2x">
-<picture id="fp"><source srcset="http://cdn.test:__PORT__/img/fallback/proxyfail-picture.png?w=40&quality=80 1x"><img id="fpimg" src="http://cdn.test:__PORT__/img/fallback/picture-fallback.png"></picture>
+<picture id="fp"><source id="fps"><script>document.getElementById("fps").srcset = "http://cdn.test:__PORT__/img/fallback/proxyfail-picture.png?w=40&quality=80 1x";</script><img id="fpimg" src="http://cdn.test:__PORT__/img/fallback/picture-fallback.png"></picture>
 <img id="f3" src="http://cdn.test:__PORT__/img/fallback/proxy403.png">
 <img id="f4" src="http://cdn.test:__PORT__/img/fallback/proxyfail-originfail.png">
 <div class="box" id="fi1" style="background-image:url(http://cdn.test:__PORT__/img/fallback/proxyfail-inline.png)"></div>
