@@ -150,14 +150,23 @@ function createServer({ pagesDir }) {
   }
 
   async function proxy(req, res, u, entry) {
-    if (state.proxyDown) { req.socket.destroy(); return; }
+    // Attribute the request to its original URL first, so even requests that
+    // fail below stay visible to the assertions (proxied(), assertNoProxyLoops).
+    const raw = u.search.replace(/^\?/, '');
+    const { url } = getImageUrl.fn({ rawQuery: raw, queryStringParameters: Object.fromEntries(u.searchParams) });
+    entry.original = url || '';
+    if (state.proxyDown) {
+      // An unreachable proxy host looks like a TCP reset to Chrome
+      // (net::ERR_CONNECTION_RESET). A plain destroy() yields
+      // net::ERR_EMPTY_RESPONSE, which the service worker does not count as a
+      // reachability failure, so the circuit breaker would never open.
+      req.socket.resetAndDestroy();
+      return;
+    }
     res.setHeader('access-control-allow-origin', '*');
     res.setHeader('access-control-expose-headers', 'X-BH-Original-Size, X-BH-Compressed-Size, X-BH-Bytes-Saved');
     // no-store: every duplicate proxied request must reach the server log.
     res.setHeader('cache-control', 'no-store');
-    const raw = u.search.replace(/^\?/, '');
-    const { url } = getImageUrl.fn({ rawQuery: raw, queryStringParameters: Object.fromEntries(u.searchParams) });
-    entry.original = url || '';
     if (!url) { res.setHeader('content-type', 'text/plain'); return res.end('bandwidth-hero-proxy'); }
     if (url.includes('proxyfail')) { res.statusCode = 500; res.setHeader('content-type', 'text/plain'); return res.end('Processing failure'); }
     if (url.includes('proxy403')) { res.statusCode = 403; res.setHeader('content-type', 'text/plain'); return res.end('Forbidden'); }
