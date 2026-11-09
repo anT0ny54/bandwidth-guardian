@@ -227,12 +227,25 @@ let statsFlushTimer = null;
 let statsFlushInProgress = false;
 let statsMirrorTimer = null;
 let statsMirrorWriteInProgress = false;
+let statsMirrorRetryDelay = 1000;
 let statsStartupWriteInProgress = true; // startup recovery's first storage read/write
+let statsStartupRetryTimer = null;
+let statsStartupRetryDelay = 1000;
 let statsResetPending = false;
 let statsResetInProgress = false;
 const statsResetResponders = [];
 
 const hasPendingStats = () => !!(pendingStats.filesProcessed || pendingStats.bytesProcessed || pendingStats.bytesSaved);
+
+function restorePendingStats(delta) {
+  pendingStats = {
+    filesProcessed: pendingStats.filesProcessed + delta.filesProcessed,
+    bytesProcessed: pendingStats.bytesProcessed + delta.bytesProcessed,
+    bytesSaved: pendingStats.bytesSaved + delta.bytesSaved
+  };
+  mirrorPendingStats();
+  scheduleStatsFlush();
+}
 
 function finishStatsResetIfReady() {
   if (!statsResetPending || statsFlushInProgress || statsMirrorWriteInProgress ||
@@ -275,8 +288,16 @@ function resetStatsCounters(sendResponse) {
   pendingStats = { ...ZERO_STATS };
   if (statsFlushTimer) { clearTimeout(statsFlushTimer); statsFlushTimer = null; }
   if (statsMirrorTimer) { clearTimeout(statsMirrorTimer); statsMirrorTimer = null; }
+  statsMirrorRetryDelay = 1000;
   if (typeof sendResponse === "function") statsResetResponders.push(sendResponse);
   statsResetPending = true;
+  // A queued startup retry has no storage operation in flight. Reset supersedes
+  // recovery in that case and can safely clear the journal immediately.
+  if (statsStartupRetryTimer) {
+    clearTimeout(statsStartupRetryTimer);
+    statsStartupRetryTimer = null;
+    statsStartupWriteInProgress = false;
+  }
   finishStatsResetIfReady();
 }
 
@@ -285,35 +306,66 @@ function flushStats() {
   // Startup recovery and ordinary flushes must not race each other's read/modify/write.
   if (statsStartupWriteInProgress) return;
   if (statsFlushInProgress) { scheduleStatsFlush(); return; }
+  // The write-ahead mirror must finish before a flush clears it. Otherwise a
+  // worker shutdown between the flush read and commit can lose this batch.
+  if (statsMirrorTimer || statsMirrorWriteInProgress) return;
   if (!hasPendingStats()) return;
   statsFlushInProgress = true;
   const delta = pendingStats;
-  pendingStats = { filesProcessed: 0, bytesProcessed: 0, bytesSaved: 0 };
-  chrome.storage.local.get({ stats: ZERO_STATS }, d => {
-    // A reset requested during the read wins over this stale delta.
+  pendingStats = { ...ZERO_STATS };
+
+  const restoreDelta = () => {
+    statsFlushInProgress = false;
     if (statsResetPending || statsResetInProgress) {
-      statsFlushInProgress = false;
       finishStatsResetIfReady();
       return;
     }
-    // Clone before merging: when `stats` is missing, Chromium can hand back
-    // the very ZERO_STATS object passed as the default — mutating it would
-    // poison every later spread/reset built from it.
-    const s = { ...(d.stats || ZERO_STATS) };
-    s.filesProcessed += delta.filesProcessed;
-    s.bytesProcessed += delta.bytesProcessed;
-    s.bytesSaved     += delta.bytesSaved;
-    // B8: commit stats and clear the crash mirror in ONE atomic write — a
-    // worker kill between two writes can no longer strand the delta.
-    chrome.storage.local.set({ stats: s, statsPending: { ...ZERO_STATS } }, () => {
-      statsFlushInProgress = false;
-      if (statsResetPending) {
+    // Storage read/write failures must not silently discard the in-memory
+    // batch. The journal is refreshed before the next flush attempt.
+    restorePendingStats(delta);
+  };
+
+  try {
+    chrome.storage.local.get({ stats: ZERO_STATS }, d => {
+      // A reset requested during the read wins over this stale delta.
+      if (statsResetPending || statsResetInProgress) {
+        statsFlushInProgress = false;
         finishStatsResetIfReady();
-      } else if (hasPendingStats()) {
-        scheduleStatsFlush();
+        return;
+      }
+      if (chrome.runtime?.lastError) {
+        restoreDelta();
+        return;
+      }
+      // Clone before merging: when `stats` is missing, Chromium can hand back
+      // the very ZERO_STATS object passed as the default — mutating it would
+      // poison every later spread/reset built from it.
+      const s = { ...(d?.stats || ZERO_STATS) };
+      s.filesProcessed += delta.filesProcessed;
+      s.bytesProcessed += delta.bytesProcessed;
+      s.bytesSaved     += delta.bytesSaved;
+      // B8: commit stats and clear the crash mirror in ONE atomic write — a
+      // worker kill between two writes can no longer strand the delta.
+      try {
+        chrome.storage.local.set({ stats: s, statsPending: { ...ZERO_STATS } }, () => {
+          const writeFailed = !!chrome.runtime?.lastError;
+          statsFlushInProgress = false;
+          if (statsResetPending) {
+            finishStatsResetIfReady();
+          } else if (writeFailed) {
+            restorePendingStats(delta);
+          } else if (hasPendingStats()) {
+            mirrorPendingStats();
+            scheduleStatsFlush();
+          }
+        });
+      } catch {
+        restoreDelta();
       }
     });
-  });
+  } catch {
+    restoreDelta();
+  }
 }
 
 function scheduleStatsFlush() {
@@ -321,25 +373,56 @@ function scheduleStatsFlush() {
   statsFlushTimer = setTimeout(() => { statsFlushTimer = null; flushStats(); }, 750);
 }
 
-function mirrorPendingStats() {
-  if (statsMirrorTimer || statsMirrorWriteInProgress || statsStartupWriteInProgress ||
-      statsResetPending || statsResetInProgress) return;
+function mirrorPendingStats(delay = 250) {
+  if (statsMirrorTimer || statsMirrorWriteInProgress || statsFlushInProgress ||
+      statsStartupWriteInProgress || statsResetPending || statsResetInProgress) return;
   statsMirrorTimer = setTimeout(() => {
     statsMirrorTimer = null;
-    if (!hasPendingStats() || statsResetPending || statsResetInProgress) return;
+    if (!hasPendingStats() || statsFlushInProgress || statsResetPending || statsResetInProgress) return;
     statsMirrorWriteInProgress = true;
     const snapshot = { ...pendingStats };
     try {
       chrome.storage.local.set({ statsPending: snapshot }, () => {
         statsMirrorWriteInProgress = false;
-        if (statsResetPending) finishStatsResetIfReady();
-        else if (hasPendingStats()) mirrorPendingStats();
+        if (statsResetPending) {
+          finishStatsResetIfReady();
+        } else if (chrome.runtime?.lastError) {
+          // The journal is the crash-safe copy of this in-memory batch. Keep
+          // retrying with bounded backoff rather than letting the later flush
+          // clear a journal that never reached storage.
+          if (hasPendingStats()) {
+            const retryDelay = statsMirrorRetryDelay;
+            statsMirrorRetryDelay = Math.min(statsMirrorRetryDelay * 2, 30000);
+            mirrorPendingStats(retryDelay);
+          }
+        } else {
+          statsMirrorRetryDelay = 1000;
+          // New activity may have arrived while this snapshot was being written.
+          // Don't rewrite an unchanged snapshot: the normal flush will clear it.
+          if (hasPendingStats()) {
+            if (pendingStats.filesProcessed !== snapshot.filesProcessed ||
+                pendingStats.bytesProcessed !== snapshot.bytesProcessed ||
+                pendingStats.bytesSaved !== snapshot.bytesSaved) {
+              mirrorPendingStats();
+            } else {
+              // The normal flush may have fired while this journal write was
+              // pending. Resume it now rather than polling every 750 ms.
+              scheduleStatsFlush();
+            }
+          }
+        }
       });
     } catch {
       statsMirrorWriteInProgress = false;
-      if (statsResetPending) finishStatsResetIfReady();
+      if (statsResetPending) {
+        finishStatsResetIfReady();
+      } else if (hasPendingStats()) {
+        const retryDelay = statsMirrorRetryDelay;
+        statsMirrorRetryDelay = Math.min(statsMirrorRetryDelay * 2, 30000);
+        mirrorPendingStats(retryDelay);
+      }
     }
-  }, 1000);
+  }, delay);
 }
 
 function recordStats(bytes, saved) {
@@ -356,6 +439,10 @@ function recordStats(bytes, saved) {
 let statsRevision = 0;
 const startupStatsRevision = statsRevision;
 function finishStatsStartup() {
+  if (statsStartupRetryTimer) {
+    clearTimeout(statsStartupRetryTimer);
+    statsStartupRetryTimer = null;
+  }
   statsStartupWriteInProgress = false;
   if (statsResetPending) {
     finishStatsResetIfReady();
@@ -366,39 +453,76 @@ function finishStatsStartup() {
     scheduleStatsFlush();
   }
 }
-chrome.storage.local.get({ stats: ZERO_STATS, statsPending: null }, d => {
-  if (startupStatsRevision !== statsRevision) {
-    finishStatsStartup();
-    return;
-  }
-  const p = d.statsPending;
-  if (!p) {
-    finishStatsStartup();
-    return;
-  }
-  const files = Number(p.filesProcessed) || 0;
-  const bytes = Math.max(0, Number(p.bytesProcessed) || 0);
-  const saved = Math.max(0, Number(p.bytesSaved) || 0);
-  if (!files && !bytes && !saved) {
-    try {
-      chrome.storage.local.remove("statsPending", finishStatsStartup);
-    } catch {
-      finishStatsStartup();
-    }
-    return;
-  }
-  // Clone for the same reason as flushStats: the default object can be the
-  // shared ZERO_STATS instance; never merge into it in place.
-  const s = { ...(d.stats || ZERO_STATS) };
-  s.filesProcessed += files;
-  s.bytesProcessed += bytes;
-  s.bytesSaved     += saved;
+
+function retryStatsStartup() {
+  if (statsStartupRetryTimer) return;
+  const delay = statsStartupRetryDelay;
+  statsStartupRetryDelay = Math.min(statsStartupRetryDelay * 2, 30000);
+  statsStartupRetryTimer = setTimeout(() => {
+    statsStartupRetryTimer = null;
+    recoverStatsStartup();
+  }, delay);
+}
+
+function recoverStatsStartup() {
   try {
-    chrome.storage.local.set({ stats: s, statsPending: { ...ZERO_STATS } }, finishStatsStartup);
+    chrome.storage.local.get({ stats: ZERO_STATS, statsPending: null }, d => {
+      if (chrome.runtime?.lastError || !d) {
+        // Do not enable writes while an older journal may still be on disk:
+        // a new mirror could otherwise overwrite the only recoverable copy.
+        if (startupStatsRevision !== statsRevision || statsResetPending) finishStatsStartup();
+        else retryStatsStartup();
+        return;
+      }
+      statsStartupRetryDelay = 1000;
+      if (startupStatsRevision !== statsRevision) {
+        finishStatsStartup();
+        return;
+      }
+      const p = d.statsPending;
+      if (!p) {
+        finishStatsStartup();
+        return;
+      }
+      const files = Number(p.filesProcessed) || 0;
+      const bytes = Math.max(0, Number(p.bytesProcessed) || 0);
+      const saved = Math.max(0, Number(p.bytesSaved) || 0);
+      if (!files && !bytes && !saved) {
+        try {
+          chrome.storage.local.remove("statsPending", finishStatsStartup);
+        } catch {
+          finishStatsStartup();
+        }
+        return;
+      }
+      // Clone for the same reason as flushStats: the default object can be the
+      // shared ZERO_STATS instance; never merge into it in place.
+      const s = { ...(d.stats || ZERO_STATS) };
+      s.filesProcessed += files;
+      s.bytesProcessed += bytes;
+      s.bytesSaved     += saved;
+      const finishRecovery = () => {
+        if (chrome.runtime?.lastError && startupStatsRevision === statsRevision && !statsResetPending) {
+          restorePendingStats({ filesProcessed: files, bytesProcessed: bytes, bytesSaved: saved });
+        }
+        finishStatsStartup();
+      };
+      try {
+        chrome.storage.local.set({ stats: s, statsPending: { ...ZERO_STATS } }, finishRecovery);
+      } catch {
+        if (startupStatsRevision === statsRevision && !statsResetPending) {
+          restorePendingStats({ filesProcessed: files, bytesProcessed: bytes, bytesSaved: saved });
+        }
+        finishStatsStartup();
+      }
+    });
   } catch {
-    finishStatsStartup();
+    if (startupStatsRevision !== statsRevision || statsResetPending) finishStatsStartup();
+    else retryStatsStartup();
   }
-});
+}
+
+recoverStatsStartup();
 
 // Observe proxy responses, narrowed to the configured proxy origin (O3) and
 // re-registered whenever proxyBase changes. onCompleted feeds statistics and
