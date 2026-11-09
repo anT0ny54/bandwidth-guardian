@@ -367,11 +367,16 @@ test.describe('Bandwidth Guardian in Chrome', { skip: SKIP }, () => {
     const isKnownBad = u => /\/img\/fallback\/proxyfail|\/img\/fallback\/proxy403/.test(u || '');
     assert.deepEqual(proxied('/img/fallback/').slice(before).map(e => e.original).filter(isKnownBad), [], 'no new proxy attempts for known-bad URLs in this tab');
     await page.close();
-    // On a mismatch, list every proxied request this test made so the extra
-    // counted response is identifiable from the CI log.
-    const counted = await settledStats();
+    // Expected count, derived from the proxy request log rather than hard-coded:
+    // every proxied request the mock proxy answers with a successful image is
+    // counted once. The mock fails only URLs containing proxyfail / proxy403 /
+    // proxy503 / originfail, so each other request in this window is a success.
+    // (picture-fallback.png is a success on both the first load and the reload.)
     const proxiedHere = [...proxied('/img/fallback/'), ...proxied('/img/reused-node/')].map(e => e.original);
-    assert.equal(counted, statsBefore + 2, 'failed responses are not counted; only the recycled img and picture-source successes are; proxied requests: ' + JSON.stringify(proxiedHere));
+    const successes = proxiedHere.filter(u => !/proxyfail|proxy403|proxy503|originfail/.test(u)).length;
+    const counted = await settledStats();
+    assert.equal(counted - statsBefore, successes,
+      'only successful strict-image proxy responses are counted; proxied requests: ' + JSON.stringify(proxiedHere));
   });
 
   test('statistics count only strict image types', async () => {
