@@ -1926,3 +1926,109 @@ test('service worker opens the breaker after two failures inside 10 seconds and 
   assert.deepEqual(removed, ['bhSuspendedUntil'], 'the current alarm clears the expired suspension');
   assert.equal(refreshes, 3, 'clearing suspension reinstalls the normal redirect rules');
 });
+
+test('a src assigned after a rewritten srcset restores the original candidates, not proxy URLs', () => {
+  const h = createDomHarness();
+  h.publishSettings({ redirect: false });
+  const img = new h.HTMLImageElement();
+  const candidate = 'https://cdn.example/lazy/a.jpg?w=40&quality=80';
+  img.srcset = `${candidate} 1x`;
+  assertProxied(img.getAttribute('srcset').split(' ')[0], candidate);
+
+  // A lazy loader commonly assigns srcset first and src second.
+  img.src = 'https://cdn.example/lazy/main.jpg';
+  img.currentSrc = img.getAttribute('src');
+  img.dispatchEvent({ type: 'error' });
+  const [, timer] = [...h.timerCallbacks.entries()].filter(([, entry]) => entry.delay === 1500).at(-1);
+  timer.callback();
+
+  assert.equal(img.getAttribute('srcset'), `${candidate} 1x`,
+    'the restore must use the original candidate, never the proxy URL the page already received');
+});
+
+test('bypass eviction only starts when the live bypass table is actually full', async () => {
+  const sources = ['bypassCondition', 'bypassUrlFromRule', 'addBypass'].map(name => extractFunction(serviceWorker, name));
+  const removed = [];
+  const sandbox = {
+    Promise, Number, JSON, Error, Set, Map, RegExp, URL, decodeURIComponent,
+    chrome: { declarativeNetRequest: { updateSessionRules: async update => {
+      removed.push(...(update.removeRuleIds || []));
+    } } }
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(`
+    const PROXY_REQUEST_TYPES = ["image", "object"];
+    const PRIORITY_BYPASS = 4;
+    const BYPASS_BASE_ID = 100000;
+    const BYPASS_LIMIT = 3000;
+    const BYPASS_REGEX_LIMIT = 900;
+    const BYPASSABLE_URL_RE = /^https?:\\/\\/[\\x21-\\x7e]+$/;
+    const MAX_BYPASS_REGEX_LENGTH = 1900;
+    let bypassRules = new Map();
+    let bypassRegexRules = new Set();
+    let bypassNextId = BYPASS_BASE_ID;
+    let bypassChain = null;
+    const bypassReady = () => Promise.resolve();
+    ${sources.join('\n')}
+    this.add = addBypass;
+    this.size = () => bypassRules.size;
+  `, sandbox);
+
+  // One flush of 2,000 failures is well under the 3,000-rule cap.
+  const urls = Array.from({ length: 2000 }, (_, i) => `https://cdn.example/bulk/${i}.png`);
+  const bypassed = await sandbox.add(7, urls);
+  assert.equal(bypassed.length, 2000, 'every failed URL receives a bypass');
+  assert.equal(sandbox.size(), 2000, 'the live table keeps all entries');
+  assert.deepEqual(removed, [], 'no bypass is evicted while capacity remains');
+});
+
+test('custom badges are static siblings of the preset grids, never appended grid children', () => {
+  // Returns the markup inside the <div id="..."> element, matching nested divs.
+  const innerOf = (html, id) => {
+    const open = html.indexOf(`id="${id}"`);
+    assert.ok(open >= 0, `#${id} exists`);
+    const start = html.indexOf('>', open) + 1;
+    let depth = 1;
+    const re = /<\/?div\b/g;
+    re.lastIndex = start;
+    let m;
+    while ((m = re.exec(html))) {
+      depth += m[0] === '</div' ? -1 : 1;
+      if (depth === 0) return html.slice(start, m.index);
+    }
+    assert.fail(`#${id} is not closed`);
+  };
+  for (const file of ['popup.html', 'options.html']) {
+    const html = fs.readFileSync(path.join(ROOT, file), 'utf8');
+    assert.doesNotMatch(innerOf(html, 'qualityPresets'), /custom-badge/, `${file}: quality badge is outside its grid`);
+    assert.match(html, /class="[^"]*custom-badge[^"]*" id="qualityCustom" hidden>Custom</, `${file}: quality badge is static and hidden by default`);
+  }
+  const optionsHtml = fs.readFileSync(path.join(ROOT, 'options.html'), 'utf8');
+  assert.doesNotMatch(innerOf(optionsHtml, 'widthPresets'), /custom-badge/, 'width badge is outside its grid');
+  assert.match(optionsHtml, /id="widthCustom" hidden>Custom</);
+  for (const source of [popupSource, optionsSource]) {
+    assert.doesNotMatch(source, /appendChild\(badge\)|createElement\("span"\)/, 'badges are no longer created at runtime');
+  }
+});
+
+test('retry re-requests the original URL when an img attribute still holds a proxy URL', () => {
+  const sandbox = {
+    URL,
+    safeURL(value, base) { try { return new URL(value, base); } catch { return null; } }
+  };
+  vm.createContext(sandbox);
+  vm.runInContext([
+    extractFunction(prehook, 'parseSrcset'),
+    extractFunction(prehook, 'directUrlFor'),
+    extractFunction(prehook, 'directSrcset')
+  ].join('\n') + '\nthis.direct = directUrlFor; this.directSet = directSrcset;', sandbox);
+
+  const original = 'https://cdn.example/retry/a.png?w=40&quality=80';
+  const proxy = `https://proxy.example/convert?url=${encodeURIComponent(original)}&jpeg=0&bw=0&quality=60`;
+  const map = new Map([[proxy, original]]);
+  assert.equal(sandbox.direct(proxy, 'https://page.example/', map), original, 'a proxy src maps back to its original');
+  assert.equal(sandbox.direct('https://cdn.example/other.png', 'https://page.example/', map), 'https://cdn.example/other.png',
+    'unrelated URLs are untouched');
+  assert.equal(sandbox.directSet(`${proxy} 1x, https://cdn.example/other.png 2x`, 'https://page.example/', map),
+    `${original} 1x, https://cdn.example/other.png 2x`, 'only proxy candidates are restored and descriptors kept');
+});
