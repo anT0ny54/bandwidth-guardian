@@ -628,6 +628,10 @@ const CONNECTION_NET_ERRORS = new Set([
   "net::ERR_CONNECTION_REFUSED", "net::ERR_CONNECTION_ABORTED",
   "net::ERR_CONNECTION_FAILED", "net::ERR_CONNECTION_TIMED_OUT",
   "net::ERR_ADDRESS_UNREACHABLE", "net::ERR_INTERNET_DISCONNECTED",
+  // The endpoint accepted the connection but closed it without any response
+  // bytes (crashed proxy, killed connection) — as unreachable as a refused
+  // or reset connection.
+  "net::ERR_EMPTY_RESPONSE",
   // Proxy-path failures and DNS resolution failures.
   "net::ERR_PROXY_CONNECTION_FAILED", "net::ERR_SOCKS_CONNECTION_FAILED",
   "net::ERR_SOCKS_CONNECTION_HOST_UNREACHABLE", "net::ERR_NAME_NOT_RESOLVED",
