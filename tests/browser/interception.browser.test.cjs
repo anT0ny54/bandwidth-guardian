@@ -362,7 +362,10 @@ test.describe('Bandwidth Guardian in Chrome', { skip: SKIP }, () => {
     const before = proxied('/img/fallback/').length;
     await page.reload({ waitUntil: 'load' });
     await sleep(800);
-    assert.deepEqual(proxied('/img/fallback/').slice(before).map(e => e.original), [], 'no new proxy attempts for known-bad URLs in this tab');
+    // Only known-bad URLs must not be retried. Healthy images (e.g. the <img>
+    // inside <picture>, which is not a failing URL) may be proxied normally.
+    const isKnownBad = u => /\/img\/fallback\/proxyfail|\/img\/fallback\/proxy403/.test(u || '');
+    assert.deepEqual(proxied('/img/fallback/').slice(before).map(e => e.original).filter(isKnownBad), [], 'no new proxy attempts for known-bad URLs in this tab');
     await page.close();
     assert.equal(await settledStats(), statsBefore + 2, 'failed responses are not counted; only the recycled img and picture-source successes are');
   });
