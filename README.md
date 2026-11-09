@@ -236,17 +236,8 @@ Without `CHROME_PATH` the browser suite skips itself.
 ## Stats
 
 Processed images, bytes processed and bytes saved are read from the proxy's
-response headers. Pending counters are briefly coalesced, then written to a
-small recovery journal (`statsPending`); the normal batch flush commits the
-totals and clears that journal in one storage write. A failed batch read or
-commit restores the in-memory delta to the pending queue rather than dropping it.
-Failed journal writes are retried with capped exponential backoff. While a
-journal write or retry is pending, the normal flush waits without repeatedly
-polling; a successful journal write then resumes the flush. A failed startup
-read is retried before new journal writes are enabled, so an older recovery
-snapshot cannot be overwritten. If the MV3 worker restarts before a
-batch is flushed, startup recovery merges the journal into the saved totals. The **Reset stats** button clears both
-the totals and the journal.
+response headers and flushed in batches. The **Reset stats** button clears the
+counters.
 
 ## Build
 
