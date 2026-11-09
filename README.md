@@ -119,9 +119,19 @@ their module scripts.
   pending, its stale fallback markers, metadata and timers are cleared in both
   execution worlds. Timer ownership checks prevent a cancelled callback already
   queued by the browser from restoring over the newer source.
-- If the proxy itself is unreachable (6 connection-level failures within 30 s),
-  the redirect is suspended for 2 minutes and pages load images directly; it
-  then resumes automatically.
+- If the proxy itself becomes unreachable (2 connection-level failures within
+  a rolling 10-second window), image redirects are suspended for 40 seconds so
+  pages load images directly; an alarm then resumes proxying automatically.
+  Only recognized Chromium transport, DNS and proxy-path errors count
+  (for example `ERR_CONNECTION_REFUSED`, `ERR_CONNECTION_TIMED_OUT`,
+  `ERR_PROXY_CONNECTION_FAILED`, `ERR_SOCKS_CONNECTION_FAILED` and
+  `ERR_NAME_NOT_RESOLVED`). TLS/certificate,
+  CSP/policy, upstream-tunnel, generic and other unrecognized errors can still
+  trigger direct fallback for the affected image, but never open the global
+  breaker. HTTP error responses (including 429, 503 and 520–530) and
+  ORB/response-blocking errors also use per-image direct fallback only. Any
+  completed HTTP response, including an error status, confirms the proxy was
+  reachable and resets the failure window.
 - Usage statistics are counted only from successful proxy responses of the
   strict image types above; failed and fallback requests are never counted.
 
@@ -244,33 +254,9 @@ builds the extension. If a release for the manifest version does not exist, the
 workflow creates it; if that release already exists, it replaces the release
 asset. Bump `manifest.json`'s version when publishing a distinct release.
 
-The shipped code is periodically re-audited for dead/redundant code,
-cross-layer conflicts, bugs and optimization opportunities (details in
-`CHANGELOG.md`). The latest pass keeps the DOM fallback synchronized with the
-actual dynamic rules retained by Chrome when every DNR installation attempt is
-rejected; rejects proxy base URLs that already define the reserved `url` query
-parameter; and retries stylesheet rules with case-insensitive CSS `url()`
-matching. It also restores failed conflict URLs selected through
-`<picture><source srcset>` to their original URL during the confirmed direct
-retry, clears stale parent-image failure state when a source is replaced, and
-keeps the options page's quality/width reset baselines current when settings
-change elsewhere without overwriting active edits. It also deduplicates
-same-URL fallback failures while a DNR bypass is being installed, drops queued
-fallback batches when their tab closes (without cancelling other tabs' shared
-timer), and serializes runtime-state storage writes so a stale callback cannot
-overwrite a newer redirect state. A subsequent full re-read of every shipped
-file hardened the bypass-rule eviction path against an empty-map edge case,
-removed four pieces of dead or redundant service-worker code (duplicate
-eviction lookup, unread bookkeeping field, two provably-dead guards), and added
-a cheap origin-prefix prefilter to proxy-URL detection; the cross-layer pattern
-sync, DOM ids and script load order were re-verified with no further changes
-needed. All 38 simulation tests, JavaScript syntax checks, and the
-reproducible build pass. The browser suite includes
-picture-source fallback, re-arm, and repeat-failure coverage, but could not run
-here because `playwright-core` is unavailable. The documented
-`./build.sh` command is executable from a fresh checkout. No additional runtime
-code was safe to remove: the remaining shared helpers and fallback paths are
-referenced by active flows. No version bump.
+See [Fallback, loops and the circuit breaker](#fallback-loops-and-the-circuit-breaker)
+for the failure classification, two-in-10-seconds threshold and 40-second
+automatic resume behavior.
 
 ## 🔗 Related projects (not part of this repository)
 

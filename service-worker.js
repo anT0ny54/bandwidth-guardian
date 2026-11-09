@@ -460,12 +460,15 @@ function handleProxyCompleted(details) {
 
   const headers = headerMap(responseHeaders);
   const contentType = (headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
+  // Any completed HTTP response proves the proxy endpoint was reachable,
+  // regardless of status. Reset the connection-failure window before deciding
+  // whether this particular image needs a direct retry.
+  noteProxyResponse();
   const ok = typeof statusCode !== "number" || (statusCode >= 200 && statusCode < 300);
 
   if (!ok) {
-    // 503 (Sharp unavailable), 429 and Cloudflare-style 52x mean the proxy as
-    // a whole is unhealthy; other statuses are specific to this image.
-    if (statusCode === 503 || statusCode === 429 || (statusCode >= 520 && statusCode <= 530)) noteGlobalProxyFailure();
+    // HTTP errors still get a direct retry for this image, but are not
+    // themselves connection-level failures.
     scheduleFallback(details);
     return;
   }
@@ -473,7 +476,6 @@ function handleProxyCompleted(details) {
   // cannot render; fall back. image/* types outside the strict list (AVIF
   // passthrough, etc.) still render, they are just not counted below.
   if (contentType && !contentType.startsWith("image/")) { scheduleFallback(details); return; }
-  noteProxySuccess();
   if (fromCache) return;
 
   // STRICT detected image types only: count the response only when its actual
@@ -484,15 +486,29 @@ function handleProxyCompleted(details) {
   recordStats(st.received, st.saved);
 }
 
-// Network errors that say nothing about the proxy: the page cancelled the
-// request (navigation, element removed), another extension/policy blocked it,
-// or the client's own cache/network state tripped. ORB and BLOCKED_BY_RESPONSE
-// are deliberately NOT ignored: when they fire on a PROXY-origin URL they mean
-// the proxy answered with a non-image body (e.g. an HTML error page from a dead
-// or cold public proxy), which is a proxy failure and must trigger the fallback.
+// Errors that do not indicate a failed proxy connection: the page cancelled
+// the request, another extension/policy blocked it, or the client's cache or
+// network changed. They do not need a fallback retry or breaker accounting.
 const IGNORED_NET_ERRORS = new Set([
   "net::ERR_ABORTED", "net::ERR_BLOCKED_BY_CLIENT", "net::ERR_BLOCKED_BY_ADMINISTRATOR",
   "net::ERR_CACHE_MISS", "net::ERR_NETWORK_CHANGED"
+]);
+// Only errors that indicate proxy reachability / transport failure may open
+// the global breaker. Chromium also reports TLS, certificate, CSP, policy,
+// generic and upstream-response errors through webRequest; those must not be
+// mistaken for an unreachable proxy. Unknown errors still get per-image
+// recovery below, but are deliberately not promoted to global failures.
+const CONNECTION_NET_ERRORS = new Set([
+  // Socket/connection failures.
+  "net::ERR_CONNECTION_CLOSED", "net::ERR_CONNECTION_RESET",
+  "net::ERR_CONNECTION_REFUSED", "net::ERR_CONNECTION_ABORTED",
+  "net::ERR_CONNECTION_FAILED", "net::ERR_CONNECTION_TIMED_OUT",
+  "net::ERR_ADDRESS_UNREACHABLE", "net::ERR_INTERNET_DISCONNECTED",
+  // Proxy-path failures and DNS resolution failures.
+  "net::ERR_PROXY_CONNECTION_FAILED", "net::ERR_SOCKS_CONNECTION_FAILED",
+  "net::ERR_SOCKS_CONNECTION_HOST_UNREACHABLE", "net::ERR_NAME_NOT_RESOLVED",
+  "net::ERR_NAME_RESOLUTION_FAILED", "net::ERR_DNS_TIMED_OUT",
+  "net::ERR_DNS_MALFORMED_RESPONSE", "net::ERR_DNS_SERVER_FAILED"
 ]);
 function onProxyError(details) {
   if (!configuredProxyOrigin) {
@@ -504,7 +520,7 @@ function onProxyError(details) {
 function handleProxyError(details) {
   const { url, error } = details || {};
   if (!url || !isGuardianProxyUrl(url) || IGNORED_NET_ERRORS.has(error)) return;
-  noteGlobalProxyFailure();
+  if (CONNECTION_NET_ERRORS.has(error)) noteGlobalProxyFailure();
   scheduleFallback(details);
 }
 
@@ -635,7 +651,7 @@ function addBypass(tabId, urls) {
       const needsSlot = addRules.length >= BYPASS_LIMIT - nextRules.size;
       if (needsSlot) {
         const oldest = nextRules.entries().next().value;
-        // Hardened: never read oldest[0] on a theoretically empty map.
+        // No entry can be evicted, so leave this candidate uninstalled.
         if (!oldest) continue;
         // Evicting a non-regex oldest rule cannot make room under the regex
         // quota, so skip a quota-blocked regex candidate instead of discarding
@@ -648,8 +664,6 @@ function addBypass(tabId, urls) {
       }
       if (c.baseCondition.regexFilter && nextRegexRules.size >= BYPASS_REGEX_LIMIT) continue;
       const id = bypassNextId++;
-      // tab >= 0 is guaranteed by addBypass's early return; the conditional
-      // branch was dead code.
       const condition = { ...c.baseCondition, resourceTypes: PROXY_REQUEST_TYPES, tabIds: [tab] };
       addRules.push({ id, priority: PRIORITY_BYPASS, action: { type: "allow" }, condition });
       addedKeys.set(c.key, { id, url: c.url });
@@ -791,8 +805,6 @@ function flushFallbacks() {
       // Release each reservation after the DNR result is known. Failed or
       // capacity-limited entries remain eligible for a later request.
       for (const original of originals) fallbackPending.delete(b.tabId + " " + original);
-      // b.tabId >= 0 is guaranteed by scheduleFallback; the negative-tab
-      // branch here was dead code.
       if (!chrome.tabs?.sendMessage || !bypassed?.length) return;
       const allowed = new Set(bypassed);
       const items = Array.from(b.items, ([original, proxyUrl]) => ({ original, proxyUrl }))
@@ -812,17 +824,20 @@ function flushFallbacks() {
 }
 
 // ── Circuit breaker ───────────────────────────────────────────────────────────
-// Connection-level failures (proxy down, DNS failure, 503) are counted; a
-// success resets the count. BREAKER_THRESHOLD failures within BREAKER_WINDOW_MS
-// remove the redirect for BREAKER_COOLDOWN_MS so the web keeps working.
+// Connection-level failures (proxy down, DNS failure, connection timeout) are
+// counted; any completed HTTP response resets the count because it proves the
+// proxy was reachable. HTTP errors and response-body blocking use per-image
+// fallback without opening the breaker.
+// Two BREAKER_THRESHOLD failures within BREAKER_WINDOW_MS remove the redirect
+// for BREAKER_COOLDOWN_MS so the web keeps working.
 // The suspension lives in storage.session, so a browser restart clears it.
-const BREAKER_THRESHOLD   = 6;
-const BREAKER_WINDOW_MS   = 30000;
-const BREAKER_COOLDOWN_MS = 120000;
+const BREAKER_THRESHOLD   = 2;
+const BREAKER_WINDOW_MS   = 10000;
+const BREAKER_COOLDOWN_MS = 40000;
 const BREAKER_ALARM       = "bh-breaker-resume";
 let breakerFailures = [];
 
-function noteProxySuccess() { breakerFailures = []; }
+function noteProxyResponse() { breakerFailures = []; }
 function noteGlobalProxyFailure() {
   const now = Date.now();
   breakerFailures = breakerFailures.filter(t => now - t < BREAKER_WINDOW_MS);
@@ -834,9 +849,33 @@ function noteGlobalProxyFailure() {
   try { chrome.storage.session.set({ bhSuspendedUntil: until }, done); } catch { done(); }
   try { chrome.alarms?.create(BREAKER_ALARM, { when: until + 50 }); } catch {}
 }
+function scheduleBreakerResume(when) {
+  try { chrome.alarms?.create(BREAKER_ALARM, { when }); } catch {}
+}
+function resumeBreakerIfExpired() {
+  const retry = () => scheduleBreakerResume(Date.now() + 1000);
+  try {
+    chrome.storage.session.get({ bhSuspendedUntil: 0 }, data => {
+      if (chrome.runtime?.lastError) { retry(); return; }
+      const until = Number(data?.bhSuspendedUntil) || 0;
+      if (!until) return; // Another alarm or lifecycle event already cleared it.
+      if (until > Date.now()) {
+        // An older alarm can fire after an in-flight request extends the
+        // suspension. Keep the newer deadline and replace the stale alarm.
+        scheduleBreakerResume(until + 50);
+        return;
+      }
+      try {
+        chrome.storage.session.remove("bhSuspendedUntil", () => {
+          if (chrome.runtime?.lastError) { retry(); return; }
+          refreshRules();
+        });
+      } catch { retry(); }
+    });
+  } catch { retry(); }
+}
 chrome.alarms?.onAlarm?.addListener(alarm => {
-  if (alarm.name !== BREAKER_ALARM) return;
-  try { chrome.storage.session.remove("bhSuspendedUntil", () => refreshRules()); } catch { refreshRules(); }
+  if (alarm.name === BREAKER_ALARM) resumeBreakerIfExpired();
 });
 
 function readSuspended(cb) {
@@ -933,10 +972,8 @@ function buildRules(opts, noHeaderMatch, suspended) {
       id: RULE_ID_ALLOW_PROXY, priority: PRIORITY_PROXY, action: { type: "allow" },
       condition: { urlFilter: "|" + proxyOrigin + "/", resourceTypes: PROXY_REQUEST_TYPES }
     });
-    // Note: isUrlFilterCaseSensitive only applies to urlFilter conditions;
-    // these are regexFilters (case-insensitive by design), so the flag would
-    // be ignored — the fifth review pass removed it from the <object> rule
-    // for the same reason.
+    // These regex filters are case-insensitive by design; DNR's
+    // isUrlFilterCaseSensitive option applies only to urlFilter conditions.
     addRules.push({
       id: RULE_ID_ALLOW_SKIP, priority: PRIORITY_EXEMPT, action: { type: "allow" },
       condition: { regexFilter: SKIP_PATTERN, resourceTypes: PROXY_REQUEST_TYPES }

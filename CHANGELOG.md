@@ -8,10 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.2.5] — current release
 
 ### Changed
-- Removed a dead bypass-slot assignment; the decision is immutable after the
-  capacity check and eviction step.
 - Marked `build.sh` executable so the documented `./build.sh` command works
   from a fresh checkout as well as the CI workflow's `bash ./build.sh` call.
+- Tightened the connection-level circuit breaker: only recognized Chromium
+  transport, DNS and proxy-path failures count toward the two-failure,
+  rolling 10-second threshold that suspends image redirects for 40 seconds.
+  SOCKS proxy-path and DNS server failures are included. TLS/certificate,
+  CSP/policy, upstream-tunnel, generic and unrecognized errors
+  retain per-image direct fallback where appropriate but cannot suspend all
+  redirects. HTTP error responses and ORB/response-blocking errors also use
+  per-image fallback only. Any completed HTTP response, including an error
+  status, confirms proxy reachability and resets the failure window.
 
 ### Fixed
 - A repeated failure for the same tab-scoped URL could enter a second fallback
@@ -73,41 +80,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Private-network exclusions now cover IPv4-mapped private IPv6 addresses and
   the full IPv6 link-local `fe80::/10` range in all three interception layers.
 
-### Changed
-- Service worker: merged the duplicate oldest-bypass lookup in the session-rule
-  eviction path into a single iterator step; removed the never-read `isRegex`
-  bookkeeping field, an always-true `tab >= 0` conditional on tab-scoped bypass
-  conditions, and a dead `tabId < 0` guard in the retry broadcast (tab IDs are
-  validated before batching reaches it).
-
-### Fixed
-- The bypass eviction path read `oldest[0]` on a map that was only non-empty by
-  an arithmetic coincidence; an explicit empty-map guard now skips the candidate
-  instead of risking a TypeError if the capacity constants ever change.
-
 ### Maintenance
-- Re-audited every shipped file end to end (manifest, service worker, both DOM
-  layers, popup, options, build script): verified cross-layer pattern sync
-  (conflict/skip/private-host patterns, proxy-base validation, quality clamp),
-  all DOM ids against both HTML pages, and script load order. No changes were
-  needed in content.js, prehook.js, popup.js, options.js, popup.html,
-  options.html, build.sh, defaults.js or the manifest. `isGuardianProxyUrl`
-  gained an origin string-prefix prefilter, avoiding a full `URL` parse for the
-  rare non-proxy candidate event. All 38 simulation tests and JavaScript syntax
-  checks pass. No version bump.
-- Added simulation regressions for element reuse during pending and completed
-  retries, stale timeout callbacks, delayed failure-list synchronization,
-  unknown-tab bypass protection, cross-frame retry batching, unavailable DNR
-  APIs, mapped IPv6 and link-local addresses. Added a real-Chrome regression
-  that reuses a failed image node for a new conflict URL, plus simulation
-  regressions for repeated load cleanup, non-background inline CSS URL
-  declarations, picture-source proxy recovery/re-arming, external settings
-  updates while custom quality/width inputs are dirty, overlapping fallback
-  batches, tab-close cleanup of queued fallback batches, and out-of-order
-  runtime-state storage callbacks.
-- Re-audited the complete patch and its runtime dependencies. All 38 simulation
-  tests, JavaScript syntax checks and the reproducible build pass. The real-Chrome
-  suite remains unexecuted because `playwright-core` is unavailable in this
-  environment; its regressions now wait for the actual picture-source requests
-  and cover a second source failure after re-arming.
-- Updated this existing release entry and README; no version bump.
+- Removed unused bypass bookkeeping and duplicate eviction scans; eviction
+  now safely skips a candidate when no oldest entry exists.
+- Prevented an outdated breaker alarm from clearing a newer 40-second
+  suspension when in-flight proxy requests fail after redirects have stopped.
+  Resume alarms now check the current stored deadline and reschedule when it
+  has been extended. Added SOCKS proxy-path and DNS-server failures to the
+  connection-level allowlist based on Chromium's current network error types.
+- Kept shared URL patterns synchronized across the service worker and both DOM
+  interception layers. All 42 simulation tests, shipped-script syntax checks
+  and the reproducible build pass. The real-Chrome suite remains unexecuted
+  because `playwright-core` is unavailable in this environment. The manifest
+  version remains `0.2.5`.

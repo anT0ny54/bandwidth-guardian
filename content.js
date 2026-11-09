@@ -151,10 +151,8 @@
     return false;
   }
 
-  // KEEP IN SYNC with the service worker's sameOpts(): settings equality is
-  // decided on exactly the DEFAULTS keys. NOTE: 0.2.3 deleted this helper as
-  // "unused" while its three onStorageChanged call sites remained — a
-  // ReferenceError on the first storage change killed live settings sync.
+  // Keep settings equality aligned with the service worker: compare exactly
+  // the keys defined by DEFAULTS so both execution worlds refresh together.
   const sameOpts = (a, b) => !!a && !!b && Object.keys(DEFAULTS).every(k => a[k] === b[k]);
 
   // Skip decision for a RESOLVED absolute http(s) URL (O4: parsed once here).
@@ -624,10 +622,10 @@
         childList:       true,
         subtree:         true,
         attributes:      true,
-        // href/rel/as omitted (see review C1): prehook intercepts page-driven
-        // preload changes in the MAIN world; parser-created links arrive via
-        // childList. Lazy attributes are intentionally not rewritten; actual
-        // src/srcset promotion is caught by prehook (R1 compatibility fix).
+        // href/rel/as are observed by the MAIN-world prehook for page-driven
+        // preload changes; parser-created links arrive via childList. Lazy
+        // attributes are not rewritten: actual src/srcset promotion is caught
+        // by the prehook when the loader activates the image.
         attributeFilter: ["src", "srcset", "style"]
       });
     } catch {}
