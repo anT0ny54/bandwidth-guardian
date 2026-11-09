@@ -21,6 +21,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   status, confirms proxy reachability and resets the failure window.
 
 ### Fixed
+- The fallback retry for `<img>` elements restored `src`/`srcset` from the
+  attribute as it stood. When that attribute still held a proxy URL (a DOM-layer
+  rewrite whose proxy request failed), the "direct" retry re-requested the proxy
+  instead. Retries now map proxy URLs back to their originals first, for both
+  `src` and every `srcset` candidate.
+- The per-tab DNR bypass table evicted working bypass rules at half of its
+  3,000-rule capacity: the eviction check compared against the remaining
+  headroom after the current batch was added. Eviction now starts only when
+  the table is full, so a burst of up to 3,000 failed URLs keeps every bypass.
+- A lazy-loaded image whose `srcset` was rewritten and whose `src` was then
+  assigned by page script recorded the rewritten (proxy) `srcset` as its
+  original. After a proxy failure the restore put proxy URLs back into
+  `srcset`, so the image never received its one direct retry. The original
+  `srcset` is now kept across `src` assignments.
+- The "Custom" quality and width badges were appended as children of the
+  three-column preset grids, occupying an extra grid cell beneath the preset
+  buttons. They are now static, hidden-by-default labels beside each section
+  title in both the popup and the settings page.
 - The statistics flush timer ran before the crash-recovery journal timer, so
   normal activity could be committed without ever being journaled. The journal
   is now written first, the flush waits for any pending journal write, and new
@@ -94,6 +112,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Private-network exclusions now cover IPv4-mapped private IPv6 addresses and
   the full IPv6 link-local `fe80::/10` range in all three interception layers.
 
+### Removed
+- An always-true guard around the options page version label.
+- Runtime creation of the "Custom" badge elements (`setCustomBadge`,
+  `customBadges`) in `popup.js` and `options.js`, replaced by static markup.
+- A duplicate inline-style pass in the content script. Each mutated or
+  rescanned `<img>`/`<source>` was processed for `url()` styles twice, and
+  added roots had a redundant style re-check. Inline styles are now handled
+  once per element by the style selector pass.
+
 ### Maintenance
 - Removed unused bypass bookkeeping and duplicate eviction scans; eviction
   now safely skips a candidate when no oldest entry exists.
@@ -103,7 +130,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   has been extended. Added SOCKS proxy-path and DNS-server failures to the
   connection-level allowlist based on Chromium's current network error types.
 - Kept shared URL patterns synchronized across the service worker and both DOM
-  interception layers. All 47 simulation tests, shipped-script syntax checks
-  and the reproducible build pass. The real-Chrome suite remains unexecuted
-  because `playwright-core` is unavailable in this environment. The manifest
-  version remains `0.2.6`.
+  interception layers. Added regression tests for the bypass eviction
+  threshold, the `src`-after-`srcset` restore, the static badge placement and
+  the proxy-to-original retry mapping. All 51 simulation tests, shipped-script syntax checks and the reproducible
+  build pass. The real-Chrome suite remains unexecuted because Chrome and
+  `playwright-core` are unavailable in this environment. The manifest version
+  remains `0.2.6`.

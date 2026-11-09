@@ -178,6 +178,9 @@
   let linkAttrObserver = null;
 
   function armProxyFallback(el, originalSrc, originalSrcset) {
+    // originalSrcset must be ORIGINAL srcset text, or "" to keep the one already
+    // recorded. A src assignment passes "": the live srcset attribute may
+    // already hold proxy URLs, and restoring those never reaches the direct path.
     if (!el || !(el instanceof HTMLImageElement) || isFailed(el)) return;
     // Merge: src and srcset are armed by separate calls; one must not erase the other.
     const prev = fallbackMeta.get(el) || {};
@@ -348,7 +351,7 @@
           // B7: queued values get the same treatment as live-set ones,
           // including an armed fallback.
           if (decided !== null && decided !== pendingSrc) {
-            armProxyFallback(el, resolveHttp(pendingSrc) || pendingSrc, el.getAttribute("srcset") || "");
+            armProxyFallback(el, resolveHttp(pendingSrc) || pendingSrc, "");
           }
           nativeSetSrc(el, decided ?? pendingSrc);
         }
@@ -619,7 +622,7 @@
         if (src && el.dataset.bhPendingSrc === undefined) {
           const decided = decideSrc(src);
           if (decided !== null && decided !== src) {
-            armProxyFallback(el, resolveHttp(src) || src, el.getAttribute("srcset") || "");
+            armProxyFallback(el, resolveHttp(src) || src, "");
             nativeSetSrc(el, decided);
           }
         }
@@ -653,7 +656,7 @@
           queuePending(this);
           // B6: write nothing while pending — no about:blank fake error.
         } else {
-          if (decided !== String(value)) armProxyFallback(this, resolveHttp(String(value)), this.getAttribute("srcset") || "");
+          if (decided !== String(value)) armProxyFallback(this, resolveHttp(String(value)), "");
           nativeSetSrc(this, decided);
         }
       } catch { nativeSetSrc(this, value); }
@@ -796,7 +799,7 @@
             queuePending(this);
             return; // B6: write nothing while pending
           }
-          if (decided !== String(value)) armProxyFallback(this, resolveHttp(String(value)), this.getAttribute("srcset") || "");
+          if (decided !== String(value)) armProxyFallback(this, resolveHttp(String(value)), "");
           return setAttr.call(this, "src", decided);
         }
         const v = String(value || "");
@@ -925,6 +928,20 @@
     return out;
   }
 
+  // A retry must re-request the ORIGINAL URL. An attribute that still holds a
+  // proxy URL (a DOM-layer rewrite that failed) would otherwise go back through
+  // the proxy, which is exactly what the bypass exists to avoid.
+  function directUrlFor(value, base, proxyToOriginal) {
+    const resolved = safeURL(value, base);
+    if (!resolved) return value;
+    resolved.hash = "";
+    return proxyToOriginal.get(resolved.href) || value;
+  }
+  function directSrcset(ss, base, proxyToOriginal) {
+    return parseSrcset(ss).map(({ url, desc }) =>
+      directUrlFor(url, base, proxyToOriginal) + (desc ? " " + desc : "")).join(", ");
+  }
+
   // Picture <source> candidates do not have an independent error target, so
   // their parent <img> is retried when a candidate fails. Handle both raw DNR
   // URLs and conflict URLs that the DOM layer already changed into proxy URLs.
@@ -1047,8 +1064,8 @@
             if (pic) hit = retryPictureSources(pic, el.baseURI, has, proxyToOriginal, setAttr) || hit;
             if (!hit) continue;
             markFailed(el);
-            if (ss !== null) setAttr.call(el, "srcset", ss);
-            if (src !== null) setAttr.call(el, "src", src);
+            if (ss !== null) setAttr.call(el, "srcset", directSrcset(ss, el.baseURI, proxyToOriginal));
+            if (src !== null) setAttr.call(el, "src", directUrlFor(src, el.baseURI, proxyToOriginal));
           } else if (tag === "video") {
             if (hasRel(el.getAttribute("poster"), el.baseURI) && !el.hasAttribute(FAILED_ATTR)) { markFailed(el); reset(el, "poster"); }
           } else if (tag === "image" && el.namespaceURI === "http://www.w3.org/2000/svg") {

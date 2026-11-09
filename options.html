@@ -122,6 +122,20 @@
       margin-top: 12px;
     }
     .section:first-of-type { margin-top: 0; }
+    .custom-badge {
+      display: inline-block;
+      margin-left: 6px;
+      padding: 1px 7px;
+      border-radius: 999px;
+      background: var(--accent-soft);
+      color: var(--accent);
+      font-size: 9px;
+      font-weight: 800;
+      letter-spacing: .04em;
+      text-transform: uppercase;
+      vertical-align: 1px;
+    }
+    .custom-badge[hidden] { display: none; }
     .section-title {
       margin: 0 4px 7px;
       color: var(--muted);
@@ -498,7 +512,7 @@
     </section>
 
     <section class="section">
-      <h2 class="section-title">Quality</h2>
+      <h2 class="section-title">Quality <span class="custom-badge" id="qualityCustom" hidden>Custom</span></h2>
       <div class="card">
         <div class="row">
           <div class="presets" id="qualityPresets">
@@ -521,7 +535,7 @@
     </section>
 
     <section class="section">
-      <h2 class="section-title">Maximum image width</h2>
+      <h2 class="section-title">Maximum image width <span class="custom-badge" id="widthCustom" hidden>Custom</span></h2>
       <div class="card">
         <div class="row">
           <div class="presets" id="widthPresets">

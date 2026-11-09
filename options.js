@@ -45,9 +45,7 @@ const openerTabId = (() => {
   return raw !== null && raw !== "" && Number.isInteger(v) && v >= 0 ? v : null;
 })();
 
-if (versionEl) {
-  versionEl.textContent = `v${chrome.runtime.getManifest().version}`;
-}
+versionEl.textContent = `v${chrome.runtime.getManifest().version}`;
 
 // ── Toast ─────────────────────────────────────────────────────────────────────
 
@@ -108,30 +106,17 @@ async function reloadCurrentPage() {
 
 // ── Preset helpers ────────────────────────────────────────────────────────────
 
-// B16: exact match, or a visible "Custom" badge — the popup and options page
-// now agree, and custom values no longer highlight a nearby preset.
-// One badge per container: quality and width are customized independently.
-const customBadges = new WeakMap();
-function setCustomBadge(container, show) {
-  if (!container) return;
-  let badge = customBadges.get(container);
-  if (show && !badge) {
-    badge = document.createElement("span");
-    badge.textContent = "Custom";
-    badge.style.cssText = "font-size:11px;opacity:.65;margin-left:8px;vertical-align:middle;";
-    container.appendChild(badge);
-    customBadges.set(container, badge);
-  } else if (!show && badge) {
-    badge.remove();
-    customBadges.delete(container);
-  }
-}
+// B16: exact match, or a visible "Custom" badge. The badges are static markup
+// beside each section title (never grid children of the preset buttons), so
+// quality and width are customized independently and toggle with `hidden`.
+const qualityCustomEl = $("qualityCustom");
+const widthCustomEl   = $("widthCustom");
 
 function setQualityUI(q) {
   q = Number(q);
   const matched = QUALITY_PRESETS.includes(q);
   qualityPresets.forEach(b => b.classList.toggle("active", Number(b.dataset.q) === q));
-  setCustomBadge($("qualityPresets"), !matched);
+  qualityCustomEl.hidden = matched;
   customQualityEl.value = matched ? "" : String(q ?? "");
 }
 
@@ -139,7 +124,7 @@ function setWidthUI(w) {
   w = Number(w) || 0;
   const matched = WIDTH_PRESETS.includes(w);
   widthPresets.forEach(b => b.classList.toggle("active", Number(b.dataset.w) === w));
-  setCustomBadge($("widthPresets"), !matched);
+  widthCustomEl.hidden = matched;
   customWidthEl.value = matched ? "" : String(w);
 }
 
@@ -221,7 +206,7 @@ qualityPresets.forEach(btn => {
     qualityPresets.forEach(b => b.classList.remove("active"));
     btn.classList.add("active");
     customQualityEl.value = ""; // preset takes priority; clear custom
-    setCustomBadge($("qualityPresets"), false);
+    qualityCustomEl.hidden = true;
   });
 });
 
@@ -230,7 +215,7 @@ customQualityEl.addEventListener("input", () => {
   const v = parseInt(customQualityEl.value, 10);
   if (!isNaN(v) && v >= 1 && v <= 100) {
     qualityPresets.forEach(b => b.classList.remove("active"));
-    setCustomBadge($("qualityPresets"), true);
+    qualityCustomEl.hidden = false;
   } else if (customQualityEl.value === "") {
     dirty.quality = false;
     setQualityUI(savedQuality);
@@ -243,7 +228,7 @@ widthPresets.forEach(btn => {
     widthPresets.forEach(b => b.classList.remove("active"));
     btn.classList.add("active");
     customWidthEl.value = "";
-    setCustomBadge($("widthPresets"), false);
+    widthCustomEl.hidden = true;
   });
 });
 
@@ -252,7 +237,7 @@ customWidthEl.addEventListener("input", () => {
   const v = parseInt(customWidthEl.value, 10);
   if (!isNaN(v) && v >= 0) {
     widthPresets.forEach(b => b.classList.remove("active"));
-    setCustomBadge($("widthPresets"), true);
+    widthCustomEl.hidden = false;
   } else if (customWidthEl.value === "") {
     dirty.width = false;
     setWidthUI(savedWidth);

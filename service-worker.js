@@ -772,7 +772,10 @@ function addBypass(tabId, urls) {
     const addRules = [];
     const addedKeys = new Map();
     for (const c of candidates) {
-      const needsSlot = addRules.length >= BYPASS_LIMIT - nextRules.size;
+      // Evict only when the table itself is full. nextRules already counts this
+      // batch's additions, so comparing against the remaining headroom evicted
+      // live bypasses at half capacity.
+      const needsSlot = nextRules.size >= BYPASS_LIMIT;
       if (needsSlot) {
         const oldest = nextRules.entries().next().value;
         // No entry can be evicted, so leave this candidate uninstalled.
@@ -1195,6 +1198,8 @@ function doRefreshRules(done) {
         const noHeaderMatch = buildRules(opts, true, suspended);
         update(noHeaderMatch, function(err2) {
           if (!err2) { installed(noHeaderMatch); return; }
+          // suspended=true here means "no redirect and no CSP removal": only the
+          // Save-Data header rule is installed, so pages keep their CSP.
           const headersOnly = buildRules(opts, true, true);
           update(headersOnly, function(err3) {
             if (!err3) { installed(headersOnly); return; }

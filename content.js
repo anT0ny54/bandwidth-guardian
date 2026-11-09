@@ -512,7 +512,7 @@
 
   function rewriteAll() {
     if (destroyed || !active) return;
-    document.querySelectorAll(CANDIDATE_SELECTOR).forEach(processCandidate);
+    document.querySelectorAll(CANDIDATE_SELECTOR).forEach(rewriteImg);
     document.querySelectorAll(STYLE_SELECTOR).forEach(rewriteInlineStyles);
   }
 
@@ -563,12 +563,11 @@
     }
 
     for (const root of addedRoots) {
+      // processCandidate(root) covers the root's own style attribute too.
+      // Descendant inline styles are matched by STYLE_SELECTOR (which is
+      // case-insensitive like CSS), so img/source only need rewriteImg here.
       processCandidate(root);
-      root.querySelectorAll(CANDIDATE_SELECTOR).forEach(processCandidate);
-      // Style-attribute candidates from this batch only. Check the added root
-      // itself as well as descendants; CSS function names are case-insensitive.
-      const rootStyle = root.getAttribute("style");
-      if (rootStyle && /\burl\(/i.test(rootStyle)) rewriteInlineStyles(root);
+      root.querySelectorAll(CANDIDATE_SELECTOR).forEach(rewriteImg);
       root.querySelectorAll(STYLE_SELECTOR).forEach(rewriteInlineStyles);
     }
     imageTargets.forEach(rewriteImg);

@@ -185,6 +185,20 @@
       text-transform: uppercase;
       letter-spacing: .08em;
     }
+    .custom-badge {
+      display: inline-block;
+      margin-left: 6px;
+      padding: 1px 6px;
+      border-radius: 999px;
+      background: var(--accent-soft);
+      color: var(--accent);
+      font-size: 9px;
+      font-weight: 800;
+      letter-spacing: .04em;
+      text-transform: uppercase;
+      vertical-align: 1px;
+    }
+    .custom-badge[hidden] { display: none; }
     .presets {
       display: grid;
       grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -368,7 +382,7 @@
         <input type="checkbox" id="grayscale" class="switch">
       </label>
 
-      <div class="section-label">Quality</div>
+      <div class="section-label">Quality <span class="custom-badge" id="qualityCustom" hidden>Custom</span></div>
       <div class="presets" id="qualityPresets">
         <button class="preset" data-q="45" type="button">
           <span class="p-label">Small</span>

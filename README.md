@@ -8,7 +8,7 @@ the browser — and optionally sends `Save-Data: on` with requests.
 **Privacy:** the extension contains no analytics, no tracking pixels and no
 telemetry of any kind. The only outbound traffic it generates is image data sent
 to the compression proxy you configure yourself (plus one manual health-check
-fetch when you press "Test proxy" on the settings page). No browsing data is
+fetch when you press "Test" next to the proxy URL on the settings page). No browsing data is
 collected, logged or shared by the extension itself.
 
 ## Platform support
@@ -114,11 +114,19 @@ their module scripts.
   documents. Requests without a valid tab ID are not given a global bypass.
   Plain and escaped-regex filters are preflighted against the same conservative
   size limit before submission. Bypass rules are removed when the tab closes.
+  A tab keeps at most 3,000 live bypass rules; the oldest is evicted only when
+  that table is actually full.
+  The retry always names the original URL: an attribute that still holds a
+  proxy URL is mapped back to its original before it is re-set, so a retry can
+  never go through the proxy again.
   A failed element is guarded per URL rather than permanently: when a page
   reuses an image node for a different source, including while a retry is still
   pending, its stale fallback markers, metadata and timers are cleared in both
   execution worlds. Timer ownership checks prevent a cancelled callback already
-  queued by the browser from restoring over the newer source.
+  queued by the browser from restoring over the newer source. When a page sets
+  `src` after `srcset` (a common lazy-loader order), the original `srcset`
+  recorded for the element is kept, so a failed restore never reinstates proxy
+  URLs into `srcset`.
 - If the proxy itself becomes unreachable (2 connection-level failures within
   a rolling 10-second window), image redirects are suspended for 40 seconds so
   pages load images directly; an alarm then resumes proxying automatically.

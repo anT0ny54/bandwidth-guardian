@@ -37,22 +37,9 @@ function removeDomainToken(text, excludedDomain) {
 }
 
 // B16: exact-match highlighting. "Nearest" matching lied about custom values
-// (quality 55 highlighted "60"); when nothing matches we show a "Custom" badge.
-const customBadges = new WeakMap();
-function setCustomBadge(container, show) {
-  if (!container) return;
-  let badge = customBadges.get(container);
-  if (show && !badge) {
-    badge = document.createElement("span");
-    badge.textContent = "Custom";
-    badge.style.cssText = "font-size:11px;opacity:.65;margin-left:8px;vertical-align:middle;";
-    container.appendChild(badge);
-    customBadges.set(container, badge);
-  } else if (!show && badge) {
-    badge.remove();
-    customBadges.delete(container);
-  }
-}
+// (quality 55 highlighted "60"); when nothing matches the static "Custom" badge
+// beside the label is shown. It lives outside the preset grid on purpose.
+const qualityCustomEl = $("qualityCustom");
 
 function setActivePreset(q) {
   let matched = false;
@@ -61,7 +48,7 @@ function setActivePreset(q) {
     b.classList.toggle("active", on);
     if (on) matched = true;
   });
-  setCustomBadge($("qualityPresets"), !matched);
+  qualityCustomEl.hidden = matched;
 }
 
 function showNudge() { nudge.classList.add("show"); }
