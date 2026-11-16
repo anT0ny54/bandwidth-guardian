@@ -8,8 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.2.6] — current release
 
 ### Changed
-- Marked `build.sh` executable so the documented `./build.sh` command works
-  from a fresh checkout as well as the CI workflow's `bash ./build.sh` call.
+- Set and preserved the executable mode on `build.sh`, so the documented
+  `./build.sh` command works from a fresh checkout as well as the CI workflow's
+  `bash ./build.sh` call.
 - Tightened the connection-level circuit breaker: only recognized Chromium
   transport, DNS and proxy-path failures count toward the two-failure,
   rolling 10-second threshold that suspends image redirects for 40 seconds.
@@ -21,15 +22,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   status, confirms proxy reachability and resets the failure window.
 
 ### Fixed
+- A failed content-script settings read could dereference an empty storage
+  callback result and abort initialization. Local and sync reads now check
+  `runtime.lastError` and synchronous API exceptions; the script falls back from
+  the local mirror to sync settings and uses disabled/no-proxy DOM defaults if
+  both stores are unavailable. Successful sync fallback still refreshes the
+  local mirror.
+- The custom max-width field accepted digit strings beyond JavaScript's safe
+  integer range. Those values could be rounded before being written into proxy
+  and DNR rules; custom widths now accept only non-negative safe whole numbers.
+- The fallback browser fixture reused the `fps` ID on a `<source>` and a `<div>`.
+  Removed the unused duplicate ID and added a simulation check that all browser
+  fixture pages keep their DOM IDs unique.
 - The fallback retry for `<img>` elements restored `src`/`srcset` from the
   attribute as it stood. When that attribute still held a proxy URL (a DOM-layer
   rewrite whose proxy request failed), the "direct" retry re-requested the proxy
   instead. Retries now map proxy URLs back to their originals first, for both
   `src` and every `srcset` candidate.
-- The per-tab DNR bypass table evicted working bypass rules at half of its
-  3,000-rule capacity: the eviction check compared against the remaining
-  headroom after the current batch was added. Eviction now starts only when
-  the table is full, so a burst of up to 3,000 failed URLs keeps every bypass.
+- The extension-wide DNR bypass table evicted working tab-scoped rules at half
+  of its 3,000-rule capacity: the eviction check compared against the remaining
+  headroom after the current batch was added. Eviction now starts only when the
+  global table is full, so up to 3,000 active bypasses across all tabs are kept.
+  Each rule remains restricted to the tab that produced the failed request.
 - A lazy-loaded image whose `srcset` was rewritten and whose `src` was then
   assigned by page script recorded the rewritten (proxy) `srcset` as its
   original. After a proxy failure the restore put proxy URLs back into
@@ -60,7 +74,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Rapid runtime transitions could complete their asynchronous storage callbacks
   out of order and leave an older redirect state persisted last. Runtime-state
   read/compare/write operations are now serialized, and obsolete queued
-  revisions are skipped.
+  revisions are skipped. A transient local-storage read/write failure could also
+  mark an unpublished state as current and suppress later identical updates;
+  the worker now records only storage-confirmed states, retains the newest
+  pending state and retries failed reads/writes through a dedicated Chrome
+  alarm with exponential backoff from 30 seconds up to 10 minutes. A successful
+  publication clears the alarm and resets the delay. A queued return to the
+  last confirmed state is still preserved while another transition is in flight.
 - Closing a tab while its 250 ms fallback batch was queued could leave stale
   retry work available for a later DNR update. Tab teardown now drops that
   tab's queued batch and retry reservations, while preserving the shared timer
@@ -103,6 +123,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   timer-ownership checks prevent queued stale callbacks from restoring over a
   newer source. The exact failed responsive candidate is recorded, and a failed
   inline CSS URL no longer permanently blacklists its containing element.
+- A failed circuit-breaker session-storage read was treated as an inactive
+  suspension, which could reinstall proxy redirects before the cooldown ended.
+  Unreadable state now keeps redirects disabled and schedules a separate,
+  exponentially backed-off rule-refresh alarm; the normal cooldown alarm remains
+  independent and successful reads clear the retry alarm.
 - Fallback retries are batched per tab and broadcast to all frames, matching the
   tab-scoped DNR bypass. Invalid/unknown tab IDs are rejected so they cannot
   create a global allow rule. Newly loaded documents receive the complete
@@ -136,7 +161,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Kept shared URL patterns synchronized across the service worker and both DOM
   interception layers. Added regression tests for the bypass eviction
   threshold, the `src`-after-`srcset` restore, the static badge placement and
-  the proxy-to-original retry mapping. All 51 simulation tests, shipped-script syntax checks and the reproducible
-  build pass. The real-Chrome suite remains unexecuted because Chrome and
-  `playwright-core` are unavailable in this environment. The manifest version
-  remains `0.2.6`.
+  the proxy-to-original retry mapping. Expanded the HTML-ID guard to cover the
+  popup and settings pages and verify their static JavaScript selectors exist.
+  Added a regression test for successful proxy responses without `Content-Type`:
+  unknown MIME types remain uncounted and do not trigger a redundant direct retry,
+  while explicit non-image types still fall back. Runtime publication tests now
+  cover automatic alarm retries, capped backoff, failed storage reads/writes and
+  transitions back to the last confirmed state while another write is pending.
+  The bypass-capacity test now verifies the 3,000-rule limit across multiple tabs.
+  Added a regression test for content-script storage callback errors,
+  synchronous storage API throws and successful settings reads. All 57
+  simulation tests, shipped-script syntax checks and the reproducible build
+  pass. The real-Chrome
+  suite remains unexecuted because `playwright-core` is unavailable in this
+  environment; Chromium itself is present. The manifest version remains `0.2.6`.

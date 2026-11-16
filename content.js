@@ -630,12 +630,31 @@
     } catch {}
   }
 
+  // Storage callbacks expose failures through runtime.lastError. Read it
+  // inside the callback and turn both callback errors and synchronous API
+  // throws into a null result so startup can select a safe fallback.
+  function readStorage(area, query, callback) {
+    let callbackStarted = false;
+    try {
+      chrome.storage[area].get(query, value => {
+        callbackStarted = true;
+        const error = chrome.runtime.lastError || null;
+        callback(error ? null : value, error);
+      });
+    } catch (error) {
+      if (callbackStarted) throw error;
+      callback(null, error);
+    }
+  }
+
   // ── Settings load ──────────────────────────────────────────────────────────
   // Fast path: bhOpts mirror in storage.local (~5 ms). Cold path: storage.sync,
   // then write the mirror — the service worker is the mirror's sole writer in
   // steady state (B4); this is the only content-script write, on the cold path.
   // The known-failed list is fetched in parallel with settings (bounded wait),
-  // so the first publish already carries it.
+  // so the first publish already carries it. If both settings stores fail, this
+  // document uses disabled/no-proxy defaults rather than crashing or guessing
+  // that DOM interception is safe while the DNR state is unknown.
   const failedListReady = new Promise(resolve => {
     const timer = setTimeout(resolve, 400);
     try {
@@ -651,16 +670,22 @@
       });
     } catch { clearTimeout(timer); resolve(); }
   });
-  chrome.storage.local.get({ bhOpts: null, bhRuntime: null }, d => failedListReady.then(() => {
+  readStorage("local", { bhOpts: null, bhRuntime: null }, d => failedListReady.then(() => {
     if (destroyed) return;
-    if (d.bhRuntime && typeof d.bhRuntime === "object") runtime = d.bhRuntime;
-    if (d.bhOpts) {
-      applyOpts(d.bhOpts);
+    if (d?.bhRuntime && typeof d.bhRuntime === "object") runtime = d.bhRuntime;
+    if (d?.bhOpts && typeof d.bhOpts === "object") {
+      applyOpts({ ...DEFAULTS, ...d.bhOpts });
     } else {
-      chrome.storage.sync.get(DEFAULTS, synced => {
+      readStorage("sync", DEFAULTS, synced => {
         if (destroyed) return;
-        applyOpts(synced);
-        try { chrome.storage.local.set({ bhOpts: synced }); } catch {}
+        const valid = !!synced && typeof synced === "object";
+        const settings = valid
+          ? { ...DEFAULTS, ...synced }
+          : { ...DEFAULTS, enabled: false, proxyBase: "" };
+        applyOpts(settings);
+        if (valid) {
+          try { chrome.storage.local.set({ bhOpts: settings }, () => { void chrome.runtime.lastError; }); } catch {}
+        }
       });
     }
   }));

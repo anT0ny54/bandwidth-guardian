@@ -962,7 +962,19 @@ const BREAKER_THRESHOLD   = 2;
 const BREAKER_WINDOW_MS   = 10000;
 const BREAKER_COOLDOWN_MS = 40000;
 const BREAKER_ALARM       = "bh-breaker-resume";
+const BREAKER_READ_RETRY_ALARM = "bh-breaker-read-retry";
+const RUNTIME_PUBLISH_RETRY_ALARM = "bh-runtime-publish-retry";
 let breakerFailures = [];
+let breakerReadRetryDelay = 1000;
+
+function scheduleBreakerReadRetry() {
+  const delay = breakerReadRetryDelay;
+  breakerReadRetryDelay = Math.min(delay * 2, 30000);
+  try {
+    const created = chrome.alarms?.create(BREAKER_READ_RETRY_ALARM, { when: Date.now() + delay });
+    if (created && typeof created.catch === "function") created.catch(() => {});
+  } catch {}
+}
 
 function noteProxyResponse() { breakerFailures = []; }
 function noteGlobalProxyFailure() {
@@ -1003,12 +1015,29 @@ function resumeBreakerIfExpired() {
 }
 chrome.alarms?.onAlarm?.addListener(alarm => {
   if (alarm.name === BREAKER_ALARM) resumeBreakerIfExpired();
+  else if (alarm.name === BREAKER_READ_RETRY_ALARM) refreshRules();
+  else if (alarm.name === RUNTIME_PUBLISH_RETRY_ALARM) retryPendingRuntimePublication();
 });
 
 function readSuspended(cb) {
+  const unavailable = () => {
+    // An unreadable suspension must never be interpreted as an expired one:
+    // keep proxying disabled for this refresh, then retry rule setup separately
+    // from the cooldown alarm so neither timer can overwrite the other.
+    scheduleBreakerReadRetry();
+    cb(true);
+  };
   try {
-    chrome.storage.session.get({ bhSuspendedUntil: 0 }, d => cb(Number(d?.bhSuspendedUntil) > Date.now()));
-  } catch { cb(false); }
+    chrome.storage.session.get({ bhSuspendedUntil: 0 }, d => {
+      if (chrome.runtime?.lastError) { unavailable(); return; }
+      breakerReadRetryDelay = 1000;
+      try {
+        const cleared = chrome.alarms?.clear(BREAKER_READ_RETRY_ALARM);
+        if (cleared && typeof cleared.catch === "function") cleared.catch(() => {});
+      } catch {}
+      cb(Number(d?.bhSuspendedUntil) > Date.now());
+    });
+  } catch { unavailable(); }
 }
 
 // ── DNR rules ─────────────────────────────────────────────────────────────────
@@ -1137,31 +1166,93 @@ function buildRules(opts, noHeaderMatch, suspended) {
 // live. While it is, they proxy ONLY CONFLICT_PATTERN URLs (no duplicates);
 // if it is not (rule rejected), they fall back to full DOM rewriting; while
 // the breaker is open they proxy nothing.
-let lastRuntime = null;
+let lastRuntime = null; // last state confirmed in storage
+let pendingRuntime = null; // newest desired state until storage confirms it
 let runtimePublishRevision = 0;
 let runtimeWriteQueue = Promise.resolve();
-function publishRuntime(runtime) {
-  const same = lastRuntime && lastRuntime.redirect === runtime.redirect && lastRuntime.suspended === runtime.suspended;
-  if (same) return;
-  lastRuntime = runtime;
+const RUNTIME_PUBLISH_RETRY_INITIAL_DELAY_MS = 30000; // Chrome alarms have a 30s minimum interval
+const RUNTIME_PUBLISH_RETRY_MAX_DELAY_MS = 10 * 60 * 1000;
+let runtimePublishRetryDelay = RUNTIME_PUBLISH_RETRY_INITIAL_DELAY_MS;
+
+function clearRuntimePublishRetry(resetBackoff = false) {
+  try {
+    const cleared = chrome.alarms?.clear(RUNTIME_PUBLISH_RETRY_ALARM);
+    if (cleared && typeof cleared.catch === "function") cleared.catch(() => {});
+  } catch {}
+  if (resetBackoff) runtimePublishRetryDelay = RUNTIME_PUBLISH_RETRY_INITIAL_DELAY_MS;
+}
+
+function scheduleRuntimePublishRetry(revision) {
+  if (revision !== runtimePublishRevision || !pendingRuntime) return;
+  const delay = runtimePublishRetryDelay;
+  runtimePublishRetryDelay = Math.min(delay * 2, RUNTIME_PUBLISH_RETRY_MAX_DELAY_MS);
+  try {
+    const created = chrome.alarms?.create(RUNTIME_PUBLISH_RETRY_ALARM, { when: Date.now() + delay });
+    if (created && typeof created.catch === "function") created.catch(() => {});
+  } catch {}
+}
+
+function enqueueRuntimePublication(next) {
   const revision = ++runtimePublishRevision;
   // Serialize the read/compare/write sequence. Overlapping storage callbacks
   // could otherwise finish out of order and leave content scripts with a stale
   // redirect state after a quick settings or circuit-breaker transition.
   runtimeWriteQueue = runtimeWriteQueue.then(() => new Promise(resolve => {
+    const fail = () => {
+      // Keep the newest desired state pending: without another settings/rule
+      // event, it still needs a retry after a transient storage failure.
+      if (revision === runtimePublishRevision) scheduleRuntimePublishRetry(revision);
+      resolve();
+    };
+    const confirm = () => {
+      if (revision === runtimePublishRevision) {
+        lastRuntime = next;
+        pendingRuntime = null;
+        clearRuntimePublishRetry(true);
+      }
+      resolve();
+    };
     try {
       chrome.storage.local.get({ bhRuntime: null }, d => {
         if (revision !== runtimePublishRevision) { resolve(); return; }
+        if (chrome.runtime?.lastError) { fail(); return; }
         const cur = d?.bhRuntime;
-        if (cur && cur.redirect === runtime.redirect && cur.suspended === runtime.suspended) {
-          resolve();
+        if (cur && cur.redirect === next.redirect && cur.suspended === next.suspended) {
+          confirm();
           return;
         }
-        try { chrome.storage.local.set({ bhRuntime: runtime }, resolve); }
-        catch { resolve(); }
+        try {
+          chrome.storage.local.set({ bhRuntime: next }, () => {
+            if (revision === runtimePublishRevision && chrome.runtime?.lastError) fail();
+            else confirm();
+          });
+        } catch { fail(); }
       });
-    } catch { resolve(); }
-  })).catch(() => {});
+    } catch { fail(); }
+  })).catch(() => {
+    if (revision === runtimePublishRevision) scheduleRuntimePublishRetry(revision);
+  });
+}
+
+function retryPendingRuntimePublication() {
+  if (!pendingRuntime) return;
+  enqueueRuntimePublication(pendingRuntime);
+}
+
+function publishRuntime(runtime) {
+  const next = { redirect: !!runtime.redirect, suspended: !!runtime.suspended };
+  const same = state => state && state.redirect === next.redirect && state.suspended === next.suspended;
+  // A pending transition takes precedence over the last confirmed state. In
+  // particular, a request to return to `lastRuntime` must not be dropped while
+  // a different state is still being written.
+  if (same(pendingRuntime)) return;
+  if (!pendingRuntime && same(lastRuntime)) {
+    clearRuntimePublishRetry(true);
+    return;
+  }
+  pendingRuntime = next;
+  clearRuntimePublishRetry();
+  enqueueRuntimePublication(next);
 }
 
 function doRefreshRules(done) {

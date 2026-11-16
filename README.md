@@ -114,8 +114,9 @@ their module scripts.
   documents. Requests without a valid tab ID are not given a global bypass.
   Plain and escaped-regex filters are preflighted against the same conservative
   size limit before submission. Bypass rules are removed when the tab closes.
-  A tab keeps at most 3,000 live bypass rules; the oldest is evicted only when
-  that table is actually full.
+  The extension keeps at most 3,000 live bypass rules globally across all tabs.
+  Each rule remains scoped to its own tab; when the global table is full, the
+  oldest rule across all tabs is evicted.
   The retry always names the original URL: an attribute that still holds a
   proxy URL is mapped back to its original before it is re-set, so a retry can
   never go through the proxy again.
@@ -129,7 +130,10 @@ their module scripts.
   URLs into `srcset`.
 - If the proxy itself becomes unreachable (2 connection-level failures within
   a rolling 10-second window), image redirects are suspended for 40 seconds so
-  pages load images directly; an alarm then resumes proxying automatically.
+  pages load images directly; an alarm then resumes proxying automatically. If
+  the suspension state cannot be read from session storage, that rule refresh
+  also keeps redirects off and schedules a separate, backoff-limited refresh
+  until the state can be read safely.
   Only recognized Chromium transport, DNS and proxy-path errors count
   (for example `ERR_CONNECTION_REFUSED`, `ERR_CONNECTION_TIMED_OUT`,
   `ERR_PROXY_CONNECTION_FAILED`, `ERR_SOCKS_CONNECTION_FAILED` and
@@ -142,6 +146,9 @@ their module scripts.
   reachable and resets the failure window.
 - Usage statistics are counted only from successful proxy responses of the
   strict image types above; failed and fallback requests are never counted.
+  A successful response with no `Content-Type` is left unclassified: it is not
+  counted and is not automatically retried just because its MIME type is
+  unknown. An explicit non-image `Content-Type` triggers direct fallback.
 
 `service-worker.js` also injects `Save-Data: on` and strips CSP only while the
 proxy is valid, enabled, and not temporarily suspended by the circuit breaker
@@ -169,10 +176,21 @@ value. The
 service worker only reacts to `storage.sync` changes for the settings keys it
 manages, so unrelated sync writes never trigger rule refreshes, and the
 `webRequest` observer is re-registered only when the proxy origin changes.
+The service worker serializes updates to its local `bhRuntime` mirror and only
+records a state as published after storage confirms it. If a local-storage read
+or write fails, the newest desired state stays pending and a dedicated Chrome
+alarm retries it with exponential backoff (30 seconds up to 10 minutes). A
+confirmed publication clears the retry alarm and resets the delay. A newer
+transition (including a return to the last confirmed state) supersedes stale
+work without allowing callbacks to reorder the final stored state.
 
 A quality or max-width value that is not one of the preset buttons is shown
 with a per-group "Custom" badge on the popup and the settings page, instead of
-highlighting a nearby preset.
+highlighting a nearby preset. Custom max-width values must be non-negative whole
+pixels; values beyond JavaScript's safe-integer range are rejected rather than
+silently rounded. If a content script cannot read its local settings mirror, it
+falls back to synced settings; if both reads fail, that document disables
+DOM-side rewriting rather than crashing or guessing that interception is safe.
 
 ## Interception coverage and tests
 
@@ -215,8 +233,16 @@ BHP2_DIR=../bhp2 node --test --test-concurrency=1 \
 
 Pass the test files explicitly: Node 21+ no longer accepts a bare `tests/`
 directory for `node --test`. The simulation suite also covers the shared-default
-loading contract, oversized bypass filters, DNR-failure retry bookkeeping, live-rule state recovery, reserved proxy query validation and case-insensitive CSS fallback.
-Without `CHROME_PATH` the browser suite skips itself.
+loading contract, oversized bypass filters, DNR-failure retry bookkeeping,
+live-rule state recovery, runtime-publication alarm retries, global bypass
+capacity across tabs, reserved proxy query validation, safe custom-width
+validation, case-insensitive CSS fallback, unique IDs across all extension and
+browser HTML pages, and static popup/settings selectors that resolve against
+their markup.
+The browser suite skips unless both `playwright-core` and a valid `CHROME_PATH`
+are available. The simulation suite also locks down the proxy-response boundary
+for missing `Content-Type` headers: unknown MIME types are not counted or
+retried solely because the header is absent.
 
 ### Known limits
 

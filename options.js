@@ -135,9 +135,16 @@ function readQuality() {
   return active ? Number(active.dataset.q) : savedQuality;
 }
 
+function parseCustomWidth(value) {
+  const text = String(value ?? "").trim();
+  if (!/^\d+$/.test(text)) return null;
+  const width = Number(text);
+  return Number.isSafeInteger(width) ? width : null;
+}
+
 function readWidth() {
-  const v = parseInt(customWidthEl.value, 10);
-  if (!isNaN(v) && v >= 0) return v;
+  const custom = parseCustomWidth(customWidthEl.value);
+  if (custom !== null) return custom;
   const active = widthPresets.find(b => b.classList.contains("active"));
   return active ? Number(active.dataset.w ?? 0) : savedWidth;
 }
@@ -234,8 +241,8 @@ widthPresets.forEach(btn => {
 
 customWidthEl.addEventListener("input", () => {
   dirty.width = true;
-  const v = parseInt(customWidthEl.value, 10);
-  if (!isNaN(v) && v >= 0) {
+  const v = parseCustomWidth(customWidthEl.value);
+  if (v !== null) {
     widthPresets.forEach(b => b.classList.remove("active"));
     widthCustomEl.hidden = false;
   } else if (customWidthEl.value === "") {
@@ -273,8 +280,8 @@ async function save() {
     showToast("Quality must be 1–100", "err");
     return;
   }
-  if (cw !== "" && !/^\d+$/.test(cw)) {
-    showToast("Width must be 0 or a positive number", "err");
+  if (cw !== "" && parseCustomWidth(cw) === null) {
+    showToast("Width must be a non-negative safe whole number", "err");
     return;
   }
   const proxyBase = (proxyBaseEl.value || "").trim();
