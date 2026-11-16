@@ -113,6 +113,9 @@ test.describe('Bandwidth Guardian in Chrome', { skip: SKIP }, () => {
     ctx = await chromium.launchPersistentContext(profile, {
       executablePath: CHROME,
       headless: true,
+      // Playwright disables extensions by default. Remove that default switch
+      // so the explicit unpacked-extension flags below can take effect.
+      ignoreDefaultArgs: ['--disable-extensions'],
       args: ['--headless=new', `--disable-extensions-except=${EXT}`, `--load-extension=${EXT}`,
         '--host-resolver-rules=MAP *.test 127.0.0.1, MAP intranet 127.0.0.1, MAP *.local 127.0.0.1', '--no-first-run', '--no-default-browser-check']
     });
