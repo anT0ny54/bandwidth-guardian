@@ -153,10 +153,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   once per element by the style selector pass.
 
 ### Maintenance
-- The real-Chrome fallback test derives its expected statistics count from the
-  proxied requests it actually made (every request not designed to fail is a
-  counted success), instead of a hard-coded number. Its failure message lists
-  the proxied requests.
+- The source-archive permission test now verifies that the project directory is
+  the Git checkout root before checking its executable bit. Extracting a source
+  ZIP inside an unrelated Git worktree no longer triggers a false failure. A
+  regression assertion also verifies that both CI jobs restore mode `755` after
+  checkout before using the build script.
 - Removed unused bypass bookkeeping and duplicate eviction scans; eviction
   now safely skips a candidate when no oldest entry exists.
 - Prevented an outdated breaker alarm from clearing a newer 40-second
@@ -193,10 +194,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The real-browser harness removes Playwright's default
   `--disable-extensions` argument, which otherwise prevents its explicit
   unpacked-extension flags from loading the worker. All 61 simulation tests,
-  shipped-script syntax checks, unused-local/parameter checks and two clean
-  reproducible builds pass. The updated browser suite was retried with the
-  available Playwright package and system Chromium, but that Chromium build
-  still did not expose the extension service worker during startup, so its 17
-  browser test cases remain unverified here. The CI workflow's Playwright-managed
-  Chromium remains the intended environment for that suite. The manifest
-  version remains `0.2.7`.
+  shipped-script syntax checks and two independent byte-identical reproducible
+  builds pass. The local rerun in an environment without
+  `playwright-core` and Chrome skips the browser suite; the latest supplied CI
+  run passes all 17 Chrome browser cases with Playwright-managed Chromium. The
+  manifest version remains `0.2.7`.

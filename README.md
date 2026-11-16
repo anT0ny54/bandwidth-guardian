@@ -255,10 +255,12 @@ Pass the test files explicitly: Node 21+ no longer accepts a bare `tests/`
 directory for `node --test`. The browser harness removes Playwright's default
 `--disable-extensions` argument before supplying the unpacked-extension flags;
 without that override, Chromium starts without the extension and no service
-worker is available to test. A simulation check verifies that `build.sh` is executable in POSIX Git
-checkouts. The test skips only that mode assertion for source ZIPs, which may
-not contain a Git index or Unix mode metadata; both CI jobs restore mode `755`
-after checkout, and `bash ./build.sh` remains portable for archive extracts.
+worker is available to test. A simulation check verifies that `build.sh` is
+executable when this project is the root of a POSIX Git checkout. It skips only
+that mode assertion for source ZIPs (including archives extracted inside an
+unrelated Git worktree), which may not carry a Git index or Unix mode metadata;
+both CI jobs restore mode `755` after checkout, and `bash ./build.sh` remains
+portable for archive extracts.
 The simulation suite also covers the shared-default loading contract, oversized
 bypass filters, DNR-failure retry bookkeeping,
 live-rule state recovery, runtime-publication alarm retries, global bypass
