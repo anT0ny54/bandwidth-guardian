@@ -29,21 +29,30 @@ test('shared defaults are declared once and loaded before classic consumers', ()
 test('build script permission and README invocation support source archives', () => {
   const buildScript = path.join(ROOT, 'build.sh');
   const readme = fs.readFileSync(path.join(ROOT, 'README.md'), 'utf8');
+  const workflow = fs.readFileSync(path.join(ROOT, '.github', 'workflows', 'build.yml'), 'utf8');
   if (process.platform !== 'win32') {
-    // Source ZIPs may not carry Unix mode bits and have no Git index to check.
-    // In a real checkout, the workflow restores the mode before this test runs.
-    const gitCheckout = spawnSync('git', ['rev-parse', '--is-inside-work-tree'], {
+    // Source ZIPs may be extracted inside an unrelated Git worktree and do
+    // not necessarily carry a Git index or Unix mode bits. Check the mode only
+    // when this project directory is itself the checkout root.
+    const gitRoot = spawnSync('git', ['rev-parse', '--show-toplevel'], {
       cwd: ROOT,
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore']
     });
-    if (gitCheckout.status === 0 && gitCheckout.stdout.trim() === 'true') {
+    const checkoutRoot = gitRoot.status === 0 ? path.resolve(gitRoot.stdout.trim()) : '';
+    if (checkoutRoot === ROOT) {
       assert.notEqual(fs.statSync(buildScript).mode & 0o111, 0,
         'build.sh remains executable in POSIX checkouts');
     }
   }
   assert.match(readme, /## Build\s+```sh\s+bash \.\/build\.sh\s+```/,
     'the documented command works even when an archive drops executable metadata');
+  assert.match(workflow,
+    /^  test:[\s\S]*?^      - name: Checkout[\s\S]*?^      - name: Ensure build script is executable\n        run: chmod 755 \.\/build\.sh[\s\S]*?^      - name: Set up Node\.js/m,
+    'the test job restores the executable bit after checkout');
+  assert.match(workflow,
+    /^  build:[\s\S]*?^      - name: Checkout[\s\S]*?^      - name: Ensure build script is executable\n        run: chmod 755 \.\/build\.sh[\s\S]*?^      - name: Read manifest version/m,
+    'the build job restores the executable bit after checkout');
 });
 
 test('real-browser suite overrides Playwright default that disables extensions', () => {
