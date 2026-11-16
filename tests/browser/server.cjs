@@ -98,8 +98,26 @@ function createServer({ pagesDir }) {
   const server = http.createServer(async (req, res) => {
     const host = String(req.headers.host || '').split(':')[0];
     const u = new URL(req.url, `http://${req.headers.host}`);
-    const entry = { host, path: u.pathname, url: `http://${req.headers.host}${req.url}` };
+    const entry = {
+      host,
+      path: u.pathname,
+      url: `http://${req.headers.host}${req.url}`,
+      statusCode: null,
+      contentType: '',
+      responseFinished: false
+    };
     if (u.pathname !== '/favicon.ico') log.push(entry);
+    // A logged request is not necessarily a completed response: the browser
+    // may cancel it while an image candidate is being replaced. Keep final
+    // response metadata so statistics assertions count only completed results.
+    res.once('finish', () => {
+      entry.statusCode = res.statusCode;
+      const contentType = res.getHeader('content-type');
+      entry.contentType = Array.isArray(contentType)
+        ? contentType.join(', ')
+        : String(contentType || '');
+      entry.responseFinished = true;
+    });
 
     try {
       if (host === 'proxy.test') return proxy(req, res, u, entry);

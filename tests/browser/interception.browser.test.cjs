@@ -370,16 +370,21 @@ test.describe('Bandwidth Guardian in Chrome', { skip: SKIP }, () => {
     const isKnownBad = u => /\/img\/fallback\/proxyfail|\/img\/fallback\/proxy403/.test(u || '');
     assert.deepEqual(proxied('/img/fallback/').slice(before).map(e => e.original).filter(isKnownBad), [], 'no new proxy attempts for known-bad URLs in this tab');
     await page.close();
-    // Expected count, derived from the proxy request log rather than hard-coded:
-    // every proxied request the mock proxy answers with a successful image is
-    // counted once. The mock fails only URLs containing proxyfail / proxy403 /
-    // proxy503 / originfail, so each other request in this window is a success.
-    // (picture-fallback.png is a success on both the first load and the reload.)
-    const proxiedHere = [...proxied('/img/fallback/'), ...proxied('/img/reused-node/')].map(e => e.original);
-    const successes = proxiedHere.filter(u => !/proxyfail|proxy403|proxy503|originfail/.test(u)).length;
+    // Count completed successful strict-image responses, not merely requests
+    // that reached the mock server. A browser may cancel an otherwise healthy
+    // image request while replacing a <picture> candidate; such an incomplete
+    // response must not contribute to filesProcessed.
+    const proxiedHere = [...proxied('/img/fallback/'), ...proxied('/img/reused-node/')];
+    const strictImageTypes = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/tiff', 'image/jxl']);
+    const successes = proxiedHere.filter(e => {
+      const contentType = String(e.contentType || '').split(';', 1)[0].trim().toLowerCase();
+      return e.responseFinished && e.statusCode >= 200 && e.statusCode < 300 && strictImageTypes.has(contentType);
+    }).length;
     const counted = await settledStats();
     assert.equal(counted - statsBefore, successes,
-      'only successful strict-image proxy responses are counted; proxied requests: ' + JSON.stringify(proxiedHere));
+      'only completed successful strict-image proxy responses are counted; responses: ' +
+      JSON.stringify(proxiedHere.map(({ original, statusCode, contentType, responseFinished }) =>
+        ({ original, statusCode, contentType, responseFinished }))));
   });
 
   test('statistics count only strict image types', async () => {
