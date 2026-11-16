@@ -154,7 +154,13 @@ their module scripts.
 proxy is valid, enabled, and not temporarily suspended by the circuit breaker
 (only on documents whose CSP references `img-src`/`default-src`). Excluded
 domains always keep their own CSP, and CSP remains intact while the breaker is
-open. If Chrome rejects response-header matching during rule setup, the extension
+open. **Security impact:** when a response matches, Chromium's DNR `remove`
+operation removes **all `Content-Security-Policy` response-header entries** for
+that response—not just the matching `img-src`/`default-src` policy or directive.
+Other CSP headers and unrelated protections such as `script-src` and
+`frame-ancestors` are removed too. This is a broad policy trade-off; exclude
+sites whose CSP protections must remain intact. If
+Chrome rejects response-header matching during rule setup, the extension
 preserves CSP rather than removing it from every document; a restrictive policy
 can then block the proxy on that browser configuration.
 
@@ -191,6 +197,15 @@ pixels; values beyond JavaScript's safe-integer range are rejected rather than
 silently rounded. If a content script cannot read its local settings mirror, it
 falls back to synced settings; if both reads fail, that document disables
 DOM-side rewriting rather than crashing or guessing that interception is safe.
+If the service worker cannot read synced settings, it keeps the last known local
+mirror and installed network rules, does not treat the failure as missing user
+preferences, and schedules a Chrome alarm to retry settings initialization,
+mirroring and rule refresh after the minimum 30-second alarm interval. Its
+`webRequest` observer is registered synchronously when the worker starts (as
+required for MV3 event delivery), initially for image/object requests across
+URLs; once settings load, the filter is narrowed to the configured proxy origin.
+If the sync read fails, the worker restores that origin from the last confirmed
+local mirror instead.
 
 ## Interception coverage and tests
 
@@ -205,12 +220,14 @@ DOM-side rewriting rather than crashing or guessing that interception is safe.
 | Open, closed and declarative shadow roots | Network redirect; `attachShadow` is wrapped so the DOM layer also observes roots | all three |
 | SVG `<image href>` / `xlink:href` | Redirected; `<use>` sprite references and `.svg` files are left alone, fragments intact | fragments preserved |
 | `<video poster>` | Redirected | poster renders |
-| `<object>`/`<embed>` image URLs | Redirected only when the URL has an image extension; documents in `<object>` untouched | |
+| `<object>`/`<embed>` image URLs | Redirected only when the URL has an image extension; documents in `<object>` untouched | object/embed media test |
 | `<canvas>` | Images drawn from proxied `<img>` are proxied; the proxy sends `Access-Control-Allow-Origin: *`, so `crossorigin="anonymous"` images stay untainted | |
 
 Every browser test checks the actual URL Chrome requested (logged by a local
-mock origin and a mock proxy built from bandwidth-hero-proxy2's own URL parser),
-that the image loaded, fallback behaviour and that no request was proxied twice.
+mock origin and mock proxy). When `BHP2_DIR` points to a bandwidth-hero-proxy2
+checkout, the mock proxy uses that project's `getImageUrl()` implementation;
+otherwise it uses the equivalent parser bundled in `tests/browser/server.cjs`.
+Assertions cover image loading, fallback behaviour and duplicate proxy requests.
 Further tests cover a 600-image responsive, lazy, infinite-scroll page with
 viewport changes, dynamically loaded content, exclusions and private hosts,
 page CSP, enable/disable and settings changes, statistics and the circuit
@@ -232,8 +249,15 @@ BHP2_DIR=../bhp2 node --test --test-concurrency=1 \
 ```
 
 Pass the test files explicitly: Node 21+ no longer accepts a bare `tests/`
-directory for `node --test`. The simulation suite also covers the shared-default
-loading contract, oversized bypass filters, DNR-failure retry bookkeeping,
+directory for `node --test`. The browser harness removes Playwright's default
+`--disable-extensions` argument before supplying the unpacked-extension flags;
+without that override, Chromium starts without the extension and no service
+worker is available to test. A simulation check also verifies that `build.sh`
+retains its executable bit on POSIX checkouts and that the documented
+`bash ./build.sh` command remains portable when source ZIP extraction drops
+that bit.
+The simulation suite also covers the shared-default loading contract, oversized
+bypass filters, DNR-failure retry bookkeeping,
 live-rule state recovery, runtime-publication alarm retries, global bypass
 capacity across tabs, reserved proxy query validation, safe custom-width
 validation, case-insensitive CSS fallback, unique IDs across all extension and
@@ -285,7 +309,7 @@ the totals and the journal.
 ## Build
 
 ```sh
-./build.sh
+bash ./build.sh
 ```
 
 The build stages the shipped files, syntax-checks the JavaScript, validates the

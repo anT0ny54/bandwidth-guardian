@@ -5,12 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.2.6] — current release
+## [0.2.7] — current release
 
 ### Changed
-- Set and preserved the executable mode on `build.sh`, so the documented
-  `./build.sh` command works from a fresh checkout as well as the CI workflow's
-  `bash ./build.sh` call.
+- Keep `build.sh` executable for direct use from POSIX checkouts, and document
+  `bash ./build.sh` as the portable build command. Some source ZIP archives do
+  not preserve Unix executable metadata, so the README no longer depends on
+  that file mode; the CI workflow already invokes the script through Bash.
 - Tightened the connection-level circuit breaker: only recognized Chromium
   transport, DNS and proxy-path failures count toward the two-failure,
   rolling 10-second threshold that suspends image redirects for 40 seconds.
@@ -170,8 +171,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   transitions back to the last confirmed state while another write is pending.
   The bypass-capacity test now verifies the 3,000-rule limit across multiple tabs.
   Added a regression test for content-script storage callback errors,
-  synchronous storage API throws and successful settings reads. All 57
-  simulation tests, shipped-script syntax checks and the reproducible build
-  pass. The real-Chrome
-  suite remains unexecuted because `playwright-core` is unavailable in this
-  environment; Chromium itself is present. The manifest version remains `0.2.6`.
+  synchronous storage API throws and successful settings reads. A further
+  service-worker settings-read failure path now preserves the last known local
+  mirror and installed DNR rules, avoids writing defaults after a failed read,
+  and retries initialization/mirroring/rule refresh with a Chrome alarm. Added
+  regression coverage for failed sync reads across those paths. MV3 proxy
+  response/error observers are now registered synchronously at worker startup,
+  then narrowed to the configured proxy origin; if synced settings are
+  unavailable, the last confirmed local mirror restores that filter and queued
+  early events are replayed. Added regression coverage for registration,
+  narrowing and recovery. The README now explicitly warns that the CSP DNR rule
+  removes all `Content-Security-Policy` response-header entries on a matching
+  response (including unrelated directives), not just `img-src`/`default-src`,
+  and identifies the
+  security trade-off. It also corrects the object/embed browser-test table.
+  The real-browser harness removes Playwright's default
+  `--disable-extensions` argument, which otherwise prevents its explicit
+  unpacked-extension flags from loading the worker. All 61 simulation tests,
+  shipped-script syntax checks, unused-local/parameter checks and two clean
+  reproducible builds pass. The updated browser suite was retried with the
+  available Playwright package and system Chromium, but that Chromium build
+  still did not expose the extension service worker during startup, so its 17
+  browser test cases remain unverified here. The CI workflow's Playwright-managed
+  Chromium remains the intended environment for that suite. The manifest
+  version remains `0.2.7`.

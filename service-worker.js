@@ -104,13 +104,35 @@ function refreshRules() {
   });
 }
 
+// ── Settings storage recovery ──────────────────────────────────────────────────
+// A failed sync read must not be mistaken for missing settings: doing so could
+// replace the local mirror with defaults and remove a working redirect rule.
+// Chrome alarms provide a bounded retry after transient storage failures.
+const SETTINGS_READ_RETRY_ALARM = "bh-settings-read-retry";
+const SETTINGS_READ_RETRY_DELAY_MS = 30000; // Chrome's minimum alarm interval
+function scheduleSettingsReadRetry() {
+  try {
+    const created = chrome.alarms?.create(SETTINGS_READ_RETRY_ALARM, {
+      when: Date.now() + SETTINGS_READ_RETRY_DELAY_MS
+    });
+    if (created && typeof created.catch === "function") created.catch(() => {});
+  } catch {}
+}
+
 // ── Local settings mirror ─────────────────────────────────────────────────────
 // The service worker is the SOLE writer of the bhOpts mirror (B4): every
 // content script writing it on each sync change produced O(tabs × frames)
 // write/event storms and could clobber the mirror with stale partial state.
 function mirrorToLocal() {
-  chrome.storage.sync.get(DEFAULTS, opts => {
-    if (!opts) opts = { ...DEFAULTS };
+  const onSyncSettings = opts => {
+    if (chrome.runtime?.lastError || !opts || typeof opts !== "object") {
+      scheduleSettingsReadRetry();
+      // Keep response/error handling alive across a transient sync-storage
+      // failure. The local mirror is the last settings snapshot that the worker
+      // successfully published, and DNR rules are deliberately left untouched.
+      restoreProxyObserverFromLocalMirror();
+      return;
+    }
     setProxyOrigin(opts.proxyBase);
     // Without an origin the queued early events can never match (they are only
     // replayed once an origin exists); drop them so the queue cannot hold
@@ -124,22 +146,47 @@ function mirrorToLocal() {
     updateWebRequestListener(configuredProxyOrigin);
     // Only write when different: every write makes every open tab rebuild
     // its caches via storage.onChanged.
-    chrome.storage.local.get({ bhOpts: null }, d => {
-      if (!sameOpts(d.bhOpts, opts)) chrome.storage.local.set({ bhOpts: opts });
-    });
-  });
+    try {
+      chrome.storage.local.get({ bhOpts: null }, d => {
+        if (chrome.runtime?.lastError) {
+          scheduleSettingsReadRetry();
+          return;
+        }
+        if (!sameOpts(d?.bhOpts, opts)) {
+          try {
+            chrome.storage.local.set({ bhOpts: opts }, () => {
+              if (chrome.runtime?.lastError) scheduleSettingsReadRetry();
+            });
+          } catch { scheduleSettingsReadRetry(); }
+        }
+      });
+    } catch { scheduleSettingsReadRetry(); }
+  };
+  try { chrome.storage.sync.get(DEFAULTS, onSyncSettings); }
+  catch { scheduleSettingsReadRetry(); }
 }
 
 // ── Lifecycle ─────────────────────────────────────────────────────────────────
 
-chrome.runtime.onInstalled.addListener(function() {
-  chrome.storage.sync.get(null, function(all) {
-    all = all || {};
-    var missing = {};
-    for (var k in DEFAULTS) if (!(k in all)) missing[k] = DEFAULTS[k];
-    if (Object.keys(missing).length) chrome.storage.sync.set(missing);
-  });
-});
+function initializeMissingSettings() {
+  try {
+    chrome.storage.sync.get(null, function(all) {
+      if (chrome.runtime?.lastError || !all || typeof all !== "object") {
+        scheduleSettingsReadRetry();
+        return;
+      }
+      const missing = {};
+      for (const key in DEFAULTS) if (!(key in all)) missing[key] = DEFAULTS[key];
+      if (!Object.keys(missing).length) return;
+      try {
+        chrome.storage.sync.set(missing, () => {
+          if (chrome.runtime?.lastError) scheduleSettingsReadRetry();
+        });
+      } catch { scheduleSettingsReadRetry(); }
+    });
+  } catch { scheduleSettingsReadRetry(); }
+}
+chrome.runtime.onInstalled.addListener(initializeMissingSettings);
 
 // The keys below are the only ones the worker consumes: mirroring on any
 // other sync change (popup-only keys, future keys) would trigger a full
@@ -159,13 +206,19 @@ chrome.storage.onChanged.addListener((changes, area) => {
 const ICONS_ON  = { 16: "icons/icon-16.png", 32: "icons/icon-32.png", 48: "icons/icon-48.png", 128: "icons/icon-128.png" };
 const ICONS_OFF = { 16: "icons/icon-16-disabled.png", 32: "icons/icon-32-disabled.png", 48: "icons/icon-48-disabled.png", 128: "icons/icon-128-disabled.png" };
 function updateIcon() {
-  chrome.storage.sync.get({ enabled: DEFAULTS.enabled }, d => {
-    if (!chrome.action || typeof chrome.action.setIcon !== "function") return;
-    try {
-      const maybePromise = chrome.action.setIcon({ path: d.enabled ? ICONS_ON : ICONS_OFF });
-      if (maybePromise && typeof maybePromise.catch === "function") maybePromise.catch(() => {});
-    } catch {}
-  });
+  try {
+    chrome.storage.sync.get({ enabled: DEFAULTS.enabled }, d => {
+      if (chrome.runtime?.lastError || !d) {
+        scheduleSettingsReadRetry();
+        return;
+      }
+      if (!chrome.action || typeof chrome.action.setIcon !== "function") return;
+      try {
+        const maybePromise = chrome.action.setIcon({ path: d.enabled ? ICONS_ON : ICONS_OFF });
+        if (maybePromise && typeof maybePromise.catch === "function") maybePromise.catch(() => {});
+      } catch {}
+    });
+  } catch { scheduleSettingsReadRetry(); }
 }
 
 // ── Stats ─────────────────────────────────────────────────────────────────────
@@ -533,39 +586,42 @@ let webRequestOrigin = null; // origin the current registration targets
 const PROXY_REQUEST_TYPES = ["image", "object"];
 function updateWebRequestListener(origin) {
   if (!chrome.webRequest || typeof chrome.webRequest.onCompleted !== "object") return;
-  // No proxy origin (or the proxy was cleared): drop any previous listener
-  // instead of keeping a never-matching dummy registration alive.
-  if (!origin) {
-    if (webRequestRegistered) {
-      try {
-        chrome.webRequest.onCompleted.removeListener(onProxyCompleted);
-        chrome.webRequest.onErrorOccurred?.removeListener(onProxyError);
-      } catch {}
-      webRequestRegistered = false;
-      webRequestOrigin = null;
-    }
-    return;
+  const key = origin === "*" ? "*" : String(origin || "");
+  // The startup observer uses <all_urls> only until settings are available.
+  // Once a proxy origin is known, narrow the filter; with no configured proxy,
+  // remove the observer entirely.
+  if (webRequestRegistered && key === webRequestOrigin) return;
+  if (webRequestRegistered) {
+    try { chrome.webRequest.onCompleted.removeListener(onProxyCompleted); } catch {}
+    try { chrome.webRequest.onErrorOccurred?.removeListener(onProxyError); } catch {}
+    webRequestRegistered = false;
+    webRequestOrigin = null;
   }
-  // Every settings change (quality, grayscale, …) calls this through
-  // mirrorToLocal(); re-registering is only needed when the origin changed.
-  if (webRequestRegistered && origin === webRequestOrigin) return;
-  try {
-    if (webRequestRegistered) {
-      chrome.webRequest.onCompleted.removeListener(onProxyCompleted);
-      chrome.webRequest.onErrorOccurred?.removeListener(onProxyError);
-    }
-  } catch {}
-  const urls = [origin + "/*"];
+  if (!key) return;
+  const urls = key === "*" ? ["<all_urls>"] : [key + "/*"];
+  let completedAdded = false;
+  let errorAdded = false;
   try {
     chrome.webRequest.onCompleted.addListener(
       onProxyCompleted,
-      { urls: urls, types: PROXY_REQUEST_TYPES },
+      { urls, types: PROXY_REQUEST_TYPES },
       ["responseHeaders"]
     );
-    chrome.webRequest.onErrorOccurred?.addListener(onProxyError, { urls: urls, types: PROXY_REQUEST_TYPES });
+    completedAdded = true;
+    if (typeof chrome.webRequest.onErrorOccurred?.addListener === "function") {
+      chrome.webRequest.onErrorOccurred.addListener(onProxyError, { urls, types: PROXY_REQUEST_TYPES });
+      errorAdded = true;
+    }
     webRequestRegistered = true;
-    webRequestOrigin = origin;
-  } catch { webRequestRegistered = false; webRequestOrigin = null; }
+    webRequestOrigin = key;
+  } catch {
+    // Roll back a partial registration; otherwise a retry can add duplicate
+    // listeners when only one of the two event subscriptions failed.
+    if (completedAdded) { try { chrome.webRequest.onCompleted.removeListener(onProxyCompleted); } catch {} }
+    if (errorAdded) { try { chrome.webRequest.onErrorOccurred.removeListener(onProxyError); } catch {} }
+    webRequestRegistered = false;
+    webRequestOrigin = null;
+  }
 }
 // B9: events can wake the worker before the async origin lookup finishes.
 const earlyStatsEvents = [];
@@ -647,6 +703,51 @@ function handleProxyError(details) {
   if (CONNECTION_NET_ERRORS.has(error)) noteGlobalProxyFailure();
   scheduleFallback(details);
 }
+
+// Re-establish the observer from the last confirmed settings snapshot when
+// synced storage is temporarily unavailable. This never writes settings or
+// changes DNR rules; it only restores the proxy-origin filter used for response
+// accounting and per-image fallback.
+let restoringProxyObserver = false;
+function restoreProxyObserverFromLocalMirror() {
+  if (restoringProxyObserver) return;
+  restoringProxyObserver = true;
+  const finish = () => { restoringProxyObserver = false; };
+  try {
+    chrome.storage.local.get({ bhOpts: null }, data => {
+      if (chrome.runtime?.lastError) {
+        scheduleSettingsReadRetry();
+        finish();
+        return;
+      }
+      const opts = data?.bhOpts;
+      if (!opts || typeof opts !== "object") { finish(); return; }
+      try {
+        setProxyOrigin(opts.proxyBase);
+        if (!configuredProxyOrigin && earlyStatsEvents.length) earlyStatsEvents.length = 0;
+        if (configuredProxyOrigin && earlyStatsEvents.length) {
+          const queued = earlyStatsEvents.splice(0);
+          queued.forEach(handleProxyCompleted);
+        }
+        updateWebRequestListener(configuredProxyOrigin);
+      } catch {
+        scheduleSettingsReadRetry();
+      } finally {
+        finish();
+      }
+    });
+  } catch {
+    scheduleSettingsReadRetry();
+    finish();
+  }
+}
+
+// MV3 event handlers must be registered synchronously at top level. Settings
+// are loaded asynchronously, so begin with a bounded startup observer and
+// narrow it to the configured proxy origin as soon as a trusted snapshot is
+// available. Without this bootstrap, the first webRequest event after a worker
+// restart can be dispatched before the async storage callback adds its filter.
+updateWebRequestListener("*");
 
 // ── Original URL recovery (mirror of bandwidth-hero-proxy2 getImageUrl) ───────
 const PROXY_PARAMETER_RE = new RegExp(CONFLICT_PATTERN);
@@ -1014,7 +1115,12 @@ function resumeBreakerIfExpired() {
   } catch { retry(); }
 }
 chrome.alarms?.onAlarm?.addListener(alarm => {
-  if (alarm.name === BREAKER_ALARM) resumeBreakerIfExpired();
+  if (alarm.name === SETTINGS_READ_RETRY_ALARM) {
+    initializeMissingSettings();
+    mirrorToLocal();
+    refreshRules();
+    updateIcon();
+  } else if (alarm.name === BREAKER_ALARM) resumeBreakerIfExpired();
   else if (alarm.name === BREAKER_READ_RETRY_ALARM) refreshRules();
   else if (alarm.name === RUNTIME_PUBLISH_RETRY_ALARM) retryPendingRuntimePublication();
 });
@@ -1273,8 +1379,12 @@ function doRefreshRules(done) {
       chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: ALL_RULE_IDS, addRules }, () => cb(chrome.runtime.lastError || null));
     } catch (e) { cb(e); }
   };
-  chrome.storage.sync.get(DEFAULTS, function(opts) {
-    if (!opts) opts = { ...DEFAULTS };
+  const onSyncSettings = function(opts) {
+    if (chrome.runtime?.lastError || !opts || typeof opts !== "object") {
+      scheduleSettingsReadRetry();
+      finish();
+      return;
+    }
     readSuspended(function(suspended) {
       // The published runtime reflects exactly the rule set Chrome accepted.
       const installed = addRules => {
@@ -1322,7 +1432,12 @@ function doRefreshRules(done) {
         });
       });
     });
-  });
+  };
+  try { chrome.storage.sync.get(DEFAULTS, onSyncSettings); }
+  catch {
+    scheduleSettingsReadRetry();
+    finish();
+  }
 }
 
 // Bootstrap only after every declaration above has been initialized; storage
