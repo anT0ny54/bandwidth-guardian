@@ -23,6 +23,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Ensure build script is executable
+        run: chmod 755 ./build.sh
+
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
@@ -53,6 +56,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Ensure build script is executable
+        run: chmod 755 ./build.sh
 
       - name: Read manifest version
         id: version
