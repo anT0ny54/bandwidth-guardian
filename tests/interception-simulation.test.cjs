@@ -26,6 +26,72 @@ test('shared defaults are declared once and loaded before classic consumers', ()
   assert.doesNotMatch(content, /const DEFAULTS = \{/);
 });
 
+test('content settings storage reads surface callback errors and synchronous throws', () => {
+  const callbackError = new Error('local storage unavailable');
+  const callbackChrome = {
+    runtime: { lastError: callbackError },
+    storage: { local: { get(_query, callback) { callback(undefined); } } }
+  };
+  const callbackHarness = functionFrom(content, 'readStorage', { chrome: callbackChrome });
+  let callbackResult;
+  callbackHarness.fn('local', { bhOpts: null }, (value, error) => { callbackResult = { value, error }; });
+  assert.equal(callbackResult.value, null);
+  assert.equal(callbackResult.error, callbackError);
+
+  const thrownError = new Error('storage API unavailable');
+  const throwingChrome = {
+    runtime: { lastError: null },
+    storage: { sync: { get() { throw thrownError; } } }
+  };
+  const throwingHarness = functionFrom(content, 'readStorage', { chrome: throwingChrome });
+  let thrownResult;
+  throwingHarness.fn('sync', {}, (value, error) => { thrownResult = { value, error }; });
+  assert.equal(thrownResult.value, null);
+  assert.equal(thrownResult.error, thrownError);
+
+  const successChrome = {
+    runtime: { lastError: null },
+    storage: { local: { get(_query, callback) { callback({ bhOpts: { enabled: true } }); } } }
+  };
+  const successHarness = functionFrom(content, 'readStorage', { chrome: successChrome });
+  let successResult;
+  successHarness.fn('local', {}, (value, error) => { successResult = { value, error }; });
+  assert.deepEqual(JSON.parse(JSON.stringify(successResult.value)), { bhOpts: { enabled: true } });
+  assert.equal(successResult.error, null);
+});
+
+test('extension and browser HTML pages use unique DOM ids and resolve static UI selectors', () => {
+  const pagesDir = path.join(ROOT, 'tests', 'browser', 'pages');
+  const fixturePages = fs.readdirSync(pagesDir).filter(file => file.endsWith('.html'))
+    .map(file => path.join('tests', 'browser', 'pages', file));
+  const pages = ['popup.html', 'options.html', ...fixturePages].sort();
+  assert.ok(fixturePages.length > 0, 'browser fixture pages exist');
+
+  for (const file of pages) {
+    const html = fs.readFileSync(path.join(ROOT, file), 'utf8');
+    const ids = [...html.matchAll(/\bid\s*=\s*(["'])(.*?)\1/gi)].map(match => match[2]);
+    const seen = new Set();
+    const duplicates = new Set();
+    for (const id of ids) {
+      if (seen.has(id)) duplicates.add(id);
+      seen.add(id);
+    }
+    assert.deepEqual([...duplicates], [], `${file}: duplicate DOM id(s)`);
+
+    const appScript = file === 'popup.html' ? 'popup.js' : file === 'options.html' ? 'options.js' : null;
+    if (!appScript) continue;
+
+    const source = fs.readFileSync(path.join(ROOT, appScript), 'utf8');
+    const staticRefs = [
+      ...[...source.matchAll(/\$\(\s*["']([^"']+)["']\s*\)/g)].map(match => match[1]),
+      ...[...source.matchAll(/\.getElementById\(\s*["']([^"']+)["']\s*\)/g)].map(match => match[1]),
+      ...[...source.matchAll(/\.querySelector(?:All)?\(\s*["'][^"']*#([A-Za-z][\w:-]*)/g)].map(match => match[1])
+    ];
+    const missing = [...new Set(staticRefs)].filter(id => !seen.has(id));
+    assert.deepEqual(missing, [], `${appScript}: static selector(s) must exist in ${file}`);
+  }
+});
+
 function extractFunction(source, name) {
   const marker = new RegExp(`function\\s+${name}\\s*\\(`);
   const match = marker.exec(source);
@@ -784,6 +850,18 @@ test('a changed picture source clears stale fallback state on its parent image',
   assert.equal(received[0].values, candidates);
 });
 
+test('custom max width accepts only non-negative safe whole-pixel values', () => {
+  const { fn: parseWidth } = functionFrom(optionsSource, 'parseCustomWidth');
+  assert.equal(parseWidth('0'), 0);
+  assert.equal(parseWidth('768'), 768);
+  assert.equal(parseWidth('9007199254740991'), Number.MAX_SAFE_INTEGER);
+  for (const invalid of ['', '  ', '-1', '1.5', '1e3', '9007199254740992', '999999999999999999999999999999']) {
+    assert.equal(parseWidth(invalid), null, `${JSON.stringify(invalid)} must be rejected`);
+  }
+  assert.match(extractFunction(optionsSource, 'save'), /parseCustomWidth\(cw\) === null/,
+    'save rejects values that cannot be represented exactly');
+});
+
 test('incoming quality and width changes update reset baselines without clobbering dirty inputs', () => {
   const sandbox = { dirty: { quality: true, width: true } };
   vm.createContext(sandbox);
@@ -990,20 +1068,30 @@ test('closing a tab removes queued fallback work without cancelling other tabs',
 test('runtime-state storage writes stay ordered when publications overlap', async () => {
   const reads = [];
   const writes = [];
+  const runtimeHelpers = ['clearRuntimePublishRetry', 'scheduleRuntimePublishRetry', 'enqueueRuntimePublication', 'retryPendingRuntimePublication', 'publishRuntime']
+    .map(name => extractFunction(serviceWorker, name)).join('\n');
   const sandbox = {
     Promise,
-    chrome: { storage: { local: {
-      get: (_defaults, callback) => reads.push(callback),
-      set: (value, callback) => writes.push({ value, callback })
-    } } }
+    chrome: {
+      storage: { local: {
+        get: (_defaults, callback) => reads.push(callback),
+        set: (value, callback) => writes.push({ value, callback })
+      } },
+      alarms: { clear: () => Promise.resolve(true), create: () => Promise.resolve() }
+    }
   };
   vm.createContext(sandbox);
   vm.runInContext(`
+    const RUNTIME_PUBLISH_RETRY_ALARM = "bh-runtime-publish-retry";
+    const RUNTIME_PUBLISH_RETRY_INITIAL_DELAY_MS = 30000;
+    const RUNTIME_PUBLISH_RETRY_MAX_DELAY_MS = 600000;
+    let runtimePublishRetryDelay = RUNTIME_PUBLISH_RETRY_INITIAL_DELAY_MS;
     let lastRuntime = null;
+    let pendingRuntime = null;
     let runtimePublishRevision = 0;
     let runtimeWriteQueue = Promise.resolve();
-    ${extractFunction(serviceWorker, 'publishRuntime')}
-    this.api = { publishRuntime };
+    ${runtimeHelpers}
+    this.api = { publishRuntime, state: () => ({ lastRuntime, pendingRuntime }) };
   `, sandbox);
 
   const first = { redirect: true, suspended: false };
@@ -1039,6 +1127,122 @@ test('runtime-state storage writes stay ordered when publications overlap', asyn
   assert.equal(writes.length, 3);
   assert.deepEqual(JSON.parse(JSON.stringify(writes[2].value)), { bhRuntime: final });
   writes[2].callback();
+});
+
+test('runtime publication retries storage errors with an alarm and preserves pending transitions', async () => {
+  const reads = [];
+  const writes = [];
+  const alarms = [];
+  const clearedAlarms = [];
+  let now = 100_000;
+  const runtimeHelpers = ['clearRuntimePublishRetry', 'scheduleRuntimePublishRetry', 'enqueueRuntimePublication', 'retryPendingRuntimePublication', 'publishRuntime']
+    .map(name => extractFunction(serviceWorker, name)).join('\n');
+  const alarmListenerSource = serviceWorker.slice(
+    serviceWorker.indexOf('chrome.alarms?.onAlarm?.addListener'),
+    serviceWorker.indexOf('\n\nfunction readSuspended')
+  );
+  const sandbox = {
+    Promise,
+    Date: { now: () => now },
+    chrome: {
+      runtime: { lastError: null },
+      storage: { local: {
+        get: (_defaults, callback) => reads.push(callback),
+        set: (value, callback) => writes.push({ value, callback })
+      } },
+      alarms: {
+        create: (name, info) => { alarms.push({ name, ...info }); return Promise.resolve(); },
+        clear: name => { clearedAlarms.push(name); return Promise.resolve(true); },
+        onAlarm: { addListener: () => {} }
+      }
+    }
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(`
+    const BREAKER_ALARM = 'bh-breaker-resume';
+    const BREAKER_READ_RETRY_ALARM = 'bh-breaker-read-retry';
+    const RUNTIME_PUBLISH_RETRY_ALARM = 'bh-runtime-publish-retry';
+    const RUNTIME_PUBLISH_RETRY_INITIAL_DELAY_MS = 30000;
+    const RUNTIME_PUBLISH_RETRY_MAX_DELAY_MS = 600000;
+    let runtimePublishRetryDelay = RUNTIME_PUBLISH_RETRY_INITIAL_DELAY_MS;
+    let lastRuntime = null;
+    let pendingRuntime = null;
+    let runtimePublishRevision = 0;
+    let runtimeWriteQueue = Promise.resolve();
+    let alarmListener = null;
+    chrome.alarms.onAlarm.addListener = callback => { alarmListener = callback; };
+    function refreshRules() {}
+    function resumeBreakerIfExpired() {}
+    ${runtimeHelpers}
+    ${alarmListenerSource}
+    this.api = { publishRuntime, state: () => ({ lastRuntime, pendingRuntime }), retryDelay: () => runtimePublishRetryDelay,
+      fireRetry: () => alarmListener({ name: RUNTIME_PUBLISH_RETRY_ALARM }) };
+  `, sandbox);
+  const tick = () => new Promise(resolve => setImmediate(resolve));
+  const snapshot = () => JSON.parse(JSON.stringify(sandbox.api.state()));
+  const original = { redirect: true, suspended: false };
+
+  // A failed storage read retains the requested state and schedules a durable alarm.
+  sandbox.api.publishRuntime(original);
+  await tick();
+  assert.equal(reads.length, 1);
+  sandbox.chrome.runtime.lastError = { message: 'temporary read failure' };
+  reads[0]({ bhRuntime: null });
+  sandbox.chrome.runtime.lastError = null;
+  await tick();
+  assert.deepEqual(snapshot(), { lastRuntime: null, pendingRuntime: original });
+  assert.deepEqual(alarms.at(-1), { name: 'bh-runtime-publish-retry', when: now + 30_000 });
+  assert.equal(sandbox.api.retryDelay(), 60_000, 'the next retry delay grows exponentially');
+
+  // The actual alarm listener must retry the latest pending state.
+  sandbox.api.fireRetry();
+  await tick();
+  assert.equal(reads.length, 2, 'the retry alarm performs another storage read');
+  reads[1]({ bhRuntime: null });
+  await tick();
+  assert.equal(writes.length, 1);
+  sandbox.chrome.runtime.lastError = { message: 'temporary write failure' };
+  writes[0].callback();
+  sandbox.chrome.runtime.lastError = null;
+  await tick();
+  assert.deepEqual(snapshot(), { lastRuntime: null, pendingRuntime: original });
+  assert.deepEqual(alarms.at(-1), { name: 'bh-runtime-publish-retry', when: now + 60_000 });
+  assert.equal(sandbox.api.retryDelay(), 120_000);
+
+  // A successful retry confirms the state, clears the alarm and resets backoff.
+  sandbox.api.fireRetry();
+  await tick();
+  assert.equal(reads.length, 3);
+  reads[2]({ bhRuntime: null });
+  await tick();
+  assert.equal(writes.length, 2);
+  writes[1].callback();
+  await tick();
+  assert.deepEqual(snapshot(), { lastRuntime: original, pendingRuntime: null });
+  assert.equal(sandbox.api.retryDelay(), 30_000);
+  assert.ok(clearedAlarms.includes('bh-runtime-publish-retry'), 'confirmed publication clears the pending retry alarm');
+
+  // If B is in flight, a request to return to confirmed A must queue behind B.
+  const changed = { redirect: false, suspended: true };
+  sandbox.api.publishRuntime(changed);
+  await tick();
+  assert.equal(reads.length, 4);
+  reads[3]({ bhRuntime: original });
+  await tick();
+  assert.equal(writes.length, 3);
+  sandbox.api.publishRuntime(original);
+  await tick();
+  assert.equal(reads.length, 4, 'return-to-A waits for the outstanding B write');
+  writes[2].callback();
+  await tick();
+  assert.equal(reads.length, 5, 'return-to-A is read after B completes');
+  reads[4]({ bhRuntime: changed });
+  await tick();
+  assert.equal(writes.length, 4);
+  assert.deepEqual(JSON.parse(JSON.stringify(writes[3].value)), { bhRuntime: original });
+  writes[3].callback();
+  await tick();
+  assert.deepEqual(snapshot(), { lastRuntime: original, pendingRuntime: null });
 });
 
 test('service worker waits for startup recovery, serializes concurrent stats resets, and preserves later activity', () => {
@@ -1725,6 +1929,32 @@ test('HTTP errors use per-image fallback but do not count as connection failures
     'a reachable proxy that returns a non-image 2xx confirms connectivity and still retries the image directly');
 });
 
+test('a successful proxy response without Content-Type is not counted or redundantly retried', () => {
+  const calls = [];
+  const sandbox = {
+    isGuardianProxyUrl(url) { return String(url).startsWith('https://proxy.example/'); },
+    headerMap(headers) {
+      return new Map((headers || []).map(header => [String(header.name).toLowerCase(), header.value]));
+    },
+    noteGlobalProxyFailure() { calls.push('breaker'); },
+    noteProxyResponse() { calls.push('response'); },
+    scheduleFallback() { calls.push('fallback'); },
+    IMAGE_CONTENT_TYPES: new Set(['image/jpeg']),
+    getProxyResponseStats() { return { received: 100, saved: 20 }; },
+    recordStats() { calls.push('stats'); }
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(`${extractFunction(serviceWorker, 'handleProxyCompleted')}\nthis.run = handleProxyCompleted;`, sandbox);
+
+  sandbox.run({
+    url: 'https://proxy.example/convert?url=https://origin.example/photo.jpg',
+    statusCode: 200,
+    responseHeaders: []
+  });
+  assert.deepEqual(calls, ['response'],
+    'an unknown MIME type confirms proxy reachability but is neither counted nor treated as an explicit non-image response');
+});
+
 test('an HTTP error response resets earlier connection failures without opening the breaker', () => {
   const constantsStart = serviceWorker.indexOf('const BREAKER_THRESHOLD');
   const constantsEnd = serviceWorker.indexOf('let breakerFailures', constantsStart);
@@ -1927,6 +2157,74 @@ test('service worker opens the breaker after two failures inside 10 seconds and 
   assert.equal(refreshes, 3, 'clearing suspension reinstalls the normal redirect rules');
 });
 
+test('an unreadable breaker state disables proxying and retries rule refresh with backoff', () => {
+  const constantsStart = serviceWorker.indexOf('const BREAKER_THRESHOLD');
+  const constantsEnd = serviceWorker.indexOf('let breakerFailures', constantsStart);
+  assert.ok(constantsStart >= 0 && constantsEnd > constantsStart, 'breaker constants exist');
+  const constants = serviceWorker.slice(constantsStart, constantsEnd);
+  const retryFunction = extractFunction(serviceWorker, 'scheduleBreakerReadRetry');
+  const readFunction = extractFunction(serviceWorker, 'readSuspended');
+  const listenerStart = serviceWorker.indexOf('chrome.alarms?.onAlarm?.addListener');
+  const listenerEnd = serviceWorker.indexOf('\n\nfunction readSuspended', listenerStart);
+  assert.ok(listenerStart >= 0 && listenerEnd > listenerStart, 'breaker alarm listener exists');
+  const listener = serviceWorker.slice(listenerStart, listenerEnd);
+
+  let now = 5000;
+  let readFails = true;
+  let listenerCallback = null;
+  let refreshes = 0;
+  const alarms = [];
+  const clears = [];
+  const sandbox = {
+    Date: { now: () => now },
+    chrome: {
+      runtime: { lastError: { message: 'temporary storage failure' } },
+      storage: { session: { get(_defaults, callback) {
+        callback(readFails ? undefined : { bhSuspendedUntil: 0 });
+      } } },
+      alarms: {
+        create(name, info) { alarms.push({ name, ...info }); },
+        clear(name) { clears.push(name); },
+        onAlarm: { addListener(callback) { listenerCallback = callback; } }
+      }
+    },
+    refreshRules() { refreshes++; }
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(`${constants}\nlet breakerFailures = [];\nlet breakerReadRetryDelay = 1000;\n${retryFunction}\n${readFunction}\n${listener}\nthis.read = readSuspended;`, sandbox);
+
+  let suspended = false;
+  sandbox.read(value => { suspended = value; });
+  assert.equal(suspended, true, 'a failed session-storage read fails safe and keeps proxy redirects off');
+  assert.deepEqual(alarms, [{ name: 'bh-breaker-read-retry', when: now + 1000 }]);
+
+  // Repeated failures back off instead of polling storage every second forever.
+  now += 1000;
+  sandbox.read(() => {});
+  assert.deepEqual(alarms.at(-1), { name: 'bh-breaker-read-retry', when: now + 2000 });
+
+  // Once storage recovers, the dedicated retry alarm rebuilds rules and a
+  // successful read clears the retry alarm and resets its backoff.
+  readFails = false;
+  sandbox.chrome.runtime.lastError = null;
+  listenerCallback({ name: 'bh-breaker-read-retry' });
+  assert.equal(refreshes, 1, 'the read-retry alarm refreshes DNR rules');
+  suspended = true;
+  sandbox.read(value => { suspended = value; });
+  assert.equal(suspended, false, 'a successful read restores the stored active/inactive state');
+  assert.deepEqual(clears, ['bh-breaker-read-retry']);
+  now += 1000;
+  sandbox.read(() => {});
+  assert.deepEqual(alarms.at(-1), { name: 'bh-breaker-read-retry', when: now + 1000 }, 'success resets the retry delay');
+
+  // A synchronous API throw uses the same fail-safe retry path.
+  sandbox.chrome.storage.session.get = () => { throw new Error('storage API unavailable'); };
+  suspended = false;
+  sandbox.read(value => { suspended = value; });
+  assert.equal(suspended, true);
+  assert.deepEqual(alarms.at(-1), { name: 'bh-breaker-read-retry', when: now + 1000 });
+});
+
 test('a src assigned after a rewritten srcset restores the original candidates, not proxy URLs', () => {
   const h = createDomHarness();
   h.publishSettings({ redirect: false });
@@ -1972,14 +2270,21 @@ test('bypass eviction only starts when the live bypass table is actually full', 
     ${sources.join('\n')}
     this.add = addBypass;
     this.size = () => bypassRules.size;
+    this.keys = () => Array.from(bypassRules.keys());
   `, sandbox);
 
-  // One flush of 2,000 failures is well under the 3,000-rule cap.
-  const urls = Array.from({ length: 2000 }, (_, i) => `https://cdn.example/bulk/${i}.png`);
-  const bypassed = await sandbox.add(7, urls);
-  assert.equal(bypassed.length, 2000, 'every failed URL receives a bypass');
-  assert.equal(sandbox.size(), 2000, 'the live table keeps all entries');
-  assert.deepEqual(removed, [], 'no bypass is evicted while capacity remains');
+  // The cap is global even though each installed rule is tab-scoped.
+  const firstTab = Array.from({ length: 1500 }, (_, i) => `https://cdn.example/tab-7/${i}.png`);
+  const secondTab = Array.from({ length: 1500 }, (_, i) => `https://cdn.example/tab-8/${i}.png`);
+  assert.equal((await sandbox.add(7, firstTab)).length, 1500);
+  assert.equal((await sandbox.add(8, secondTab)).length, 1500);
+  assert.equal(sandbox.size(), 3000, 'the extension-wide live table reaches its global cap');
+  assert.deepEqual(removed, [], 'no bypass is evicted while global capacity remains');
+
+  await sandbox.add(9, ['https://cdn.example/tab-9/new.png']);
+  assert.equal(sandbox.size(), 3000, 'adding another tab cannot exceed the global table cap');
+  assert.deepEqual(removed, [100000], 'the oldest rule is evicted globally only when the table is full');
+  assert.equal(sandbox.keys()[0], `7 https://cdn.example/tab-7/1.png`, 'the next-oldest tab-scoped bypass remains installed');
 });
 
 test('custom badges are static siblings of the preset grids, never appended grid children', () => {
