@@ -224,10 +224,13 @@ local mirror instead.
 | `<canvas>` | Images drawn from proxied `<img>` are proxied; the proxy sends `Access-Control-Allow-Origin: *`, so `crossorigin="anonymous"` images stay untainted | |
 
 Every browser test checks the actual URL Chrome requested (logged by a local
-mock origin and mock proxy). When `BHP2_DIR` points to a bandwidth-hero-proxy2
-checkout, the mock proxy uses that project's `getImageUrl()` implementation;
-otherwise it uses the equivalent parser bundled in `tests/browser/server.cjs`.
-Assertions cover image loading, fallback behaviour and duplicate proxy requests.
+mock origin and mock proxy). The mock log also records the final HTTP status and
+response `Content-Type`, so statistics assertions distinguish completed strict
+image responses from requests that the browser cancels while replacing an image
+candidate. When `BHP2_DIR` points to a bandwidth-hero-proxy2 checkout, the mock
+proxy uses that project's `getImageUrl()` implementation; otherwise it uses the
+equivalent parser bundled in `tests/browser/server.cjs`. Assertions cover image
+loading, fallback behaviour and duplicate proxy requests.
 Further tests cover a 600-image responsive, lazy, infinite-scroll page with
 viewport changes, dynamically loaded content, exclusions and private hosts,
 page CSP, enable/disable and settings changes, statistics and the circuit
@@ -313,8 +316,10 @@ bash ./build.sh
 ```
 
 The build stages the shipped files, syntax-checks the JavaScript, validates the
-manifest (MV3, Chrome-only), normalizes file modes, and writes a reproducible
-`bandwidth-guardian-<version>.zip`.
+manifest (MV3, Chrome-only), normalizes packaged file modes, and writes a
+reproducible `bandwidth-guardian-<version>.zip`. `build.sh` is executable in
+POSIX checkouts; use the documented `bash ./build.sh` form when extracting a
+source archive that does not preserve Unix executable metadata.
 
 Releasing is handled by `.github/workflows/build.yml`. Every push to `main`
 builds the extension. If a release for the manifest version does not exist, the

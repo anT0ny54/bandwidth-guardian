@@ -8,10 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.2.7] — current release
 
 ### Changed
-- Keep `build.sh` executable for direct use from POSIX checkouts, and document
-  `bash ./build.sh` as the portable build command. Some source ZIP archives do
-  not preserve Unix executable metadata, so the README no longer depends on
-  that file mode; the CI workflow already invokes the script through Bash.
+- Keep `build.sh` executable in POSIX checkouts, while documenting
+  `bash ./build.sh` as the portable command for source ZIP archives that omit
+  Unix executable metadata. The CI workflow also invokes the script through
+  Bash.
 - Tightened the connection-level circuit breaker: only recognized Chromium
   transport, DNS and proxy-path failures count toward the two-failure,
   rolling 10-second threshold that suspends image redirects for 40 seconds.
@@ -23,6 +23,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   status, confirms proxy reachability and resets the failure window.
 
 ### Fixed
+- The fallback browser test inferred successful statistics from proxy request
+  URLs alone. A request can reach the mock server and then be cancelled while
+  Chrome replaces an image candidate, so the test now counts only completed
+  2xx responses with a strict image `Content-Type`; the mock records final
+  response metadata for that assertion.
 - A failed content-script settings read could dereference an empty storage
   callback result and abort initialization. Local and sync reads now check
   `runtime.lastError` and synchronous API exceptions; the script falls back from
