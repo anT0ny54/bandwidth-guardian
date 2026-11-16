@@ -30,8 +30,17 @@ test('build script permission and README invocation support source archives', ()
   const buildScript = path.join(ROOT, 'build.sh');
   const readme = fs.readFileSync(path.join(ROOT, 'README.md'), 'utf8');
   if (process.platform !== 'win32') {
-    assert.notEqual(fs.statSync(buildScript).mode & 0o111, 0,
-      'build.sh remains executable in POSIX checkouts');
+    // Source ZIPs may not carry Unix mode bits and have no Git index to check.
+    // In a real checkout, the workflow restores the mode before this test runs.
+    const gitCheckout = spawnSync('git', ['rev-parse', '--is-inside-work-tree'], {
+      cwd: ROOT,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore']
+    });
+    if (gitCheckout.status === 0 && gitCheckout.stdout.trim() === 'true') {
+      assert.notEqual(fs.statSync(buildScript).mode & 0o111, 0,
+        'build.sh remains executable in POSIX checkouts');
+    }
   }
   assert.match(readme, /## Build\s+```sh\s+bash \.\/build\.sh\s+```/,
     'the documented command works even when an archive drops executable metadata');
