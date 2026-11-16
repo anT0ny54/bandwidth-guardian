@@ -255,10 +255,10 @@ Pass the test files explicitly: Node 21+ no longer accepts a bare `tests/`
 directory for `node --test`. The browser harness removes Playwright's default
 `--disable-extensions` argument before supplying the unpacked-extension flags;
 without that override, Chromium starts without the extension and no service
-worker is available to test. A simulation check also verifies that `build.sh`
-retains its executable bit on POSIX checkouts and that the documented
-`bash ./build.sh` command remains portable when source ZIP extraction drops
-that bit.
+worker is available to test. A simulation check verifies that `build.sh` is executable in POSIX Git
+checkouts. The test skips only that mode assertion for source ZIPs, which may
+not contain a Git index or Unix mode metadata; both CI jobs restore mode `755`
+after checkout, and `bash ./build.sh` remains portable for archive extracts.
 The simulation suite also covers the shared-default loading contract, oversized
 bypass filters, DNR-failure retry bookkeeping,
 live-rule state recovery, runtime-publication alarm retries, global bypass
@@ -317,9 +317,10 @@ bash ./build.sh
 
 The build stages the shipped files, syntax-checks the JavaScript, validates the
 manifest (MV3, Chrome-only), normalizes packaged file modes, and writes a
-reproducible `bandwidth-guardian-<version>.zip`. `build.sh` is executable in
-POSIX checkouts; use the documented `bash ./build.sh` form when extracting a
-source archive that does not preserve Unix executable metadata.
+reproducible `bandwidth-guardian-<version>.zip`. `build.sh` is executable in POSIX
+checkouts, and the CI test/build jobs normalize its mode to `755` after
+checkout. Use `bash ./build.sh` when extracting a source archive that does not
+preserve Unix executable metadata.
 
 Releasing is handled by `.github/workflows/build.yml`. Every push to `main`
 builds the extension. If a release for the manifest version does not exist, the

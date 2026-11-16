@@ -8,10 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.2.7] — current release
 
 ### Changed
-- Keep `build.sh` executable in POSIX checkouts, while documenting
-  `bash ./build.sh` as the portable command for source ZIP archives that omit
-  Unix executable metadata. The CI workflow also invokes the script through
-  Bash.
+- Keep `build.sh` executable in POSIX checkouts and explicitly restore mode
+  `755` after checkout in both CI jobs. The permission test now checks only real
+  Git checkouts, so source ZIPs that omit Unix metadata remain testable;
+  `bash ./build.sh` remains the portable archive command.
 - Tightened the connection-level circuit breaker: only recognized Chromium
   transport, DNS and proxy-path failures count toward the two-failure,
   rolling 10-second threshold that suspends image redirects for 40 seconds.
