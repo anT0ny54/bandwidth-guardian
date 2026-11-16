@@ -26,6 +26,25 @@ test('shared defaults are declared once and loaded before classic consumers', ()
   assert.doesNotMatch(content, /const DEFAULTS = \{/);
 });
 
+test('build script permission and README invocation support source archives', () => {
+  const buildScript = path.join(ROOT, 'build.sh');
+  const readme = fs.readFileSync(path.join(ROOT, 'README.md'), 'utf8');
+  if (process.platform !== 'win32') {
+    assert.notEqual(fs.statSync(buildScript).mode & 0o111, 0,
+      'build.sh remains executable in POSIX checkouts');
+  }
+  assert.match(readme, /## Build\s+```sh\s+bash \.\/build\.sh\s+```/,
+    'the documented command works even when an archive drops executable metadata');
+});
+
+test('real-browser suite overrides Playwright default that disables extensions', () => {
+  const browserSuite = fs.readFileSync(path.join(ROOT, 'tests', 'browser', 'interception.browser.test.cjs'), 'utf8');
+  assert.match(browserSuite, /ignoreDefaultArgs:\s*\[\s*['"]--disable-extensions['"]\s*\]/,
+    "the persistent context must remove Playwright's default extension-blocking switch");
+  assert.match(browserSuite, /--disable-extensions-except=\$\{EXT\}/);
+  assert.match(browserSuite, /--load-extension=\$\{EXT\}/);
+});
+
 test('content settings storage reads surface callback errors and synchronous throws', () => {
   const callbackError = new Error('local storage unavailable');
   const callbackChrome = {
@@ -58,6 +77,142 @@ test('content settings storage reads surface callback errors and synchronous thr
   successHarness.fn('local', {}, (value, error) => { successResult = { value, error }; });
   assert.deepEqual(JSON.parse(JSON.stringify(successResult.value)), { bhOpts: { enabled: true } });
   assert.equal(successResult.error, null);
+});
+
+test('service worker does not treat failed sync reads as missing settings', () => {
+  const storageError = new Error('sync storage unavailable');
+  let retries = 0;
+  let localReads = 0;
+  const mirrorChrome = {
+    runtime: { lastError: storageError },
+    storage: {
+      sync: { get(_query, callback) { callback(undefined); } },
+      local: { get() { localReads++; } }
+    }
+  };
+  const mirror = functionFrom(serviceWorker, 'mirrorToLocal', {
+    chrome: mirrorChrome,
+    scheduleSettingsReadRetry() { retries++; }
+  });
+  mirror.fn();
+  assert.equal(localReads, 0, 'failed sync read must not replace the last good local mirror');
+  assert.equal(retries, 1, 'settings recovery is scheduled');
+
+  let ruleUpdates = 0;
+  let finished = 0;
+  const rules = functionFrom(serviceWorker, 'doRefreshRules', {
+    chrome: {
+      runtime: { lastError: storageError },
+      declarativeNetRequest: { updateDynamicRules() { ruleUpdates++; } },
+      storage: { sync: { get(_query, callback) { callback(undefined); } } }
+    },
+    scheduleSettingsReadRetry() { retries++; }
+  });
+  rules.fn(() => { finished++; });
+  assert.equal(ruleUpdates, 0, 'failed settings must not rebuild or remove the active DNR rules');
+  assert.equal(finished, 1, 'the refresh lock is released');
+  assert.equal(retries, 2);
+
+  let writes = 0;
+  const initialize = functionFrom(serviceWorker, 'initializeMissingSettings', {
+    chrome: {
+      runtime: { lastError: storageError },
+      storage: { sync: { get(_query, callback) { callback(undefined); }, set() { writes++; } } }
+    },
+    scheduleSettingsReadRetry() { retries++; }
+  });
+  initialize.fn();
+  assert.equal(writes, 0, 'failed reads must never overwrite existing user settings with defaults');
+  assert.equal(retries, 3);
+});
+
+test('proxy observers register synchronously and recover their filter from the local settings mirror', () => {
+  const bootstrapCall = serviceWorker.indexOf('updateWebRequestListener("*");');
+  const bootstrapRun = serviceWorker.lastIndexOf('\nmirrorToLocal();');
+  assert.ok(bootstrapCall >= 0 && bootstrapCall < bootstrapRun,
+    'the broad bootstrap listener must be registered at top level before async settings reads');
+
+  const registrations = [];
+  const makeEvent = name => ({
+    addListener(_listener, filter, extra) { registrations.push([name, 'add', filter, extra || null]); },
+    removeListener() { registrations.push([name, 'remove']); }
+  });
+  const listenerSandbox = {
+    chrome: { webRequest: { onCompleted: makeEvent('completed'), onErrorOccurred: makeEvent('error') } },
+    PROXY_REQUEST_TYPES: ['image', 'object'],
+    onProxyCompleted() {}, onProxyError() {},
+    webRequestRegistered: false, webRequestOrigin: null
+  };
+  vm.createContext(listenerSandbox);
+  vm.runInContext(`${extractFunction(serviceWorker, 'updateWebRequestListener')}\nthis.update = updateWebRequestListener;`, listenerSandbox);
+  listenerSandbox.update('*');
+  assert.deepEqual(registrations.filter(x => x[1] === 'add').map(x => Array.from(x[2].urls)), [['<all_urls>'], ['<all_urls>']]);
+  listenerSandbox.update('https://proxy.example');
+  assert.deepEqual(registrations.filter(x => x[1] === 'add').slice(2).map(x => Array.from(x[2].urls)), [
+    ['https://proxy.example/*'], ['https://proxy.example/*']
+  ]);
+  listenerSandbox.update('');
+  assert.equal(registrations.filter(x => x[1] === 'add').length, 4,
+    'clearing the proxy removes the targeted observer instead of re-registering it');
+
+  const event = { url: 'https://proxy.example/api?url=https://cdn.example/a.png', statusCode: 200 };
+  const mirrorSandbox = {
+    URL,
+    chrome: { runtime: { lastError: null }, storage: { local: { get(_query, callback) {
+      callback({ bhOpts: { proxyBase: 'https://proxy.example/api' } });
+    } } } }
+  };
+  vm.createContext(mirrorSandbox);
+  vm.runInContext(`
+    let configuredProxyOrigin = '';
+    let restoringProxyObserver = false;
+    const earlyStatsEvents = [${JSON.stringify(event)}];
+    const handled = [];
+    let selectedOrigin = '';
+    let retries = 0;
+    function setProxyOrigin(base) { configuredProxyOrigin = new URL(base).origin; }
+    function updateWebRequestListener(origin) { selectedOrigin = origin; }
+    function handleProxyCompleted(item) { handled.push(item.url); }
+    function scheduleSettingsReadRetry() { retries++; }
+    ${extractFunction(serviceWorker, 'restoreProxyObserverFromLocalMirror')}
+    restoreProxyObserverFromLocalMirror();
+    this.result = () => ({ configuredProxyOrigin, selectedOrigin, remaining: earlyStatsEvents.length, handled, retries, restoringProxyObserver });
+  `, mirrorSandbox);
+  const result = mirrorSandbox.result();
+  assert.equal(result.configuredProxyOrigin, 'https://proxy.example');
+  assert.equal(result.selectedOrigin, 'https://proxy.example');
+  assert.equal(result.remaining, 0, 'queued startup events are replayed after the origin is restored');
+  assert.deepEqual(Array.from(result.handled), [event.url]);
+  assert.equal(result.retries, 0);
+  assert.equal(result.restoringProxyObserver, false);
+
+  const failedRead = new Error('local settings mirror unavailable');
+  const failureSandbox = {
+    URL,
+    chrome: {
+      runtime: { lastError: failedRead },
+      storage: { local: { get(_query, callback) { callback(undefined); } } }
+    }
+  };
+  vm.createContext(failureSandbox);
+  vm.runInContext(`
+    let configuredProxyOrigin = '';
+    let restoringProxyObserver = false;
+    const earlyStatsEvents = [];
+    let selectedOrigin = '*';
+    let retries = 0;
+    function setProxyOrigin(base) { configuredProxyOrigin = new URL(base).origin; }
+    function updateWebRequestListener(origin) { selectedOrigin = origin; }
+    function handleProxyCompleted() {}
+    function scheduleSettingsReadRetry() { retries++; }
+    ${extractFunction(serviceWorker, 'restoreProxyObserverFromLocalMirror')}
+    restoreProxyObserverFromLocalMirror();
+    this.result = () => ({ selectedOrigin, retries, restoringProxyObserver });
+  `, failureSandbox);
+  const failed = failureSandbox.result();
+  assert.equal(failed.selectedOrigin, '*', 'a failed local read must leave the synchronous startup observer active');
+  assert.equal(failed.retries, 1);
+  assert.equal(failed.restoringProxyObserver, false);
 });
 
 test('extension and browser HTML pages use unique DOM ids and resolve static UI selectors', () => {
@@ -1159,6 +1314,7 @@ test('runtime publication retries storage errors with an alarm and preserves pen
   };
   vm.createContext(sandbox);
   vm.runInContext(`
+    const SETTINGS_READ_RETRY_ALARM = 'bh-settings-read-retry';
     const BREAKER_ALARM = 'bh-breaker-resume';
     const BREAKER_READ_RETRY_ALARM = 'bh-breaker-read-retry';
     const RUNTIME_PUBLISH_RETRY_ALARM = 'bh-runtime-publish-retry';
@@ -1984,7 +2140,7 @@ test('an HTTP error response resets earlier connection failures without opening 
     refreshRules() { refreshes++; }
   };
   vm.createContext(sandbox);
-  vm.runInContext(`${constants}\nlet breakerFailures = [];\n${extractFunction(serviceWorker, 'noteProxyResponse')}\n${extractFunction(serviceWorker, 'noteGlobalProxyFailure')}\n${extractFunction(serviceWorker, 'handleProxyCompleted')}\nthis.api = { fail: noteGlobalProxyFailure, completed: handleProxyCompleted };`, sandbox);
+  vm.runInContext(`const SETTINGS_READ_RETRY_ALARM = 'bh-settings-read-retry';\n${constants}\nlet breakerFailures = [];\n${extractFunction(serviceWorker, 'noteProxyResponse')}\n${extractFunction(serviceWorker, 'noteGlobalProxyFailure')}\n${extractFunction(serviceWorker, 'handleProxyCompleted')}\nthis.api = { fail: noteGlobalProxyFailure, completed: handleProxyCompleted };`, sandbox);
 
   sandbox.api.fail();
   now += 1_000;
@@ -2105,7 +2261,7 @@ test('service worker opens the breaker after two failures inside 10 seconds and 
     refreshRules() { refreshes++; }
   };
   vm.createContext(sandbox);
-  vm.runInContext(`${constants}\nlet breakerFailures = [];\n${extractFunction(serviceWorker, 'noteProxyResponse')}\n${extractFunction(serviceWorker, 'noteGlobalProxyFailure')}\n${extractFunction(serviceWorker, 'scheduleBreakerResume')}\n${extractFunction(serviceWorker, 'resumeBreakerIfExpired')}\n${alarmListener}\nthis.api = { fail: noteGlobalProxyFailure, response: noteProxyResponse };`, sandbox);
+  vm.runInContext(`const SETTINGS_READ_RETRY_ALARM = 'bh-settings-read-retry';\n${constants}\nlet breakerFailures = [];\n${extractFunction(serviceWorker, 'noteProxyResponse')}\n${extractFunction(serviceWorker, 'noteGlobalProxyFailure')}\n${extractFunction(serviceWorker, 'scheduleBreakerResume')}\n${extractFunction(serviceWorker, 'resumeBreakerIfExpired')}\n${alarmListener}\nthis.api = { fail: noteGlobalProxyFailure, response: noteProxyResponse };`, sandbox);
 
   sandbox.api.fail();
   assert.equal(Object.keys(stored).length, 0, 'one failure does not open the breaker');
@@ -2191,7 +2347,7 @@ test('an unreadable breaker state disables proxying and retries rule refresh wit
     refreshRules() { refreshes++; }
   };
   vm.createContext(sandbox);
-  vm.runInContext(`${constants}\nlet breakerFailures = [];\nlet breakerReadRetryDelay = 1000;\n${retryFunction}\n${readFunction}\n${listener}\nthis.read = readSuspended;`, sandbox);
+  vm.runInContext(`const SETTINGS_READ_RETRY_ALARM = 'bh-settings-read-retry';\n${constants}\nlet breakerFailures = [];\nlet breakerReadRetryDelay = 1000;\n${retryFunction}\n${readFunction}\n${listener}\nthis.read = readSuspended;`, sandbox);
 
   let suspended = false;
   sandbox.read(value => { suspended = value; });
