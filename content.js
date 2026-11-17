@@ -95,6 +95,11 @@
   const TEMPLATE_SOURCE_RE = /(?:\$\{[^}]*\}|\{\{?[^}]*\}\}?|%7b[^%]*%7d|__[^_\s]+__)/i;
 
   let opts = null;
+  // Revisions prevent an asynchronous startup snapshot from overwriting a
+  // newer storage.onChanged event that arrived while the read was in flight.
+  let settingsRevision = 0;
+  let runtimeRevision = 0;
+  let pendingSettingsReadRevision = -1;
   let active = false; // enabled && proxyBase set && !pageExcluded (O1)
   let proxyConfig = null;
   let proxyOrigin = "";  // C2: origin-based identity, matching the worker
@@ -647,14 +652,59 @@
     }
   }
 
+  function readCurrentSyncSettings(revision) {
+    if (destroyed || revision !== settingsRevision) return;
+    if (pendingSettingsReadRevision === revision) return;
+    pendingSettingsReadRevision = revision;
+    readStorage("sync", DEFAULTS, (synced, error) => {
+      if (pendingSettingsReadRevision !== revision) return;
+      pendingSettingsReadRevision = -1;
+      if (destroyed || revision !== settingsRevision) return;
+      if (error) {
+        // A failed cold-start read must leave this document in a safe state;
+        // already-applied settings are never replaced by a failed refresh.
+        if (!opts) applyOpts({ ...DEFAULTS, enabled: false, proxyBase: "" });
+        return;
+      }
+      const valid = !!synced && typeof synced === "object" && !Array.isArray(synced);
+      const settings = valid
+        ? { ...DEFAULTS, ...synced }
+        : { ...DEFAULTS, enabled: false, proxyBase: "" };
+      if (!sameOpts(settings, opts)) applyOpts(settings);
+      // The service worker exclusively owns the shared bhOpts mirror. This
+      // fallback updates only this document, avoiding one mirror write per
+      // frame when several documents start before the worker's mirror exists.
+    });
+  }
+
+  function applyInitialStorage(data, settingsAtRead, runtimeAtRead) {
+    if (destroyed) return;
+    if (runtimeAtRead === runtimeRevision && data?.bhRuntime &&
+        typeof data.bhRuntime === "object" && !Array.isArray(data.bhRuntime)) {
+      runtime = { redirect: true, suspended: false, ...data.bhRuntime };
+    }
+    if (settingsAtRead !== settingsRevision) {
+      // A local snapshot taken before a newer sync/local settings event is
+      // stale. Its event handler already applies or reads the newer settings.
+      return;
+    }
+    if (data?.bhOpts && typeof data.bhOpts === "object" && !Array.isArray(data.bhOpts)) {
+      applyOpts({ ...DEFAULTS, ...data.bhOpts });
+    } else {
+      readCurrentSyncSettings(settingsRevision);
+    }
+  }
+
   // ── Settings load ──────────────────────────────────────────────────────────
-  // Fast path: bhOpts mirror in storage.local (~5 ms). Cold path: storage.sync,
-  // then write the mirror — the service worker is the mirror's sole writer in
-  // steady state (B4); this is the only content-script write, on the cold path.
+  // Fast path: bhOpts mirror in storage.local (~5 ms). Cold path: storage.sync.
+  // The service worker is the only writer of the shared mirror (B4), avoiding
+  // duplicate local writes from every frame on a fresh install.
   // The known-failed list is fetched in parallel with settings (bounded wait),
   // so the first publish already carries it. If both settings stores fail, this
   // document uses disabled/no-proxy defaults rather than crashing or guessing
   // that DOM interception is safe while the DNR state is unknown.
+  const initialSettingsRevision = settingsRevision;
+  const initialRuntimeRevision = runtimeRevision;
   const failedListReady = new Promise(resolve => {
     const timer = setTimeout(resolve, 400);
     try {
@@ -670,38 +720,39 @@
       });
     } catch { clearTimeout(timer); resolve(); }
   });
-  readStorage("local", { bhOpts: null, bhRuntime: null }, d => failedListReady.then(() => {
-    if (destroyed) return;
-    if (d?.bhRuntime && typeof d.bhRuntime === "object") runtime = d.bhRuntime;
-    if (d?.bhOpts && typeof d.bhOpts === "object") {
-      applyOpts({ ...DEFAULTS, ...d.bhOpts });
-    } else {
-      readStorage("sync", DEFAULTS, synced => {
-        if (destroyed) return;
-        const valid = !!synced && typeof synced === "object";
-        const settings = valid
-          ? { ...DEFAULTS, ...synced }
-          : { ...DEFAULTS, enabled: false, proxyBase: "" };
-        applyOpts(settings);
-        if (valid) {
-          try { chrome.storage.local.set({ bhOpts: settings }, () => { void chrome.runtime.lastError; }); } catch {}
-        }
-      });
-    }
-  }));
+  readStorage("local", { bhOpts: null, bhRuntime: null }, d => failedListReady.then(() =>
+    applyInitialStorage(d, initialSettingsRevision, initialRuntimeRevision)));
 
   function onStorageChanged(changes, area) {
     if (destroyed) return;
     if (area === "local" && (changes.bhOpts || changes.bhRuntime)) {
-      if (changes.bhRuntime) runtime = changes.bhRuntime.newValue || { redirect: true, suspended: false };
-      const next = changes.bhOpts ? (changes.bhOpts.newValue || DEFAULTS) : opts;
-      if (next && (changes.bhRuntime || !sameOpts(next, opts))) applyOpts(next);
+      if (changes.bhRuntime) {
+        runtimeRevision++;
+        const nextRuntime = changes.bhRuntime.newValue;
+        runtime = nextRuntime && typeof nextRuntime === "object" && !Array.isArray(nextRuntime)
+          ? { redirect: true, suspended: false, ...nextRuntime }
+          : { redirect: true, suspended: false };
+      }
+      if (changes.bhOpts) {
+        settingsRevision++;
+        const mirror = changes.bhOpts.newValue;
+        const next = mirror == null
+          ? { ...DEFAULTS }
+          : mirror && typeof mirror === "object" && !Array.isArray(mirror)
+            ? { ...DEFAULTS, ...mirror }
+            : { ...DEFAULTS, enabled: false, proxyBase: "" };
+        if (!sameOpts(next, opts) || changes.bhRuntime) applyOpts(next);
+      } else if (changes.bhRuntime && opts) {
+        applyOpts(opts);
+      }
     } else if (area === "sync") {
       // B4: apply in memory only — no mirror write (the worker owns it).
+      if (!Object.keys(changes).some(key => key in DEFAULTS)) return;
+      settingsRevision++;
       if (!opts) {
-        chrome.storage.sync.get(DEFAULTS, next => {
-          if (!destroyed && !sameOpts(next, opts)) applyOpts(next);
-        });
+        // A sync change can arrive before startup finishes. A revision-bound
+        // read ignores stale callbacks if another settings change arrives.
+        readCurrentSyncSettings(settingsRevision);
         return;
       }
       const next = { ...opts };

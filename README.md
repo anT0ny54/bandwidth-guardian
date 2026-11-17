@@ -112,8 +112,12 @@ their module scripts.
   URL is then broadcast to every frame in the tab, matching the tab-wide bypass
   scope, and the complete bounded bypass list is supplied to newly loaded
   documents. Requests without a valid tab ID are not given a global bypass.
-  Plain and escaped-regex filters are preflighted against the same conservative
-  size limit before submission. Bypass rules are removed when the tab closes.
+  The worker first enumerates existing session rules after startup; if that read
+  fails, it skips the bypass operation and retries enumeration on the next queued
+  operation rather than assuming an empty ruleset or reusing a possibly occupied
+  rule ID. Plain and escaped-regex filters are preflighted against the same
+  conservative size limit before submission. Bypass rules are removed when the
+  tab closes.
   The extension keeps at most 3,000 live bypass rules globally across all tabs.
   Each rule remains scoped to its own tab; when the global table is full, the
   oldest rule across all tabs is evicted.
@@ -177,11 +181,48 @@ can then block the proxy on that browser configuration.
 | `excludeDomains` | `""` | Comma/space/newline separated (any whitespace); subdomains match; entries other than plain host names (ports, wildcards) are ignored |
 
 Settings changed on one surface (popup vs. options page) stay in sync on the
-other. The options page reloads the tab that opened it after a save that changed a
-value. The
-service worker only reacts to `storage.sync` changes for the settings keys it
-manages, so unrelated sync writes never trigger rule refreshes, and the
-`webRequest` observer is re-registered only when the proxy origin changes.
+other. Popup and options-page startup reads are revision-guarded: a delayed
+initial read fills only settings that have not changed since it began, so a
+newer cross-page update or unsaved edit is not rolled back. The popup also
+ignores stale active-tab lookups, shows an unavailable state instead of stale
+site data when a lookup fails, and aborts an exclusion toggle if the active site
+changes while its storage read is pending. The options page ignores an old
+startup stats snapshot after a newer live counter update. Save waits for a
+successful initial settings read before it can write, preventing a quick click
+from replacing stored values with the page's HTML defaults. When saving, the
+options page samples its controls after the asynchronous baseline read so
+cross-page updates received during that read are included. A newer cross-page
+setting received while `storage.sync.set()` is pending wins over the older
+submitted value; the page reload decision is based on that final committed
+snapshot. Edits made locally while the storage write itself is pending remain
+visible and marked unsaved when the older save completes; its completion cannot
+clear or normalize newer user edits. Only one options-page save can write at a
+time, and storage read/write failures leave unsaved values intact and show an
+error instead of silently clearing them. The Proxy Test action is also locked
+while Reset defaults is running, and a test that finishes during reset cannot
+re-enable its button prematurely. Auto-saved switch changes are serialized; a
+failed toggle restores the latest stored value when it can be read. Reset
+defaults invalidates older toggle-recovery callbacks, waits for queued switch
+writes, cannot overlap a Save, and temporarily disables setting controls until
+defaults have been reloaded. Reset also invalidates the original startup settings
+snapshot before its first asynchronous wait, so a delayed pre-reset read cannot
+repaint old values after defaults are committed. If the reset write fails, the
+page reloads persisted switch values while preserving dirty text and preset edits.
+A failed reset reports the error without clearing unsaved edits.
+Popup settings and site-exclusion reads/writes also report storage errors.
+These write actions share a short lock that disables writable popup controls,
+preventing rapid changes from issuing overlapping storage writes. Failed
+optimistic settings changes are rolled back only when no newer cross-page setting
+has arrived, and unrelated sync keys are ignored. If a boolean setting key is
+removed from sync storage, the settings page restores its shared default rather
+than interpreting the missing value as `false`. An unavailable settings read
+is reported while stats loading is settled independently. The options page
+reloads the tab that
+opened it after a save that changed a value. The service
+worker only reacts to `storage.sync` changes for the settings keys it manages,
+so unrelated sync
+writes never trigger rule refreshes, and the `webRequest` observer is
+re-registered only when the proxy origin changes.
 The service worker serializes updates to its local `bhRuntime` mirror and only
 records a state as published after storage confirms it. If a local-storage read
 or write fails, the newest desired state stays pending and a dedicated Chrome
@@ -195,8 +236,18 @@ with a per-group "Custom" badge on the popup and the settings page, instead of
 highlighting a nearby preset. Custom max-width values must be non-negative whole
 pixels; values beyond JavaScript's safe-integer range are rejected rather than
 silently rounded. If a content script cannot read its local settings mirror, it
-falls back to synced settings; if both reads fail, that document disables
-DOM-side rewriting rather than crashing or guessing that interception is safe.
+falls back to synced settings in memory; if both reads fail, that document
+disables DOM-side rewriting rather than crashing or guessing that interception
+is safe. A sync-settings change that arrives before startup finishes uses the
+same error-checked read path and merges the shared defaults before applying it,
+so a transient read failure cannot pass an empty settings value into the
+interceptor. Only the service worker writes the shared local mirror, avoiding
+per-frame write storms during a cold start. Revision checks also discard older
+local/sync snapshots when a newer change arrives during startup. Concurrent
+reads for the same revision are coalesced, so stale callbacks cannot roll
+settings or runtime state backwards or write the local mirror more than once.
+Partial local settings and runtime mirror events are normalized with their
+respective defaults before they reach the interceptor.
 If the service worker cannot read synced settings, it keeps the last known local
 mirror and installed network rules, does not treat the failure as missing user
 preferences, and schedules a Chrome alarm to retry settings initialization,
@@ -205,7 +256,17 @@ mirroring and rule refresh after the minimum 30-second alarm interval. Its
 required for MV3 event delivery), initially for image/object requests across
 URLs; once settings load, the filter is narrowed to the configured proxy origin.
 If the sync read fails, the worker restores that origin from the last confirmed
-local mirror instead.
+local mirror instead. Each settings-mirror read carries a revision: stale sync
+callbacks are discarded, local mirror writes are serialized, and only the newest
+queued snapshot is committed. Repeated local-mirror observer restore requests
+are coalesced, and a pending restore is invalidated when a newer sync snapshot
+succeeds, preventing an old proxy origin from being registered after a settings
+change. A failed newer read does not cancel a previously confirmed snapshot's
+pending mirror write; once a trusted sync or local recovery snapshot has
+configured the observer, later read failures retain that last-known origin
+instead of reapplying an older mirror. Icon updates use the same
+latest-request guard, so out-of-order storage callbacks cannot leave the toolbar
+icon in an older state.
 
 ## Interception coverage and tests
 
@@ -261,13 +322,22 @@ that mode assertion for source ZIPs (including archives extracted inside an
 unrelated Git worktree), which may not carry a Git index or Unix mode metadata;
 both CI jobs restore mode `755` after checkout, and `bash ./build.sh` remains
 portable for archive extracts.
-The simulation suite also covers the shared-default loading contract, oversized
-bypass filters, DNR-failure retry bookkeeping,
-live-rule state recovery, runtime-publication alarm retries, global bypass
-capacity across tabs, reserved proxy query validation, safe custom-width
-validation, case-insensitive CSS fallback, unique IDs across all extension and
-browser HTML pages, and static popup/settings selectors that resolve against
-their markup.
+The simulation suite also covers the shared-default loading contract (including
+restoring `enabled`, `grayscale` and `saveData` checkboxes to their shared defaults
+when a sync key is removed), stale startup settings and stats snapshots across
+the content script, service worker, popup and options page, stale proxy-observer
+restores, popup tab lookup failures,
+invalid tab URLs, exclusion clicks racing with tab changes, popup storage errors,
+write-lock behavior and failed optimistic writes, options saves waiting for
+successful startup reads, cross-page updates and edits during pending writes,
+reload decisions based on the final committed settings, Proxy Test/Reset
+exclusion, reset/autosave queue ordering, reset invalidation of stale startup
+snapshots and recovery callbacks, transient session-bypass initialization
+failures, oversized bypass filters, DNR-failure retry bookkeeping, live-rule
+state recovery, runtime-publication alarm retries, global bypass capacity across
+tabs, reserved proxy query validation, safe custom-width validation,
+case-insensitive CSS fallback, unique IDs across all extension and browser HTML
+pages, and static popup/settings selectors that resolve against their markup.
 The browser suite skips unless both `playwright-core` and a valid `CHROME_PATH`
 are available. The simulation suite also locks down the proxy-response boundary
 for missing `Content-Type` headers: unknown MIME types are not counted or

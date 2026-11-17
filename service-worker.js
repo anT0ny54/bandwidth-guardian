@@ -86,6 +86,10 @@ const ALL_RULE_IDS = [1, RULE_ID_CSP, RULE_ID_SAVE_DATA, RULE_ID_REDIRECT_IMAGE,
 let refreshing     = false;
 let pendingRefresh = false;
 let configuredProxyOrigin = "";
+// Invalidates local-mirror observer restores when a newer sync snapshot wins.
+let proxyObserverRevision = 0;
+let proxyObserverReady = false;
+let restoringProxyObserver = false;
 
 // Same validation as the DNR rules (http/https only): an "ftp://" or
 // "javascript:" value must never yield an origin ("null") that would make
@@ -123,8 +127,18 @@ function scheduleSettingsReadRetry() {
 // The service worker is the SOLE writer of the bhOpts mirror (B4): every
 // content script writing it on each sync change produced O(tabs × frames)
 // write/event storms and could clobber the mirror with stale partial state.
+// Sync callbacks can complete out of order. Keep only the newest snapshot, and
+// serialize local writes so an older in-flight write cannot finish last.
+let mirrorReadRevision = 0;
+let mirrorRevision = 0;
+let mirrorWriteInFlight = false;
+let pendingMirrorWrite = null;
 function mirrorToLocal() {
+  // A newer read request supersedes older reads, but a failed read must not
+  // cancel a previously confirmed snapshot that is still waiting to mirror.
+  const readRevision = ++mirrorReadRevision;
   const onSyncSettings = opts => {
+    if (readRevision !== mirrorReadRevision) return;
     if (chrome.runtime?.lastError || !opts || typeof opts !== "object") {
       scheduleSettingsReadRetry();
       // Keep response/error handling alive across a transient sync-storage
@@ -133,6 +147,12 @@ function mirrorToLocal() {
       restoreProxyObserverFromLocalMirror();
       return;
     }
+    const revision = ++mirrorRevision;
+    // Once a trusted settings snapshot has configured the observer, a later
+    // transient sync read failure must not restore an older local mirror over it.
+    proxyObserverReady = true;
+    // A successful sync snapshot supersedes any older local-mirror recovery read.
+    proxyObserverRevision++;
     setProxyOrigin(opts.proxyBase);
     // Without an origin the queued early events can never match (they are only
     // replayed once an origin exists); drop them so the queue cannot hold
@@ -145,22 +165,46 @@ function mirrorToLocal() {
     }
     updateWebRequestListener(configuredProxyOrigin);
     // Only write when different: every write makes every open tab rebuild
-    // its caches via storage.onChanged.
-    try {
-      chrome.storage.local.get({ bhOpts: null }, d => {
-        if (chrome.runtime?.lastError) {
-          scheduleSettingsReadRetry();
-          return;
-        }
-        if (!sameOpts(d?.bhOpts, opts)) {
+    // its caches via storage.onChanged. Queue one latest snapshot while a write
+    // is in flight, so callback ordering cannot leave an older mirror last.
+    pendingMirrorWrite = { opts, revision };
+    const persistNext = () => {
+      if (mirrorWriteInFlight) return;
+      const next = pendingMirrorWrite;
+      pendingMirrorWrite = null;
+      if (!next || next.revision !== mirrorRevision) return;
+      mirrorWriteInFlight = true;
+      const finish = () => {
+        mirrorWriteInFlight = false;
+        if (pendingMirrorWrite) persistNext();
+      };
+      try {
+        chrome.storage.local.get({ bhOpts: null }, d => {
+          if (next.revision !== mirrorRevision) { finish(); return; }
+          if (chrome.runtime?.lastError) {
+            scheduleSettingsReadRetry();
+            finish();
+            return;
+          }
+          if (sameOpts(d?.bhOpts, next.opts)) { finish(); return; }
           try {
-            chrome.storage.local.set({ bhOpts: opts }, () => {
-              if (chrome.runtime?.lastError) scheduleSettingsReadRetry();
+            chrome.storage.local.set({ bhOpts: next.opts }, () => {
+              if (next.revision === mirrorRevision && chrome.runtime?.lastError) {
+                scheduleSettingsReadRetry();
+              }
+              finish();
             });
-          } catch { scheduleSettingsReadRetry(); }
-        }
-      });
-    } catch { scheduleSettingsReadRetry(); }
+          } catch {
+            if (next.revision === mirrorRevision) scheduleSettingsReadRetry();
+            finish();
+          }
+        });
+      } catch {
+        if (next.revision === mirrorRevision) scheduleSettingsReadRetry();
+        finish();
+      }
+    };
+    persistNext();
   };
   try { chrome.storage.sync.get(DEFAULTS, onSyncSettings); }
   catch { scheduleSettingsReadRetry(); }
@@ -205,9 +249,12 @@ chrome.storage.onChanged.addListener((changes, area) => {
 // ── Extension icon ────────────────────────────────────────────────────────────
 const ICONS_ON  = { 16: "icons/icon-16.png", 32: "icons/icon-32.png", 48: "icons/icon-48.png", 128: "icons/icon-128.png" };
 const ICONS_OFF = { 16: "icons/icon-16-disabled.png", 32: "icons/icon-32-disabled.png", 48: "icons/icon-48-disabled.png", 128: "icons/icon-128-disabled.png" };
+let iconRevision = 0;
 function updateIcon() {
+  const revision = ++iconRevision;
   try {
     chrome.storage.sync.get({ enabled: DEFAULTS.enabled }, d => {
+      if (revision !== iconRevision) return;
       if (chrome.runtime?.lastError || !d) {
         scheduleSettingsReadRetry();
         return;
@@ -707,22 +754,29 @@ function handleProxyError(details) {
 // Re-establish the observer from the last confirmed settings snapshot when
 // synced storage is temporarily unavailable. This never writes settings or
 // changes DNR rules; it only restores the proxy-origin filter used for response
-// accounting and per-image fallback.
-let restoringProxyObserver = false;
+// accounting and per-image fallback. A successful sync snapshot invalidates an
+// in-flight local read, so an older mirror can never roll the observer back.
 function restoreProxyObserverFromLocalMirror() {
-  if (restoringProxyObserver) return;
+  // The local mirror is only a startup recovery source. Once a trusted sync
+  // snapshot or local restore has configured the observer, keep that last-known
+  // origin during later sync failures instead of risking a stale mirror rollback.
+  // Coalesce startup reads; a newer successful sync snapshot invalidates them.
+  if (proxyObserverReady || restoringProxyObserver) return;
   restoringProxyObserver = true;
+  const revision = ++proxyObserverRevision;
   const finish = () => { restoringProxyObserver = false; };
   try {
     chrome.storage.local.get({ bhOpts: null }, data => {
+      if (revision !== proxyObserverRevision) { finish(); return; }
       if (chrome.runtime?.lastError) {
         scheduleSettingsReadRetry();
         finish();
         return;
       }
       const opts = data?.bhOpts;
-      if (!opts || typeof opts !== "object") { finish(); return; }
+      if (!opts || typeof opts !== "object" || Array.isArray(opts)) { finish(); return; }
       try {
+        proxyObserverReady = true;
         setProxyOrigin(opts.proxyBase);
         if (!configuredProxyOrigin && earlyStatsEvents.length) earlyStatsEvents.length = 0;
         if (configuredProxyOrigin && earlyStatsEvents.length) {
@@ -731,13 +785,13 @@ function restoreProxyObserverFromLocalMirror() {
         }
         updateWebRequestListener(configuredProxyOrigin);
       } catch {
-        scheduleSettingsReadRetry();
+        if (revision === proxyObserverRevision) scheduleSettingsReadRetry();
       } finally {
         finish();
       }
     });
   } catch {
-    scheduleSettingsReadRetry();
+    if (revision === proxyObserverRevision) scheduleSettingsReadRetry();
     finish();
   }
 }
@@ -788,11 +842,18 @@ const BYPASS_REGEX_LIMIT = 900;
 const bypassRules    = new Map(); // "tabId url" -> ruleId (insertion order = age)
 const bypassRegexRules = new Set(); // keys whose exact URL uses regexFilter
 let bypassNextId     = BYPASS_BASE_ID;
-let bypassChain      = null;    // serializes updateSessionRules calls
+let bypassChain      = Promise.resolve(); // serializes all session-rule operations
+let bypassInitialized = false;
+let bypassInitPromise = null;
 
+// Session rules survive service-worker restarts. A transient read failure must
+// not be cached as an empty ruleset: retry initialization on the next queued
+// operation instead of allocating IDs that may already exist in Chrome.
 function bypassReady() {
-  if (bypassChain) return bypassChain;
-  bypassChain = (async () => {
+  if (bypassInitialized) return Promise.resolve(true);
+  if (bypassInitPromise) return bypassInitPromise;
+  let initialization;
+  initialization = (async () => {
     try {
       const rules = await chrome.declarativeNetRequest.getSessionRules();
       for (const r of rules) {
@@ -805,9 +866,27 @@ function bypassReady() {
         if (r.condition?.regexFilter) bypassRegexRules.add(key);
         bypassNextId = Math.max(bypassNextId, r.id + 1);
       }
-    } catch {}
+      bypassInitialized = true;
+      return true;
+    } catch {
+      return false;
+    } finally {
+      if (bypassInitPromise === initialization) bypassInitPromise = null;
+    }
   })();
-  return bypassChain;
+  bypassInitPromise = initialization;
+  return initialization;
+}
+
+function queueBypassOperation(operation, notReadyValue) {
+  const queued = bypassChain.catch(() => {}).then(async () => {
+    if (!await bypassReady()) {
+      return typeof notReadyValue === "function" ? notReadyValue() : notReadyValue;
+    }
+    return operation();
+  });
+  bypassChain = queued.catch(() => {});
+  return queued;
 }
 
 // Browser request URLs are ASCII after URL canonicalization. Most URLs can use
@@ -847,7 +926,7 @@ function addBypass(tabId, urls) {
   // cannot be retried safely, so never turn an unknown tab (-1) into a global bypass.
   if (!Number.isInteger(tabId) || tabId < 0) return Promise.resolve([]);
   const tab = tabId;
-  const operation = bypassReady().then(async () => {
+  return queueBypassOperation(async () => {
     const candidates = [];
     const candidateKeys = new Set();
     const alreadyPresent = new Set();
@@ -916,11 +995,7 @@ function addBypass(tabId, urls) {
       if (nextRules.has(key) && nextRules.get(key) === item.id) bypassed.push(item.url);
     }
     return bypassed;
-  });
-  // A rejected link would wedge every later bypassReady() caller; the chain
-  // only serializes, results flow through `operation`.
-  bypassChain = operation.catch(() => {});
-  return operation;
+  }, []);
 }
 
 // Drop a closed tab's bypass rules (they can never match again).
@@ -929,7 +1004,7 @@ chrome.tabs?.onRemoved?.addListener(tabId => {
   // work before it reaches addBypass(), otherwise a dead tab can consume a
   // session-rule slot after the removal handler has already run.
   clearQueuedFallbacks(tabId);
-  bypassChain = bypassReady().then(async () => {
+  queueBypassOperation(async () => {
     const keys = [];
     const removeRuleIds = [];
     for (const [key, id] of bypassRules) {
@@ -948,7 +1023,7 @@ chrome.tabs?.onRemoved?.addListener(tabId => {
       bypassRules.delete(key);
       bypassRegexRules.delete(key);
     }
-  }).catch(() => {});
+  }, undefined);
 });
 
 // Content scripts ask for this tab's known-bad originals at page start, so the
@@ -962,13 +1037,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
   if (msg.type !== "bh-failed-list") return;
   const prefix = (sender?.tab?.id ?? -1) + " ";
-  bypassReady().then(() => {
+  queueBypassOperation(() => {
     const urls = [];
     for (const k of bypassRules.keys()) if (k.startsWith(prefix)) urls.push(k.slice(prefix.length));
     // BYPASS_LIMIT bounds this list; returning all active entries ensures a
     // reloaded document also knows about failed URLs older than the last 1,000.
     sendResponse({ urls });
-  });
+  }, () => sendResponse({ urls: [] }));
   return true;
 });
 

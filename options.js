@@ -19,6 +19,17 @@ const customWidthEl   = $("customWidth");
 
 const qualityPresets = Array.from(document.querySelectorAll("#qualityPresets .preset"));
 const widthPresets   = Array.from(document.querySelectorAll("#widthPresets  .preset"));
+const editableSettingsControls = [
+  enabledEl, grayscaleEl, saveDataEl, proxyBaseEl, excludeEl,
+  customQualityEl, customWidthEl, testProxyBtn, ...qualityPresets, ...widthPresets
+];
+function setSettingsControlsDisabled(disabled) {
+  editableSettingsControls.forEach(control => {
+    control.disabled = disabled || (control === testProxyBtn && testProxyInProgress);
+  });
+}
+
+let testProxyInProgress = false;
 
 // Preset values come from the buttons themselves, so HTML and JS cannot drift.
 const QUALITY_PRESETS = qualityPresets.map(b => Number(b.dataset.q));
@@ -29,6 +40,50 @@ let savedWidth   = DEFAULTS.maxWidth;
 // B2: track fields the user has edited since load/save so incoming sync
 // changes (e.g. the popup's "Exclude this site") never clobber unsaved edits.
 const dirty = { proxyBase: false, excludeDomains: false, quality: false, width: false };
+// User edits made while storage.sync.set() is pending must remain visible and
+// dirty when that older save completes. Revisions distinguish those edits from
+// the values included in the submitted snapshot.
+const editRevision = { proxyBase: 0, excludeDomains: 0, quality: 0, width: 0 };
+let saveInProgress = false;
+let resetInProgress = false;
+function markEdit(field) {
+  editRevision[field]++;
+  dirty[field] = true;
+}
+const settingsRevision = Object.create(null);
+// Keep the latest observed sync snapshot so a cross-page change arriving while
+// Save is pending is not replaced by the older values submitted by this page.
+let latestSyncSettings = { ...DEFAULTS };
+let statsRevision = 0;
+let pendingAutoSaveWrites = Promise.resolve();
+const autoSaveRevision = { enabled: 0, grayscale: 0, saveData: 0 };
+function markSettingsRevision(key) {
+  settingsRevision[key] = (settingsRevision[key] || 0) + 1;
+}
+function queueAutoSave(values) {
+  const write = pendingAutoSaveWrites.catch(() => {}).then(() => chrome.storage.sync.set(values));
+  pendingAutoSaveWrites = write;
+  return write;
+}
+async function persistAutoSetting(key, element, successMessage, successType = "ok") {
+  const revision = ++autoSaveRevision[key];
+  const value = !!element.checked;
+  markSettingsRevision(key);
+  try {
+    await queueAutoSave({ [key]: value });
+    if (revision === autoSaveRevision[key]) showToast(successMessage(value), successType);
+  } catch {
+    if (revision !== autoSaveRevision[key]) return;
+    let latest;
+    try { latest = await chrome.storage.sync.get({ [key]: DEFAULTS[key] }); }
+    catch {}
+    // Reset may have started while the recovery read was pending. Its newer
+    // default snapshot wins; an older failed-toggle callback must not repaint it.
+    if (revision !== autoSaveRevision[key]) return;
+    if (latest) element.checked = !!latest[key];
+    showToast("Could not save setting", "err");
+  }
+}
 
 // Keep the latest stored value as the reset baseline even while an input is
 // dirty. The UI remains untouched until the user clears their custom edit.
@@ -152,24 +207,45 @@ function readWidth() {
 // ── Load ──────────────────────────────────────────────────────────────────────
 
 async function load() {
-  const [d, s] = await Promise.all([
-    chrome.storage.sync.get(DEFAULTS),
-    chrome.storage.local.get({ stats: null })
+  const revisions = { ...settingsRevision };
+  const initialStatsRevision = statsRevision;
+  const [settingsResult, statsResult] = await Promise.allSettled([
+    Promise.resolve().then(() => chrome.storage.sync.get(DEFAULTS)),
+    Promise.resolve().then(() => chrome.storage.local.get({ stats: null }))
   ]);
-  enabledEl.checked    = !!d.enabled;
-  grayscaleEl.checked  = !!d.grayscale;
-  saveDataEl.checked   = !!d.saveData;
-  proxyBaseEl.value    = d.proxyBase || "";
-  proxyBaseEl.classList.remove("invalid");
-  excludeEl.value      = d.excludeDomains || "";
-  savedQuality = d.quality  ?? DEFAULTS.quality;
-  savedWidth   = d.maxWidth ?? DEFAULTS.maxWidth;
-  setQualityUI(savedQuality);
-  setWidthUI(savedWidth);
-  renderStats(s.stats);
-  for (const k in dirty) dirty[k] = false;
+  if (settingsResult.status !== "fulfilled") {
+    showToast("Could not load saved settings", "err");
+    return false;
+  }
+  const d = settingsResult.value || DEFAULTS;
+  const unchanged = key => (settingsRevision[key] || 0) === (revisions[key] || 0);
+  for (const key of Object.keys(DEFAULTS)) {
+    if (unchanged(key)) latestSyncSettings[key] = d[key] ?? DEFAULTS[key];
+  }
+  if (unchanged("enabled")) enabledEl.checked = !!d.enabled;
+  if (unchanged("grayscale")) grayscaleEl.checked = !!d.grayscale;
+  if (unchanged("saveData")) saveDataEl.checked = !!d.saveData;
+  if (unchanged("proxyBase") && !dirty.proxyBase) {
+    proxyBaseEl.value = d.proxyBase || "";
+    proxyBaseEl.classList.remove("invalid");
+  }
+  if (unchanged("excludeDomains") && !dirty.excludeDomains) {
+    excludeEl.value = d.excludeDomains || "";
+  }
+  if (unchanged("quality")) {
+    savedQuality = d.quality ?? DEFAULTS.quality;
+    if (!dirty.quality) setQualityUI(savedQuality);
+  }
+  if (unchanged("maxWidth")) {
+    savedWidth = d.maxWidth ?? DEFAULTS.maxWidth;
+    if (!dirty.width) setWidthUI(savedWidth);
+  }
+  if (statsResult.status === "fulfilled" && statsRevision === initialStatsRevision) {
+    renderStats(statsResult.value?.stats);
+  }
+  return true;
 }
-load();
+const initialLoadPromise = load();
 
 function renderStats(st) {
   st = st || {};
@@ -178,18 +254,17 @@ function renderStats(st) {
   statSavedEl.textContent  = fmtBytes(Number(st.bytesSaved || 0));
 }
 
-// Live stats counter while this page is open (worker flushes in batches), and
-// B2: stay in sync with changes made elsewhere (popup toggles, popup
-// exclusions, second Settings window). Fields with unsaved edits win.
-chrome.storage.onChanged.addListener((changes, area) => {
-  if (area === "local") {
-    if (changes.stats) renderStats(changes.stats.newValue);
-    return;
+// Apply only settings owned by this extension; keep the latest observed values
+// even when a dirty control must remain untouched by a cross-page update.
+function applySyncSettingsChanges(changes) {
+  for (const [key, change] of Object.entries(changes)) {
+    if (!(key in DEFAULTS)) continue;
+    markSettingsRevision(key);
+    latestSyncSettings[key] = change.newValue ?? DEFAULTS[key];
   }
-  if (area !== "sync") return;
-  if (changes.enabled)    enabledEl.checked   = !!changes.enabled.newValue;
-  if (changes.grayscale)  grayscaleEl.checked = !!changes.grayscale.newValue;
-  if (changes.saveData)   saveDataEl.checked  = !!changes.saveData.newValue;
+  if (changes.enabled)    enabledEl.checked   = !!(changes.enabled.newValue ?? DEFAULTS.enabled);
+  if (changes.grayscale)  grayscaleEl.checked = !!(changes.grayscale.newValue ?? DEFAULTS.grayscale);
+  if (changes.saveData)   saveDataEl.checked  = !!(changes.saveData.newValue ?? DEFAULTS.saveData);
   if (changes.proxyBase && !dirty.proxyBase) {
     proxyBaseEl.value = changes.proxyBase.newValue || "";
     proxyBaseEl.classList.remove("invalid");
@@ -203,13 +278,27 @@ chrome.storage.onChanged.addListener((changes, area) => {
   if (changes.maxWidth) {
     savedWidth = mergeIncomingSetting(changes.maxWidth, "width", DEFAULTS.maxWidth, setWidthUI);
   }
+}
+
+// Live stats counter while this page is open (worker flushes in batches), and
+// B2: stay in sync with changes made elsewhere (popup toggles, popup
+// exclusions, second Settings window). Fields with unsaved edits win.
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === "local") {
+    if (changes.stats) {
+      statsRevision++;
+      renderStats(changes.stats.newValue);
+    }
+    return;
+  }
+  if (area === "sync") applySyncSettingsChanges(changes);
 });
 
 // ── Preset buttons ────────────────────────────────────────────────────────────
 
 qualityPresets.forEach(btn => {
   btn.addEventListener("click", () => {
-    dirty.quality = true; // Preset changes are unsaved edits too.
+    markEdit("quality"); // Preset changes are unsaved edits too.
     qualityPresets.forEach(b => b.classList.remove("active"));
     btn.classList.add("active");
     customQualityEl.value = ""; // preset takes priority; clear custom
@@ -218,7 +307,7 @@ qualityPresets.forEach(btn => {
 });
 
 customQualityEl.addEventListener("input", () => {
-  dirty.quality = true;
+  markEdit("quality");
   const v = parseInt(customQualityEl.value, 10);
   if (!isNaN(v) && v >= 1 && v <= 100) {
     qualityPresets.forEach(b => b.classList.remove("active"));
@@ -231,7 +320,7 @@ customQualityEl.addEventListener("input", () => {
 
 widthPresets.forEach(btn => {
   btn.addEventListener("click", () => {
-    dirty.width = true; // Preset changes are unsaved edits too.
+    markEdit("width"); // Preset changes are unsaved edits too.
     widthPresets.forEach(b => b.classList.remove("active"));
     btn.classList.add("active");
     customWidthEl.value = "";
@@ -240,7 +329,7 @@ widthPresets.forEach(btn => {
 });
 
 customWidthEl.addEventListener("input", () => {
-  dirty.width = true;
+  markEdit("width");
   const v = parseCustomWidth(customWidthEl.value);
   if (v !== null) {
     widthPresets.forEach(b => b.classList.remove("active"));
@@ -251,77 +340,149 @@ customWidthEl.addEventListener("input", () => {
   }
 });
 
-proxyBaseEl.addEventListener("input", () => { dirty.proxyBase = true; proxyBaseEl.classList.remove("invalid"); });
-excludeEl.addEventListener("input", () => { dirty.excludeDomains = true; });
+proxyBaseEl.addEventListener("input", () => { markEdit("proxyBase"); proxyBaseEl.classList.remove("invalid"); });
+excludeEl.addEventListener("input", () => { markEdit("excludeDomains"); });
 
 // ── Auto-save: enable + grayscale + saveData ──────────────────────────────────
 
-enabledEl.addEventListener("change", async () => {
-  await chrome.storage.sync.set({ enabled: !!enabledEl.checked });
-  showToast(enabledEl.checked ? "Compression enabled" : "Compression disabled", "ok");
-});
+enabledEl.addEventListener("change", () => persistAutoSetting(
+  "enabled", enabledEl, value => value ? "Compression enabled" : "Compression disabled"
+));
 
-grayscaleEl.addEventListener("change", async () => {
-  await chrome.storage.sync.set({ grayscale: !!grayscaleEl.checked });
-  showToast("Reload the page to apply", "warn");
-});
+grayscaleEl.addEventListener("change", () => persistAutoSetting(
+  "grayscale", grayscaleEl, () => "Reload the page to apply", "warn"
+));
 
-saveDataEl.addEventListener("change", async () => {
-  await chrome.storage.sync.set({ saveData: !!saveDataEl.checked });
-  showToast(saveDataEl.checked ? "Save-Data header enabled" : "Save-Data header disabled", "ok");
-});
+saveDataEl.addEventListener("change", () => persistAutoSetting(
+  "saveData", saveDataEl, value => value ? "Save-Data header enabled" : "Save-Data header disabled"
+));
 
 // ── Save ──────────────────────────────────────────────────────────────────────
 
 async function save() {
-  const cq = customQualityEl.value.trim();
-  const cw = customWidthEl.value.trim();
-  if (cq !== "" && !(/^\d+$/.test(cq) && +cq >= 1 && +cq <= 100)) {
-    showToast("Quality must be 1–100", "err");
-    return;
-  }
-  if (cw !== "" && parseCustomWidth(cw) === null) {
-    showToast("Width must be a non-negative safe whole number", "err");
-    return;
-  }
-  const proxyBase = (proxyBaseEl.value || "").trim();
-  // B3: an empty proxyBase is allowed — it means "proxying disabled". Validate
-  // only when a value was entered, so quality/width/exclusions are savable
-  // without a proxy and the proxy can actually be cleared.
-  if (proxyBase !== "" && !isValidProxyBase(proxyBase)) {
-    proxyBaseEl.classList.add("invalid");
-    showToast("Use a valid http(s) proxy URL without a ?url= parameter", "err");
-    proxyBaseEl.focus();
-    return;
-  }
-  const quality = readQuality();
-  const maxWidth = readWidth();
-  const excludeDomains = (excludeEl.value || "").trim();
-  const current = await chrome.storage.sync.get(DEFAULTS);
+  // Enter and repeated clicks can submit the same UI more than once. Keep one
+  // write in flight so an older snapshot cannot complete after a newer save.
+  if (saveInProgress || resetInProgress) return;
+  saveInProgress = true;
+  saveBtn.disabled = true;
+  resetAllBtn.disabled = true;
+  try {
+    // Saving before the startup snapshot arrives could submit HTML defaults
+    // over a user's existing settings. Wait for a successful initial load.
+    if (!await initialLoadPromise) {
+      showToast("Could not save because settings failed to load", "err");
+      return;
+    }
+    // Read the baseline first. Cross-page storage events can update untouched
+    // controls while this request is pending, so sample the controls afterwards.
+    let current;
+    try { current = await chrome.storage.sync.get(DEFAULTS); }
+    catch {
+      showToast("Could not read saved settings", "err");
+      return;
+    }
+    const cq = customQualityEl.value.trim();
+    const cw = customWidthEl.value.trim();
+    if (cq !== "" && !(/^\d+$/.test(cq) && +cq >= 1 && +cq <= 100)) {
+      showToast("Quality must be 1–100", "err");
+      return;
+    }
+    if (cw !== "" && parseCustomWidth(cw) === null) {
+      showToast("Width must be a non-negative safe whole number", "err");
+      return;
+    }
+    const proxyBase = (proxyBaseEl.value || "").trim();
+    // B3: an empty proxyBase is allowed — it means "proxying disabled". Validate
+    // only when a value was entered, so quality/width/exclusions are savable
+    // without a proxy and the proxy can actually be cleared.
+    if (proxyBase !== "" && !isValidProxyBase(proxyBase)) {
+      proxyBaseEl.classList.add("invalid");
+      showToast("Use a valid http(s) proxy URL without a ?url= parameter", "err");
+      proxyBaseEl.focus();
+      return;
+    }
+    const quality = readQuality();
+    const maxWidth = readWidth();
+    const excludeDomains = (excludeEl.value || "").trim();
+    const snapshotRevisions = { ...editRevision };
+    const settingsSnapshotRevisions = { ...settingsRevision };
+    const submitted = { proxyBase, quality, maxWidth, excludeDomains };
 
-  await chrome.storage.sync.set({ proxyBase, quality, maxWidth, excludeDomains });
+    try { await chrome.storage.sync.set(submitted); }
+    catch {
+      showToast("Could not save settings", "err");
+      return;
+    }
 
-  if (proxyBase !== String(current.proxyBase || "") ||
-      quality  !== Number(current.quality  ?? DEFAULTS.quality) ||
-      maxWidth !== Number(current.maxWidth ?? DEFAULTS.maxWidth) ||
-      excludeDomains !== String(current.excludeDomains || "")) {
-    await reloadCurrentPage();
+    // A different extension page may publish newer values while this write is
+    // pending. Storage events update latestSyncSettings; prefer those observed
+    // values over our older submission for any affected key.
+    const committedValue = key =>
+      (settingsRevision[key] || 0) !== (settingsSnapshotRevisions[key] || 0)
+        ? (latestSyncSettings[key] ?? submitted[key])
+        : submitted[key];
+    const committed = {
+      proxyBase: committedValue("proxyBase"),
+      quality: committedValue("quality"),
+      maxWidth: committedValue("maxWidth"),
+      excludeDomains: committedValue("excludeDomains")
+    };
+
+    // Commit the latest observed baseline immediately after the write, before
+    // any optional tab reload awaits. Preserve controls edited after the
+    // submitted snapshot; those newer local values still need an explicit Save.
+    savedQuality = committed.quality;
+    savedWidth = committed.maxWidth;
+    const changedDuringWrite = field => editRevision[field] !== snapshotRevisions[field];
+    for (const field of ["proxyBase", "excludeDomains"]) {
+      if (changedDuringWrite(field)) {
+        dirty[field] = true;
+      } else {
+        dirty[field] = false;
+        if ((settingsRevision[field] || 0) !== (settingsSnapshotRevisions[field] || 0)) {
+          (field === "proxyBase" ? proxyBaseEl : excludeEl).value = String(committed[field] ?? "");
+        }
+      }
+    }
+    for (const [field, value, apply] of [
+      ["quality", committed.quality, setQualityUI],
+      ["width", committed.maxWidth, setWidthUI]
+    ]) {
+      if (changedDuringWrite(field)) {
+        dirty[field] = true;
+      } else {
+        dirty[field] = false;
+        apply(value);
+      }
+    }
+
+    // Reload against the values that actually won the write race, not the
+    // submitted snapshot: a newer cross-page update may be the committed value.
+    if (committed.proxyBase !== String(current.proxyBase || "") ||
+        committed.quality !== Number(current.quality ?? DEFAULTS.quality) ||
+        committed.maxWidth !== Number(current.maxWidth ?? DEFAULTS.maxWidth) ||
+        committed.excludeDomains !== String(current.excludeDomains || "")) {
+      await reloadCurrentPage();
+    }
+
+    const hasNewerEdits = Object.values(dirty).some(Boolean);
+    showToast(hasNewerEdits ? "Saved; newer edits remain unsaved" : "Saved",
+      hasNewerEdits ? "warn" : "ok");
+  } finally {
+    saveInProgress = false;
+    saveBtn.disabled = false;
+    resetAllBtn.disabled = false;
   }
-
-  savedQuality = quality;
-  savedWidth   = maxWidth;
-  setQualityUI(quality);
-  setWidthUI(maxWidth);
-  for (const k in dirty) dirty[k] = false;
-  showToast("Saved", "ok");
 }
 
 async function testProxy() {
+  if (testProxyInProgress || resetInProgress) return;
   const url = (proxyBaseEl.value || "").trim();
   if (!isValidProxyBase(url)) {
     showToast("Enter a valid http(s) proxy URL without a ?url= parameter", "err");
     return;
   }
+  testProxyInProgress = true;
   const orig = testProxyBtn.textContent;
   testProxyBtn.textContent = "Testing…"; testProxyBtn.disabled = true;
   const ctrl = new AbortController();
@@ -339,7 +500,9 @@ async function testProxy() {
   } finally {
     // B18: clear the timeout even on slow bodies and thrown errors.
     clearTimeout(timer);
-    testProxyBtn.textContent = orig; testProxyBtn.disabled = false;
+    testProxyBtn.textContent = orig;
+    testProxyInProgress = false;
+    testProxyBtn.disabled = resetInProgress;
   }
 }
 
@@ -348,10 +511,38 @@ testProxyBtn.addEventListener("click", testProxy);
 // ── Reset ────────────────────────────────────────────────────────────────────
 
 async function resetAll() {
-  await chrome.storage.sync.set(DEFAULTS);
-  await load();
-  await reloadCurrentPage();
-  showToast("Reset to defaults");
+  // Reset writes the complete settings object, so it must not race a partial
+  // Save. Freeze editable controls until the reset and UI refresh have finished.
+  if (saveInProgress || resetInProgress) return;
+  resetInProgress = true;
+  // Invalidate both pending toggle recoveries and the original startup read:
+  // none may repaint pre-reset settings after Reset defaults has started.
+  for (const key of Object.keys(autoSaveRevision)) autoSaveRevision[key]++;
+  for (const key of Object.keys(DEFAULTS)) markSettingsRevision(key);
+  setSettingsControlsDisabled(true);
+  saveBtn.disabled = true;
+  resetAllBtn.disabled = true;
+  try {
+    // Auto-save switches use their own quick writes; drain those first so none
+    // can complete after the full DEFAULTS write and undo the reset.
+    await pendingAutoSaveWrites.catch(() => {});
+    await chrome.storage.sync.set(DEFAULTS);
+    for (const key in dirty) dirty[key] = false;
+    const loaded = await load();
+    await reloadCurrentPage();
+    showToast(loaded ? "Reset to defaults" : "Defaults saved; settings could not be refreshed",
+      loaded ? "ok" : "warn");
+  } catch {
+    // A failed reset invalidates older optimistic-toggle recovery callbacks too;
+    // refresh the persisted switches while load() preserves dirty text/presets.
+    try { await load(); } catch {}
+    showToast("Could not reset settings", "err");
+  } finally {
+    resetInProgress = false;
+    setSettingsControlsDisabled(false);
+    saveBtn.disabled = false;
+    resetAllBtn.disabled = false;
+  }
 }
 
 async function resetStats() {

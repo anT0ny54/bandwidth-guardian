@@ -23,6 +23,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   status, confirms proxy reachability and resets the failure window.
 
 ### Fixed
+- When a boolean setting was removed from `storage.sync`, the options page could
+  render its checkbox as unchecked even though the shared default was `true`.
+  The `enabled`, `grayscale` and `saveData` controls now consistently fall back
+  to their shared defaults, matching the settings baseline and other extension
+  contexts. Added regression coverage for all three removed keys.
+- Reset defaults could race an in-flight partial Save or an auto-saved switch
+  write. Reset now refuses to overlap Save, drains queued switch writes, invalidates
+  older failed-toggle recovery reads, and disables setting controls through the
+  reset and refresh. If the reset write fails, persisted switch values are
+  reloaded while dirty text/preset edits remain intact. Auto-saved switch writes
+  are serialized, overlapping toggles do not show stale completion messages, and
+  failed writes restore the latest stored value when it can be read. Initial
+  settings-read failures are surfaced without making an independent stats read
+  block the settings page. Added regression coverage for reset serialization,
+  pending auto-saves, duplicate reset attempts, late recovery callbacks and
+  failed reads/writes.
 - The fallback browser test inferred successful statistics from proxy request
   URLs alone. A request can reach the mock server and then be cancelled while
   Chrome replaces an image candidate, so the test now counts only completed
@@ -32,8 +48,98 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   callback result and abort initialization. Local and sync reads now check
   `runtime.lastError` and synchronous API exceptions; the script falls back from
   the local mirror to sync settings and uses disabled/no-proxy DOM defaults if
-  both stores are unavailable. Successful sync fallback still refreshes the
-  local mirror.
+  both stores are unavailable. The content script applies synced fallback
+  settings in memory only; the service worker remains the sole writer of the
+  shared local mirror and updates it after its own successful sync-settings read.
+- A `storage.sync` change arriving before the content script's initial settings
+  load used a separate, unchecked read. Callback failures or synchronous API
+  throws could pass an empty value to `applyOpts()`, while partial results could
+  omit defaults. The change handler now uses the guarded reader and merges the
+  shared defaults before applying settings. Revision checks now also discard
+  stale local/sync startup snapshots, and overlapping reads for one revision
+  share a single callback, preventing older values from rolling settings or
+  runtime state backwards. Content scripts no longer write the shared mirror;
+  the service worker remains its sole writer. Partial local settings and
+  runtime mirror events are normalized with their respective defaults, and
+  invalid runtime mirror values fall back to the known default runtime state.
+- The service worker could receive `storage.sync.get()` callbacks out of order,
+  then publish an older `bhOpts` snapshot after a newer settings change. Mirror
+  reads now carry revisions, obsolete callbacks are ignored, and local mirror
+  writes are serialized with only the newest pending snapshot retained. Toolbar
+  icon reads also discard stale callbacks. Added regression tests for reversed
+  sync-read completion, an older local write already in flight, and stale icon
+  callbacks.
+- A local-mirror recovery read for the proxy `webRequest` observer could finish
+  after a newer sync snapshot had already selected a different proxy origin,
+  re-registering the observer against stale settings. Observer restores now
+  coalesce overlapping reads and use a shared revision that every successful
+  sync snapshot invalidates; late local callbacks are ignored. Added out-of-order
+  callback and read-coalescing regression assertions.
+- A later failed sync read could trigger local-mirror recovery after a newer sync
+  snapshot had already configured the proxy observer, allowing an older mirror
+  to roll the observer back while the confirmed mirror write was still pending.
+  Observer recovery is now limited to startup (until a trusted sync or local
+  snapshot is loaded), and failed read requests no longer invalidate a previously
+  confirmed snapshot's pending mirror write. Added a regression for the failed-
+  newer-read / pending-write ordering.
+- Repeated Save clicks or Enter presses could overlap multiple settings writes,
+  and Save was initially available before the first settings read completed.
+  The options page now waits for a successful startup settings read before
+  writing, serializes saves, disables the Save button while a write is pending,
+  and reports storage read/write failures without clearing unsaved edits. Added
+  regression coverage for a fast Save click during startup, duplicate
+  submissions and a rejected storage write.
+- A newer cross-page setting could arrive while `storage.sync.set()` was pending.
+  Save completion now preserves that newer observed value and decides whether to
+  reload the page from the final committed snapshot rather than the older
+  submitted values. Locally edited fields remain dirty when changed during the
+  write. Added regressions for both cross-page updates during Save and the
+  resulting reload decision.
+- The Proxy Test request could finish during Reset defaults and re-enable its
+  button while the rest of the settings UI was still locked. Test Proxy now
+  refuses to start during reset and its completion respects the reset lock;
+  added a regression for the overlapping operation.
+- An options-page save could complete after newer edits were made while
+  `storage.sync.set()` was pending, then clear their dirty flags and reset custom
+  controls to the older submitted values. Per-field edit revisions now ensure
+  that save completion only normalizes fields untouched since its snapshot;
+  newer edits remain visible and explicitly unsaved. Added a regression test for
+  edits made during the write.
+- The popup could retain an old excluded-site badge after its active-tab query
+  failed or returned an invalid URL, even though its internal tab context had
+  been cleared. Unavailable states now clear the badge and disable the action.
+  An exclusion toggle also captures the active-site revision and aborts if the
+  user changes tabs while its storage read is pending, preventing a click on one
+  site from changing the newly active site. Added regressions for both cases.
+- Popup settings and site-exclusion storage reads/writes could reject without
+  reporting an error, leaving controls in a stale or optimistic state. The popup
+  now reports these failures, rolls back a failed optimistic setting only when no
+  newer cross-page change has arrived, and ignores unrelated sync keys. Added
+  regression coverage for failed reads/writes and newer settings events arriving
+  while a write is pending.
+- Reset defaults could finish while the original options-page settings snapshot
+  was still pending; that older callback could repaint pre-reset values after
+  defaults had been committed. Reset now advances every settings revision before
+  its first asynchronous wait, invalidating the stale startup snapshot. Added a
+  regression that resolves the initial read after a completed reset.
+- Rapid popup controls changes could issue overlapping `storage.sync.set()` calls
+  for different settings, allowing an earlier click to complete after a later
+  intent. Popup settings and site-exclusion actions now share a short write lock
+  that disables writable controls until the current operation settles. Added
+  regression coverage for duplicate setting writes and exclusion attempts during
+  a pending save.
+- When a boolean sync setting was removed, the options page updated its stored
+  baseline to the shared default but rendered the missing `newValue` as `false`.
+  The enabled, grayscale and Save-Data checkboxes now use their shared defaults
+  for removed keys, matching the popup and content-script fallback behavior.
+  Added a regression for all three boolean settings.
+- A transient `getSessionRules()` failure during worker wake was cached as an
+  empty initialized bypass table. Later fallbacks could then allocate session
+  rule IDs without first discovering rules that Chrome still owned. Session-rule
+  initialization now has its own retryable single-flight promise, separate from
+  the serialized DNR operation queue; bypass operations are skipped when rule
+  enumeration fails and the next queued operation retries it. Added a regression
+  for failed initialization followed by successful recovery.
 - The custom max-width field accepted digit strings beyond JavaScript's safe
   integer range. Those values could be rounded before being written into proxy
   and DNR rules; custom widths now accept only non-negative safe whole numbers.
@@ -140,10 +246,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bounded bypass list rather than only its last 1,000 entries.
 - The service worker now publishes `redirect: false` when the DNR API is
   unavailable, while preserving circuit-breaker suspension state.
+- Popup and options-page startup reads could complete after newer cross-page
+  updates and roll controls back to stale values. Their initial snapshots now
+  update only settings untouched since the read began; the popup also ignores
+  stale active-tab lookups, and the options page discards old startup statistics
+  after a newer live update. Options saves now sample controls after the async
+  baseline read so cross-page changes arriving during that read are included.
 - Private-network exclusions now cover IPv4-mapped private IPv6 addresses and
   the full IPv6 link-local `fe80::/10` range in all three interception layers.
 
 ### Removed
+- Removed the content script's cold-start write to `storage.local.bhOpts`. That
+  fallback ran independently in every frame and duplicated the service worker's
+  mirror writer; content scripts now apply the sync fallback in memory only.
 - An always-true guard around the options page version label.
 - Runtime creation of the "Custom" badge elements (`setCustomBadge`,
   `customBadges`) in `popup.js` and `options.js`, replaced by static markup.
@@ -177,7 +292,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   transitions back to the last confirmed state while another write is pending.
   The bypass-capacity test now verifies the 3,000-rule limit across multiple tabs.
   Added a regression test for content-script storage callback errors,
-  synchronous storage API throws and successful settings reads. A further
+  synchronous storage API throws and successful settings reads. A new
+  regression covers sync changes arriving during startup, including default
+  normalization and failed callback/throw paths. A further
   service-worker settings-read failure path now preserves the last known local
   mirror and installed DNR rules, avoids writing defaults after a failed read,
   and retries initialization/mirroring/rule refresh with a Chrome alarm. Added
@@ -185,17 +302,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   response/error observers are now registered synchronously at worker startup,
   then narrowed to the configured proxy origin; if synced settings are
   unavailable, the last confirmed local mirror restores that filter and queued
-  early events are replayed. Added regression coverage for registration,
-  narrowing and recovery. The README now explicitly warns that the CSP DNR rule
-  removes all `Content-Security-Policy` response-header entries on a matching
+  early events are replayed. Revision guards also invalidate a pending local
+  restore when a newer sync snapshot succeeds, preventing stale proxy origins
+  from being re-registered. Added regression coverage for registration,
+  narrowing, recovery and out-of-order restores. The README now explicitly
+  warns that the CSP DNR rule removes all `Content-Security-Policy` response-header entries on a matching
   response (including unrelated directives), not just `img-src`/`default-src`,
   and identifies the
   security trade-off. It also corrects the object/embed browser-test table.
   The real-browser harness removes Playwright's default
   `--disable-extensions` argument, which otherwise prevents its explicit
-  unpacked-extension flags from loading the worker. All 61 simulation tests,
+  unpacked-extension flags from loading the worker. All 91 simulation tests,
   shipped-script syntax checks and two independent byte-identical reproducible
-  builds pass. The local rerun in an environment without
-  `playwright-core` and Chrome skips the browser suite; the latest supplied CI
-  run passes all 17 Chrome browser cases with Playwright-managed Chromium. The
+  builds pass. The local rerun without `playwright-core` and a configured
+  `CHROME_PATH` skips the browser suite; the workflow installs
+  Playwright-managed Chromium and runs all 17 Chrome browser cases. The
   manifest version remains `0.2.7`.
