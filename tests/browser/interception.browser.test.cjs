@@ -62,6 +62,44 @@ async function imgState(page, sel) {
   return page.$$eval(sel, els => els.map(i => ({ id: i.id, complete: i.complete, w: i.naturalWidth, cur: i.currentSrc, src: i.getAttribute('src'), srcset: i.getAttribute('srcset') })));
 }
 
+// Browser-side network record, captured through the DevTools protocol. A
+// request counts as completed only when Chrome reports loadingFinished: the
+// mock server's own "finish" event means the bytes were written to the socket,
+// not that the renderer received them. Chrome may cancel an image candidate
+// that was already fully written by the server (a <picture> source change),
+// and such a request is not a completed response.
+const netLog = [];
+async function recordNetwork(page) {
+  const cdp = await ctx.newCDPSession(page);
+  await cdp.send('Network.enable');
+  const byId = new Map();
+  const rec = id => {
+    if (!byId.has(id)) { const r = { page, requestId: id, urls: [] }; byId.set(id, r); netLog.push(r); }
+    return byId.get(id);
+  };
+  cdp.on('Network.requestWillBeSent', e => { const r = rec(e.requestId); r.urls.push(e.request.url); r.type = e.type; });
+  cdp.on('Network.responseReceived', e => { const r = rec(e.requestId); r.urls.push(e.response.url); r.status = e.response.status; r.mime = e.response.mimeType; });
+  cdp.on('Network.loadingFinished', e => { rec(e.requestId).finished = true; });
+  cdp.on('Network.loadingFailed', e => { rec(e.requestId).failed = e.errorText; });
+}
+// Completed proxy responses (as Chrome saw them) whose proxy URL names one of
+// the given original path prefixes. The raw form and the encoded form both match.
+function completedProxyResponses(page, prefixes) {
+  const hit = r => r.urls.some(u => u.startsWith(`http://proxy.test:${PORT}/`) &&
+    prefixes.some(p => u.includes(p) || u.includes(encodeURIComponent(p))));
+  return netLog.filter(r => r.page === page && r.finished && !r.failed && hit(r));
+}
+// Wait until an element has actually loaded the candidate we just selected.
+// currentSrc is the proxy URL for proxied candidates and the original otherwise.
+async function waitLoaded(page, selector, original, timeout = 8000) {
+  await page.waitForFunction(([sel, needle]) => {
+    const el = document.querySelector(sel);
+    if (!el || !el.complete || !(el.naturalWidth > 0)) return false;
+    const cur = el.currentSrc || '';
+    return cur.includes(needle) || cur.includes(encodeURIComponent(needle));
+  }, [selector, original], { timeout });
+}
+
 // Statistics are flushed in batches (≈0.75 s); wait until the counter has been
 // stable for a while so a test never sees another test's late flush.
 async function settledStats() {
@@ -100,6 +138,7 @@ const BASE_SETTINGS = { enabled: true, saveData: true, proxyBase: PROXY_BASE, qu
 
 async function open(name, { width = 1280, height = 800 } = {}) {
   const page = await ctx.newPage();
+  await recordNetwork(page);
   await page.setViewportSize({ width, height });
   await page.goto(`${PAGE}/${name}`, { waitUntil: 'load' });
   return page;
@@ -329,10 +368,10 @@ test.describe('Bandwidth Guardian in Chrome', { skip: SKIP }, () => {
     const pictureSourceUrl = `${C}/img/reused-node/picture-source.png?w=40&quality=80`;
     await page.evaluate(url => { document.querySelector('#fp source').srcset = `${url} 1x`; }, pictureSourceUrl);
     await until(() => proxiedUrl(pictureSourceUrl).length === 1, 8000);
-    await page.waitForFunction(() => {
-      const image = document.getElementById('fpimg');
-      return image.complete && image.naturalWidth > 0;
-    }, null, { timeout: 8000 });
+    // Wait for the new candidate itself: the old picture-fallback image is
+    // still complete, so a naturalWidth check alone would pass immediately and
+    // the next source change could cancel this request mid-flight.
+    await waitLoaded(page, '#fpimg', pictureSourceUrl);
     assert.equal(proxiedUrl(pictureSourceUrl).length, 1, 'a changed picture source is eligible for a fresh proxy attempt');
     assert.equal(directUrl(pictureSourceUrl).length, 0, 'the new picture source does not fall back prematurely');
 
@@ -342,10 +381,7 @@ test.describe('Bandwidth Guardian in Chrome', { skip: SKIP }, () => {
     await page.evaluate(url => { document.querySelector('#fp source').srcset = `${url} 1x`; }, pictureFailureUrl);
     await until(() => proxiedUrl(pictureFailureUrl).length === 1, 8000);
     await until(() => directUrl(pictureFailureUrl).length === 1, 8000);
-    await page.waitForFunction(() => {
-      const image = document.getElementById('fpimg');
-      return image.complete && image.naturalWidth > 0;
-    }, null, { timeout: 8000 });
+    await waitLoaded(page, '#fpimg', pictureFailureUrl);
     assert.equal(proxiedUrl(pictureFailureUrl).length, 1, 'the re-armed source is proxied once');
     assert.equal(directUrl(pictureFailureUrl).length, 1, 'the re-armed source recovers with one direct retry');
 
@@ -354,10 +390,7 @@ test.describe('Bandwidth Guardian in Chrome', { skip: SKIP }, () => {
     const reusedUrl = `${C}/img/reused-node/reused-node.png?w=40&quality=80`;
     await page.evaluate(url => { document.getElementById('f1').src = url; }, reusedUrl);
     await until(() => proxiedUrl(reusedUrl).length === 1, 8000);
-    await page.waitForFunction(() => {
-      const image = document.getElementById('f1');
-      return image.complete && image.naturalWidth > 0;
-    }, null, { timeout: 8000 });
+    await waitLoaded(page, '#f1', reusedUrl);
     assert.equal(proxiedUrl(reusedUrl).length, 1, 'reused image node proxies its new URL once');
     assert.equal(directUrl(reusedUrl).length, 0, 'reused image node does not fall back to direct prematurely');
 
@@ -370,21 +403,16 @@ test.describe('Bandwidth Guardian in Chrome', { skip: SKIP }, () => {
     const isKnownBad = u => /\/img\/fallback\/proxyfail|\/img\/fallback\/proxy403/.test(u || '');
     assert.deepEqual(proxied('/img/fallback/').slice(before).map(e => e.original).filter(isKnownBad), [], 'no new proxy attempts for known-bad URLs in this tab');
     await page.close();
-    // Count completed successful strict-image responses, not merely requests
-    // that reached the mock server. A browser may cancel an otherwise healthy
-    // image request while replacing a <picture> candidate; such an incomplete
-    // response must not contribute to filesProcessed.
-    const proxiedHere = [...proxied('/img/fallback/'), ...proxied('/img/reused-node/')];
+    // Count completed successful strict-image proxy responses as Chrome saw
+    // them (loadingFinished with a 2xx status and a strict image MIME type). A
+    // request Chrome cancels while replacing a <picture> candidate is excluded.
     const strictImageTypes = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/tiff', 'image/jxl']);
-    const successes = proxiedHere.filter(e => {
-      const contentType = String(e.contentType || '').split(';', 1)[0].trim().toLowerCase();
-      return e.responseFinished && e.statusCode >= 200 && e.statusCode < 300 && strictImageTypes.has(contentType);
-    }).length;
+    const completed = completedProxyResponses(page, ['/img/fallback/', '/img/reused-node/']);
+    const successes = completed.filter(r => r.status >= 200 && r.status < 300 && strictImageTypes.has(String(r.mime || '').toLowerCase())).length;
     const counted = await settledStats();
     assert.equal(counted - statsBefore, successes,
-      'only completed successful strict-image proxy responses are counted; responses: ' +
-      JSON.stringify(proxiedHere.map(({ original, statusCode, contentType, responseFinished }) =>
-        ({ original, statusCode, contentType, responseFinished }))));
+      'only completed successful strict-image proxy responses are counted; browser-side: ' +
+      JSON.stringify(completed.map(r => ({ url: r.urls.at(-1), status: r.status, mime: r.mime }))));
   });
 
   test('statistics count only strict image types', async () => {
