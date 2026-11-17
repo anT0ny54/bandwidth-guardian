@@ -97,6 +97,1179 @@ test('content settings storage reads surface callback errors and synchronous thr
   assert.equal(successResult.error, null);
 });
 
+test('content sync changes during startup use guarded reads and normalized settings', () => {
+  const defaults = {
+    enabled: true, saveData: true, proxyBase: '', quality: 60,
+    grayscale: true, maxWidth: 768, excludeDomains: ''
+  };
+  const makeHarness = get => {
+    const applied = [];
+    const runtime = { lastError: null };
+    const sandbox = {
+      DEFAULTS: defaults,
+      destroyed: false,
+      opts: null,
+      settingsRevision: 0,
+      runtimeRevision: 0,
+      pendingSettingsReadRevision: -1,
+      runtime: { redirect: true, suspended: false },
+      chrome: { runtime, storage: { sync: { get: (query, callback) => get(query, callback, runtime) } } },
+      sameOpts: (a, b) => !!a && !!b && Object.keys(defaults).every(key => a[key] === b[key]),
+      applyOpts: value => { applied.push(value); sandbox.opts = value; }
+    };
+    vm.createContext(sandbox);
+    vm.runInContext(
+      `${extractFunction(content, 'readStorage')}\n${extractFunction(content, 'readCurrentSyncSettings')}\n${extractFunction(content, 'onStorageChanged')}\nthis.run = onStorageChanged;`,
+      sandbox
+    );
+    sandbox.run({ proxyBase: { newValue: 'https://proxy.example/convert' } }, 'sync');
+    return { sandbox, applied };
+  };
+
+  const valid = makeHarness((_query, callback) => callback({ proxyBase: 'https://proxy.example/convert' }));
+  assert.equal(valid.applied.length, 1);
+  assert.deepEqual(JSON.parse(JSON.stringify(valid.applied[0])), {
+    ...defaults, proxyBase: 'https://proxy.example/convert'
+  }, 'partial storage results are normalized with the shared defaults');
+
+  const callbackFailure = makeHarness((_query, callback, runtime) => {
+    runtime.lastError = new Error('sync storage unavailable');
+    callback(undefined);
+  });
+  assert.equal(callbackFailure.applied.length, 1,
+    'a failed cold-start callback applies only the safe disabled fallback');
+  assert.equal(callbackFailure.applied[0].enabled, false);
+  assert.equal(callbackFailure.applied[0].proxyBase, '');
+
+  const throwFailure = makeHarness(() => { throw new Error('sync storage API unavailable'); });
+  assert.equal(throwFailure.applied.length, 1,
+    'a synchronous cold-start API throw applies only the safe disabled fallback');
+  assert.equal(throwFailure.applied[0].enabled, false);
+  assert.equal(throwFailure.applied[0].proxyBase, '');
+});
+
+test('options restores shared boolean defaults when sync settings are removed', () => {
+  const defaults = {
+    enabled: true, grayscale: true, saveData: true, proxyBase: '',
+    quality: 60, maxWidth: 768, excludeDomains: ''
+  };
+  const settingsRevision = Object.create(null);
+  const sandbox = {
+    DEFAULTS: defaults,
+    settingsRevision,
+    latestSyncSettings: { ...defaults, enabled: false, grayscale: false, saveData: false },
+    markSettingsRevision(key) { settingsRevision[key] = (settingsRevision[key] || 0) + 1; },
+    enabledEl: { checked: false },
+    grayscaleEl: { checked: false },
+    saveDataEl: { checked: false },
+    dirty: { proxyBase: false, excludeDomains: false, quality: false, width: false }
+  };
+  const apply = functionFrom(optionsSource, 'applySyncSettingsChanges', sandbox);
+  apply.fn({
+    enabled: { oldValue: false, newValue: undefined },
+    grayscale: { oldValue: false, newValue: undefined },
+    saveData: { oldValue: false, newValue: undefined }
+  });
+
+  assert.equal(sandbox.enabledEl.checked, true, 'removed enabled key falls back to the shared true default');
+  assert.equal(sandbox.grayscaleEl.checked, true, 'removed grayscale key falls back to the shared true default');
+  assert.equal(sandbox.saveDataEl.checked, true, 'removed saveData key falls back to the shared true default');
+  for (const key of ['enabled', 'grayscale', 'saveData']) {
+    assert.equal(sandbox.latestSyncSettings[key], true);
+    assert.equal(settingsRevision[key], 1);
+  }
+});
+
+test('late startup snapshots cannot overwrite newer sync or runtime settings', () => {
+  const defaults = {
+    enabled: true, saveData: true, proxyBase: '', quality: 60,
+    grayscale: true, maxWidth: 768, excludeDomains: ''
+  };
+  const reads = [];
+  const writes = [];
+  const applied = [];
+  const sandbox = {
+    DEFAULTS: defaults,
+    destroyed: false,
+    opts: null,
+    settingsRevision: 0,
+    runtimeRevision: 0,
+    pendingSettingsReadRevision: -1,
+    runtime: { redirect: true, suspended: false },
+    readStorage(_area, _query, callback) { reads.push(callback); },
+    chrome: {
+      runtime: { lastError: null },
+      storage: { local: { set(value, callback) { writes.push(value); callback(); } } }
+    },
+    sameOpts: (a, b) => !!a && !!b && Object.keys(defaults).every(key => a[key] === b[key]),
+    applyOpts: value => { applied.push(value); sandbox.opts = value; }
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(
+    `${extractFunction(content, 'readCurrentSyncSettings')}\n${extractFunction(content, 'applyInitialStorage')}\n${extractFunction(content, 'onStorageChanged')}\nthis.loadInitial = applyInitialStorage; this.changed = onStorageChanged;`,
+    sandbox
+  );
+
+  const staleLocal = {
+    bhOpts: { ...defaults, proxyBase: 'https://old-proxy.example/convert' },
+    bhRuntime: { redirect: true, suspended: false }
+  };
+  sandbox.changed({ proxyBase: { newValue: 'https://intermediate-proxy.example/convert' } }, 'sync');
+  sandbox.changed({ proxyBase: { newValue: 'https://new-proxy.example/convert' } }, 'sync');
+  assert.equal(reads.length, 2, 'each newer sync revision gets one read');
+  // The old local snapshot returns while the newest sync read is pending.
+  sandbox.loadInitial(staleLocal, 0, 0);
+  assert.equal(reads.length, 2, 'the startup path coalesces with the newest in-flight read');
+  reads[0]({ proxyBase: 'https://intermediate-proxy.example/convert' });
+  assert.equal(sandbox.opts, null, 'an obsolete sync callback is ignored');
+  reads[1]({ proxyBase: 'https://new-proxy.example/convert' });
+  assert.equal(sandbox.opts.proxyBase, 'https://new-proxy.example/convert');
+  assert.ok(applied.every(value => value.proxyBase === 'https://new-proxy.example/convert'),
+    'no older proxy value is ever applied');
+
+  sandbox.changed({ bhOpts: { newValue: { proxyBase: 'https://local-latest.example/convert' } } }, 'local');
+  assert.equal(sandbox.opts.proxyBase, 'https://local-latest.example/convert');
+  assert.equal(sandbox.opts.quality, defaults.quality,
+    'partial local mirror updates are normalized with the shared defaults');
+  sandbox.changed({ bhRuntime: { newValue: { suspended: true } } }, 'local');
+  assert.deepEqual(JSON.parse(JSON.stringify(sandbox.runtime)), { redirect: true, suspended: true },
+    'partial runtime mirror updates are normalized with runtime defaults');
+  sandbox.loadInitial(staleLocal, 0, 0);
+  assert.deepEqual(JSON.parse(JSON.stringify(sandbox.runtime)), { redirect: true, suspended: true },
+    'a late local snapshot cannot roll runtime state back either');
+  assert.equal(sandbox.opts.proxyBase, 'https://local-latest.example/convert',
+    'a late local snapshot cannot roll settings back either');
+  assert.equal(writes.length, 0, 'content-script cold-start reads never write the worker-owned local mirror');
+});
+
+
+test('popup and options startup snapshots cannot roll newer settings or stats back', async () => {
+  const defaults = {
+    enabled: true, grayscale: true, saveData: true, proxyBase: '',
+    quality: 60, maxWidth: 768, excludeDomains: ''
+  };
+
+  let resolvePopupRead;
+  const popupState = { ...defaults };
+  const popupHarness = functionFrom(popupSource, 'load', {
+    DEFAULTS: defaults,
+    state: popupState,
+    settingsRevision: Object.create(null),
+    chrome: { storage: { sync: { get: () => new Promise(resolve => { resolvePopupRead = resolve; }) } } },
+    applyUI() {},
+    loadSiteUI() {}
+  });
+  const popupLoad = popupHarness.fn();
+  popupHarness.sandbox.settingsRevision.proxyBase = 1;
+  popupHarness.sandbox.state.proxyBase = 'https://new-proxy.example/convert';
+  resolvePopupRead({ ...defaults, proxyBase: 'https://stale-proxy.example/convert' });
+  await popupLoad;
+  assert.equal(popupHarness.sandbox.state.proxyBase, 'https://new-proxy.example/convert');
+  assert.equal(popupHarness.sandbox.state.quality, defaults.quality,
+    'the initial snapshot still fills untouched settings');
+
+  let resolveSyncRead;
+  let resolveStatsRead;
+  const calls = { quality: [], width: [], stats: [] };
+  const optionsHarness = functionFrom(optionsSource, 'load', {
+    DEFAULTS: defaults,
+    settingsRevision: Object.create(null),
+    latestSyncSettings: { ...defaults },
+    statsRevision: 0,
+    dirty: { proxyBase: false, excludeDomains: false, quality: false, width: false },
+    enabledEl: { checked: false },
+    grayscaleEl: { checked: false },
+    saveDataEl: { checked: false },
+    proxyBaseEl: { value: '', classList: { remove() {} } },
+    excludeEl: { value: '' },
+    savedQuality: defaults.quality,
+    savedWidth: defaults.maxWidth,
+    setQualityUI(value) { calls.quality.push(value); },
+    setWidthUI(value) { calls.width.push(value); },
+    renderStats(value) { calls.stats.push(value); },
+    chrome: { storage: { sync: { get: () => new Promise(resolve => { resolveSyncRead = resolve; }) },
+      local: { get: () => new Promise(resolve => { resolveStatsRead = resolve; }) } } }
+  });
+  const optionsLoad = optionsHarness.fn();
+  await Promise.resolve(); // Flush the Promise-wrapped storage calls before resolving mocks.
+  const ctx = optionsHarness.sandbox;
+  ctx.settingsRevision.proxyBase = 1;
+  ctx.dirty.proxyBase = true;
+  ctx.proxyBaseEl.value = 'https://new-proxy.example/convert';
+  ctx.settingsRevision.quality = 1;
+  ctx.dirty.quality = true;
+  ctx.statsRevision++;
+  calls.stats.push({ filesProcessed: 99 }); // Simulate the newer live event.
+  resolveSyncRead({ ...defaults, proxyBase: 'https://stale-proxy.example/convert', quality: 42, maxWidth: 960 });
+  resolveStatsRead({ stats: { filesProcessed: 1 } });
+  await optionsLoad;
+  assert.equal(ctx.proxyBaseEl.value, 'https://new-proxy.example/convert');
+  assert.equal(ctx.savedQuality, defaults.quality,
+    'an old startup value cannot replace a newer quality baseline');
+  assert.deepEqual(calls.width, [960], 'untouched controls still load from the snapshot');
+  assert.deepEqual(calls.stats, [{ filesProcessed: 99 }],
+    'an old stats read cannot overwrite a newer live stats event');
+});
+
+test('options save waits for a successful initial load before writing settings', async () => {
+  let resolveInitialLoad;
+  let baselineReads = 0;
+  const writes = [];
+  const toasts = [];
+  const defaults = {
+    enabled: true, grayscale: true, saveData: true,
+    proxyBase: 'https://configured.example/convert', quality: 45,
+    maxWidth: 1024, excludeDomains: 'saved.example'
+  };
+  const harness = functionFrom(optionsSource, 'save', {
+    initialLoadPromise: new Promise(resolve => { resolveInitialLoad = resolve; }),
+    customQualityEl: { value: '' }, customWidthEl: { value: '' },
+    proxyBaseEl: { value: 'https://configured.example/convert', classList: { add() {}, remove() {} }, focus() {} },
+    excludeEl: { value: 'saved.example' },
+    saveBtn: { disabled: false }, resetAllBtn: { disabled: false },
+    saveInProgress: false, resetInProgress: false,
+    DEFAULTS: defaults,
+    parseCustomWidth: value => /^\d+$/.test(value) ? Number(value) : null,
+    isValidProxyBase: () => true,
+    readQuality: () => 45, readWidth: () => 1024,
+    editRevision: { proxyBase: 0, excludeDomains: 0, quality: 0, width: 0 },
+    settingsRevision: Object.create(null), latestSyncSettings: { ...defaults },
+    savedQuality: 45, savedWidth: 1024,
+    setQualityUI() {}, setWidthUI() {},
+    dirty: { proxyBase: false, excludeDomains: false, quality: false, width: false },
+    reloadCurrentPage: async () => {},
+    showToast(...args) { toasts.push(args); },
+    chrome: { storage: { sync: {
+      get: async () => { baselineReads++; return { ...defaults }; },
+      set: async value => { writes.push(value); }
+    } } }
+  });
+
+  const saving = harness.fn();
+  await Promise.resolve();
+  assert.equal(baselineReads, 0, 'the save cannot read/sample the form before startup completes');
+  assert.equal(writes.length, 0);
+  resolveInitialLoad(true);
+  await saving;
+  assert.equal(baselineReads, 1);
+  assert.equal(writes.length, 1);
+  assert.equal(writes[0].proxyBase, defaults.proxyBase);
+  assert.equal(writes[0].quality, defaults.quality);
+  assert.equal(writes[0].maxWidth, defaults.maxWidth);
+  assert.equal(writes[0].excludeDomains, defaults.excludeDomains);
+
+  let attemptedBaselineRead = false;
+  const failed = functionFrom(optionsSource, 'save', {
+    initialLoadPromise: Promise.resolve(false),
+    saveInProgress: false, resetInProgress: false,
+    saveBtn: { disabled: false }, resetAllBtn: { disabled: false },
+    chrome: { storage: { sync: { get() { attemptedBaselineRead = true; }, set() { throw new Error('must not save'); } } } },
+    showToast(...args) { toasts.push(args); }
+  });
+  await failed.fn();
+  assert.equal(attemptedBaselineRead, false, 'failed startup reads block a destructive save');
+  assert.deepEqual(toasts.at(-1), ['Could not save because settings failed to load', 'err']);
+});
+
+test('options save samples cross-page-updated controls after its async baseline read', async () => {
+  const defaults = {
+    enabled: true, grayscale: true, saveData: true, proxyBase: '',
+    quality: 60, maxWidth: 768, excludeDomains: ''
+  };
+  let resolveRead;
+  const saved = [];
+  const customQualityEl = { value: '' };
+  const customWidthEl = { value: '' };
+  const proxyBaseEl = { value: '', classList: { add() {}, remove() {} }, focus() {} };
+  const excludeEl = { value: 'old.example' };
+  const harness = functionFrom(optionsSource, 'save', {
+    customQualityEl, customWidthEl, proxyBaseEl, excludeEl,
+    chrome: { storage: { sync: {
+      get: () => new Promise(resolve => { resolveRead = resolve; }),
+      set: async value => { saved.push(value); }
+    } } },
+    DEFAULTS: defaults,
+    saveBtn: { disabled: false },
+    resetAllBtn: { disabled: false },
+    saveInProgress: false,
+    resetInProgress: false,
+    initialLoadPromise: Promise.resolve(true),
+    parseCustomWidth: value => /^\d+$/.test(value) ? Number(value) : null,
+    isValidProxyBase: () => true,
+    readQuality: () => defaults.quality,
+    readWidth: () => defaults.maxWidth,
+    reloadCurrentPage: async () => {},
+    savedQuality: defaults.quality,
+    savedWidth: defaults.maxWidth,
+    settingsRevision: Object.create(null),
+    latestSyncSettings: { ...defaults },
+    setQualityUI() {}, setWidthUI() {},
+    dirty: { proxyBase: false, excludeDomains: false, quality: false, width: false },
+    editRevision: { proxyBase: 0, excludeDomains: 0, quality: 0, width: 0 },
+    showToast() {}
+  });
+  const savePromise = harness.fn();
+  excludeEl.value = 'newer.example';
+  await new Promise(resolve => setImmediate(resolve)); // Let the startup-read guard reach the baseline read.
+  assert.equal(typeof resolveRead, 'function');
+  resolveRead({ ...defaults });
+  await savePromise;
+  assert.equal(saved.length, 1);
+  assert.equal(saved[0].excludeDomains, 'newer.example');
+});
+
+test('options save preserves edits made while the storage write is pending', async () => {
+  const defaults = {
+    enabled: true, grayscale: true, saveData: true, proxyBase: '',
+    quality: 60, maxWidth: 768, excludeDomains: ''
+  };
+  let resolveWrite;
+  let signalWriteStarted;
+  const writeStarted = new Promise(resolve => { signalWriteStarted = resolve; });
+  const saved = [];
+  const qualityUi = [];
+  const widthUi = [];
+  const toasts = [];
+  const customQualityEl = { value: '45' };
+  const customWidthEl = { value: '' };
+  const proxyBaseEl = { value: 'https://first.example/convert', classList: { add() {}, remove() {} }, focus() {} };
+  const excludeEl = { value: 'first.example' };
+  const dirty = { proxyBase: true, excludeDomains: true, quality: true, width: false };
+  const editRevision = { proxyBase: 1, excludeDomains: 1, quality: 1, width: 0 };
+  const harness = functionFrom(optionsSource, 'save', {
+    customQualityEl, customWidthEl, proxyBaseEl, excludeEl,
+    chrome: { storage: { sync: {
+      get: async () => ({ ...defaults }),
+      set: value => {
+        saved.push(value);
+        signalWriteStarted();
+        return new Promise(resolve => { resolveWrite = resolve; });
+      }
+    } } },
+    DEFAULTS: defaults,
+    saveBtn: { disabled: false },
+    resetAllBtn: { disabled: false },
+    saveInProgress: false,
+    resetInProgress: false,
+    initialLoadPromise: Promise.resolve(true),
+    parseCustomWidth: value => /^\d+$/.test(value) ? Number(value) : null,
+    isValidProxyBase: () => true,
+    readQuality: () => 45,
+    readWidth: () => defaults.maxWidth,
+    reloadCurrentPage: async () => {},
+    savedQuality: defaults.quality,
+    savedWidth: defaults.maxWidth,
+    settingsRevision: Object.create(null),
+    latestSyncSettings: { ...defaults },
+    editRevision,
+    setQualityUI(value) { qualityUi.push(value); },
+    setWidthUI(value) { widthUi.push(value); },
+    dirty,
+    showToast(...args) { toasts.push(args); }
+  });
+
+  const savePromise = harness.fn();
+  await writeStarted;
+  assert.equal(saved.length, 1, 'the settings snapshot is submitted before the write resolves');
+  assert.equal(saved[0].proxyBase, 'https://first.example/convert');
+  assert.equal(saved[0].quality, 45);
+  assert.equal(saved[0].excludeDomains, 'first.example');
+
+  // Simulate typing while storage.sync.set() is still pending.
+  proxyBaseEl.value = 'https://later.example/convert';
+  editRevision.proxyBase++;
+  dirty.proxyBase = true;
+  excludeEl.value = 'later.example';
+  editRevision.excludeDomains++;
+  dirty.excludeDomains = true;
+  customQualityEl.value = '82';
+  editRevision.quality++;
+  dirty.quality = true;
+
+  resolveWrite();
+  await savePromise;
+
+  assert.equal(proxyBaseEl.value, 'https://later.example/convert',
+    'completion of the older write does not replace a newer proxy edit');
+  assert.equal(excludeEl.value, 'later.example',
+    'completion of the older write does not replace newer exclusions');
+  assert.equal(customQualityEl.value, '82',
+    'completion of the older write does not reset a newer custom quality');
+  assert.equal(dirty.proxyBase, true);
+  assert.equal(dirty.excludeDomains, true);
+  assert.equal(dirty.quality, true);
+  assert.equal(dirty.width, false,
+    'fields untouched during the write are marked clean');
+  assert.deepEqual(widthUi, [defaults.maxWidth],
+    'the unchanged width control is normalized to the committed value');
+  assert.deepEqual(qualityUi, [],
+    'the newer quality edit is not overwritten by setQualityUI');
+  assert.deepEqual(toasts.at(-1), ['Saved; newer edits remain unsaved', 'warn']);
+});
+
+test('options save keeps newer cross-page values received while its write is pending', async () => {
+  const defaults = {
+    enabled: true, grayscale: true, saveData: true, proxyBase: '',
+    quality: 60, maxWidth: 768, excludeDomains: ''
+  };
+  let resolveWrite;
+  let signalWriteStarted;
+  const writeStarted = new Promise(resolve => { signalWriteStarted = resolve; });
+  const writes = [];
+  const qualityUi = [];
+  const widthUi = [];
+  const dirty = { proxyBase: true, excludeDomains: true, quality: true, width: true };
+  const editRevision = { proxyBase: 1, excludeDomains: 1, quality: 1, width: 1 };
+  const sandbox = {
+    DEFAULTS: defaults,
+    settingsRevision: Object.create(null),
+    latestSyncSettings: { ...defaults },
+    markSettingsRevision(key) { sandbox.settingsRevision[key] = (sandbox.settingsRevision[key] || 0) + 1; },
+    enabledEl: { checked: true },
+    grayscaleEl: { checked: true },
+    saveDataEl: { checked: true },
+    proxyBaseEl: { value: 'https://submitted.example/convert', classList: { add() {}, remove() {} }, focus() {} },
+    excludeEl: { value: 'submitted.example' },
+    customQualityEl: { value: '45' },
+    customWidthEl: { value: '' },
+    saveBtn: { disabled: false },
+    resetAllBtn: { disabled: false },
+    saveInProgress: false,
+    resetInProgress: false,
+    initialLoadPromise: Promise.resolve(true),
+    parseCustomWidth: value => /^\d+$/.test(value) ? Number(value) : null,
+    isValidProxyBase: () => true,
+    readQuality: () => 45,
+    readWidth: () => defaults.maxWidth,
+    editRevision,
+    dirty,
+    savedQuality: defaults.quality,
+    savedWidth: defaults.maxWidth,
+    setQualityUI(value) { qualityUi.push(value); sandbox.customQualityEl.value = String(value); },
+    setWidthUI(value) { widthUi.push(value); sandbox.customWidthEl.value = String(value); },
+    reloadCurrentPage: async () => {},
+    showToast() {},
+    chrome: { storage: { sync: {
+      get: async () => ({ ...defaults }),
+      set(value) {
+        writes.push(value);
+        signalWriteStarted();
+        return new Promise(resolve => { resolveWrite = resolve; });
+      }
+    } } }
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(
+    `${extractFunction(optionsSource, 'save')}\n${extractFunction(optionsSource, 'mergeIncomingSetting')}\n${extractFunction(optionsSource, 'applySyncSettingsChanges')}\n` +
+    'this.runSave = save; this.applyChanges = applySyncSettingsChanges;', sandbox
+  );
+
+  const saving = sandbox.runSave();
+  await writeStarted;
+  sandbox.applyChanges({
+    proxyBase: { newValue: 'https://external.example/convert' },
+    quality: { newValue: 80 },
+    maxWidth: { newValue: 1024 },
+    excludeDomains: { newValue: 'external.example' }
+  }, 'sync');
+  resolveWrite();
+  await saving;
+
+  assert.equal(writes.length, 1);
+  assert.deepEqual(JSON.parse(JSON.stringify(writes[0])), {
+    proxyBase: 'https://submitted.example/convert', quality: 45,
+    maxWidth: 768, excludeDomains: 'submitted.example'
+  }, 'Save submits the values present at its own snapshot');
+  assert.equal(sandbox.proxyBaseEl.value, 'https://external.example/convert',
+    'a newer cross-page proxy value is not replaced by the older save completion');
+  assert.equal(sandbox.excludeEl.value, 'external.example');
+  assert.equal(sandbox.savedQuality, 80);
+  assert.equal(sandbox.savedWidth, 1024);
+  assert.deepEqual(qualityUi, [80]);
+  assert.deepEqual(widthUi, [1024]);
+  assert.ok(Object.values(dirty).every(value => value === false));
+});
+
+test('options save reloads the page when a newer cross-page value wins the pending write', async () => {
+  const current = {
+    enabled: true, grayscale: true, saveData: true,
+    proxyBase: 'https://old.example/convert', quality: 60,
+    maxWidth: 768, excludeDomains: 'old.example'
+  };
+  let resolveWrite;
+  let signalWriteStarted;
+  const writeStarted = new Promise(resolve => { signalWriteStarted = resolve; });
+  let reloads = 0;
+  const dirty = { proxyBase: false, excludeDomains: false, quality: false, width: false };
+  const sandbox = {
+    DEFAULTS: current,
+    settingsRevision: Object.create(null),
+    latestSyncSettings: { ...current },
+    markSettingsRevision(key) { sandbox.settingsRevision[key] = (sandbox.settingsRevision[key] || 0) + 1; },
+    customQualityEl: { value: '' }, customWidthEl: { value: '' },
+    proxyBaseEl: { value: current.proxyBase, classList: { add() {}, remove() {} }, focus() {} },
+    excludeEl: { value: current.excludeDomains },
+    saveBtn: { disabled: false }, resetAllBtn: { disabled: false },
+    saveInProgress: false, resetInProgress: false,
+    initialLoadPromise: Promise.resolve(true),
+    parseCustomWidth: value => /^\d+$/.test(value) ? Number(value) : null,
+    isValidProxyBase: () => true,
+    readQuality: () => current.quality, readWidth: () => current.maxWidth,
+    editRevision: { proxyBase: 0, excludeDomains: 0, quality: 0, width: 0 },
+    dirty,
+    savedQuality: current.quality, savedWidth: current.maxWidth,
+    setQualityUI() {}, setWidthUI() {},
+    reloadCurrentPage: async () => { reloads++; },
+    showToast() {},
+    chrome: { storage: { sync: {
+      get: async () => ({ ...current }),
+      set() {
+        signalWriteStarted();
+        return new Promise(resolve => { resolveWrite = resolve; });
+      }
+    } } }
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(
+    `${extractFunction(optionsSource, 'save')}\n${extractFunction(optionsSource, 'mergeIncomingSetting')}\n${extractFunction(optionsSource, 'applySyncSettingsChanges')}\n` +
+    'this.runSave = save; this.applyChanges = applySyncSettingsChanges;', sandbox
+  );
+
+  const saving = sandbox.runSave();
+  await writeStarted;
+  sandbox.applyChanges({ proxyBase: { newValue: 'https://new.example/convert' } }, 'sync');
+  resolveWrite();
+  await saving;
+
+  assert.equal(reloads, 1,
+    'a winning cross-page value that differs from the initial baseline requires a page reload');
+  assert.equal(sandbox.proxyBaseEl.value, 'https://new.example/convert');
+  assert.equal(dirty.proxyBase, false);
+});
+
+test('options save serializes submissions and reports storage write failures', async () => {
+  const defaults = {
+    enabled: true, grayscale: true, saveData: true, proxyBase: '',
+    quality: 60, maxWidth: 768, excludeDomains: ''
+  };
+  let rejectWrite;
+  let signalWriteStarted;
+  const writeStarted = new Promise(resolve => { signalWriteStarted = resolve; });
+  const saved = [];
+  const toasts = [];
+  const dirty = { proxyBase: true, excludeDomains: false, quality: false, width: false };
+  const harness = functionFrom(optionsSource, 'save', {
+    customQualityEl: { value: '' },
+    customWidthEl: { value: '' },
+    proxyBaseEl: { value: 'https://proxy.example/convert', classList: { add() {}, remove() {} }, focus() {} },
+    excludeEl: { value: '' },
+    saveBtn: { disabled: false },
+    resetAllBtn: { disabled: false },
+    saveInProgress: false,
+    resetInProgress: false,
+    initialLoadPromise: Promise.resolve(true),
+    chrome: { storage: { sync: {
+      get: async () => ({ ...defaults }),
+      set: value => {
+        saved.push(value);
+        signalWriteStarted();
+        return new Promise((_resolve, reject) => { rejectWrite = reject; });
+      }
+    } } },
+    DEFAULTS: defaults,
+    parseCustomWidth: value => /^\d+$/.test(value) ? Number(value) : null,
+    isValidProxyBase: () => true,
+    readQuality: () => defaults.quality,
+    readWidth: () => defaults.maxWidth,
+    reloadCurrentPage: async () => {},
+    savedQuality: defaults.quality,
+    savedWidth: defaults.maxWidth,
+    settingsRevision: Object.create(null),
+    latestSyncSettings: { ...defaults },
+    editRevision: { proxyBase: 1, excludeDomains: 0, quality: 0, width: 0 },
+    setQualityUI() {}, setWidthUI() {},
+    dirty,
+    showToast(...args) { toasts.push(args); }
+  });
+
+  const firstSave = harness.fn();
+  await writeStarted;
+  await harness.fn(); // A second click/Enter while the first write is pending.
+  assert.equal(saved.length, 1, 'only one storage write may be active');
+  assert.equal(harness.sandbox.saveBtn.disabled, true);
+  rejectWrite(new Error('sync quota exceeded'));
+  await firstSave;
+  assert.equal(dirty.proxyBase, true,
+    'a failed write does not clear the unsaved setting');
+  assert.deepEqual(toasts.at(-1), ['Could not save settings', 'err']);
+  assert.equal(harness.sandbox.saveBtn.disabled, false,
+    'the save control is restored after a failed write');
+  assert.equal(harness.sandbox.saveInProgress, false);
+});
+
+test('options auto-save writes are serialized and failed writes restore the latest value', async () => {
+  let resolveFirst;
+  let resolveSecond;
+  let signalFirst;
+  let signalSecond;
+  const firstStarted = new Promise(resolve => { signalFirst = resolve; });
+  const secondStarted = new Promise(resolve => { signalSecond = resolve; });
+  const writes = [];
+  const queueHarness = functionFrom(optionsSource, 'queueAutoSave', {
+    pendingAutoSaveWrites: Promise.resolve(),
+    chrome: { storage: { sync: { set(value) {
+      writes.push(value);
+      if (writes.length === 1) { signalFirst(); return new Promise(resolve => { resolveFirst = resolve; }); }
+      signalSecond();
+      return new Promise(resolve => { resolveSecond = resolve; });
+    } } } }
+  });
+
+  const first = queueHarness.fn({ enabled: false });
+  const second = queueHarness.fn({ grayscale: false });
+  await firstStarted;
+  assert.deepEqual(writes, [{ enabled: false }], 'the second write waits for the first');
+  resolveFirst();
+  await secondStarted;
+  assert.deepEqual(writes, [{ enabled: false }, { grayscale: false }]);
+  resolveSecond();
+  await Promise.all([first, second]);
+
+  const toasts = [];
+  const element = { checked: false };
+  const failureHarness = functionFrom(optionsSource, 'persistAutoSetting', {
+    autoSaveRevision: { enabled: 0 },
+    markSettingsRevision() {},
+    queueAutoSave: async () => { throw new Error('sync quota exceeded'); },
+    chrome: { storage: { sync: { get: async () => ({ enabled: true }) } } },
+    DEFAULTS: { enabled: true },
+    showToast(...args) { toasts.push(args); }
+  });
+  await failureHarness.fn('enabled', element, () => 'Saved');
+  assert.equal(element.checked, true, 'a failed optimistic toggle reverts to the last stored value');
+  assert.deepEqual(toasts.at(-1), ['Could not save setting', 'err']);
+});
+
+test('options proxy test remains locked while Reset defaults is active', async () => {
+  let resolveFetch;
+  let fetchCalls = 0;
+  const button = { textContent: 'Test', disabled: false };
+  const harness = functionFrom(optionsSource, 'testProxy', {
+    proxyBaseEl: { value: 'https://proxy.example/convert' },
+    isValidProxyBase: () => true,
+    testProxyBtn: button,
+    testProxyInProgress: false,
+    resetInProgress: false,
+    AbortController,
+    setTimeout,
+    clearTimeout,
+    fetch: () => {
+      fetchCalls++;
+      return new Promise(resolve => { resolveFetch = resolve; });
+    },
+    showToast() {}
+  });
+
+  const checking = harness.fn();
+  assert.equal(button.disabled, true, 'the button is disabled during the proxy request');
+  harness.sandbox.resetInProgress = true;
+  resolveFetch({ ok: true, status: 200, text: async () => 'bandwidth-hero-proxy' });
+  await checking;
+  assert.equal(button.disabled, true,
+    'the test completion cannot re-enable its button during Reset defaults');
+  await harness.fn();
+  assert.equal(fetchCalls, 1, 'a second test cannot start while Reset defaults is active');
+  harness.sandbox.resetInProgress = false;
+  button.disabled = false;
+});
+
+test('options reset invalidates a late auto-save recovery read', async () => {
+  let resolveRecoveryRead;
+  let signalRecoveryRead;
+  const recoveryReadStarted = new Promise(resolve => { signalRecoveryRead = resolve; });
+  const toasts = [];
+  const element = { checked: false };
+  const defaults = { enabled: true, grayscale: true, saveData: true };
+  const autoSaveRevision = { enabled: 0, grayscale: 0, saveData: 0 };
+  const sandbox = {
+    element,
+    autoSaveRevision,
+    queueAutoSave: async () => { throw new Error('write failed'); },
+    markSettingsRevision() {},
+    DEFAULTS: defaults,
+    chrome: { storage: { sync: {
+      get: () => {
+        signalRecoveryRead();
+        return new Promise(resolve => { resolveRecoveryRead = resolve; });
+      },
+      set: async () => {}
+    } } },
+    showToast(...args) { toasts.push(args); },
+    pendingAutoSaveWrites: Promise.resolve(),
+    dirty: { proxyBase: true, excludeDomains: false, quality: false, width: false },
+    saveInProgress: false,
+    resetInProgress: false,
+    saveBtn: { disabled: false },
+    resetAllBtn: { disabled: false },
+    setSettingsControlsDisabled() {},
+    load: async () => { element.checked = true; return true; },
+    reloadCurrentPage: async () => {}
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(
+    `${extractFunction(optionsSource, 'persistAutoSetting')}\n${extractFunction(optionsSource, 'resetAll')}\n` +
+    'this.startToggle = () => persistAutoSetting("enabled", element, value => value ? "On" : "Off");\n' +
+    'this.reset = resetAll;',
+    sandbox
+  );
+
+  const failedToggle = sandbox.startToggle();
+  await recoveryReadStarted;
+  await sandbox.reset();
+  assert.equal(element.checked, true, 'the reset refresh installs the defaults');
+  resolveRecoveryRead({ enabled: false });
+  await failedToggle;
+  assert.equal(element.checked, true,
+    'a stale failed-toggle recovery read cannot overwrite reset defaults');
+  assert.deepEqual(toasts, [['Reset to defaults', 'ok']],
+    'the obsolete failed-toggle callback does not show a stale error after reset');
+  assert.ok(Object.values(autoSaveRevision).every(value => value > 0));
+});
+
+test('options reset is serialized with save and disables edits until defaults are restored', async () => {
+  const defaults = {
+    enabled: true, grayscale: true, saveData: true, proxyBase: '',
+    quality: 60, maxWidth: 768, excludeDomains: ''
+  };
+  let resolveWrite;
+  let resolvePendingAutoSave;
+  let signalResetWrite;
+  const pendingAutoSaveWrites = new Promise(resolve => { resolvePendingAutoSave = resolve; });
+  const resetWriteStarted = new Promise(resolve => { signalResetWrite = resolve; });
+  const writes = [];
+  const busyStates = [];
+  const toasts = [];
+  const dirty = { proxyBase: true, excludeDomains: true, quality: true, width: false };
+  const settingsRevision = Object.create(null);
+  const harness = functionFrom(optionsSource, 'resetAll', {
+    DEFAULTS: defaults,
+    dirty,
+    settingsRevision,
+    markSettingsRevision(key) { settingsRevision[key] = (settingsRevision[key] || 0) + 1; },
+    autoSaveRevision: { enabled: 0, grayscale: 0, saveData: 0 },
+    saveInProgress: false,
+    resetInProgress: false,
+    pendingAutoSaveWrites,
+    saveBtn: { disabled: false },
+    resetAllBtn: { disabled: false },
+    setSettingsControlsDisabled(value) { busyStates.push(value); },
+    chrome: { storage: { sync: { set(value) {
+      writes.push(value);
+      signalResetWrite();
+      return new Promise(resolve => { resolveWrite = resolve; });
+    } } } },
+    load: async () => true,
+    reloadCurrentPage: async () => {},
+    showToast(...args) { toasts.push(args); }
+  });
+
+  const resetPromise = harness.fn();
+  assert.equal(harness.sandbox.resetInProgress, true);
+  assert.equal(harness.sandbox.saveBtn.disabled, true);
+  assert.equal(harness.sandbox.resetAllBtn.disabled, true);
+  assert.deepEqual(busyStates, [true], 'editable controls are frozen during the full reset');
+  await harness.fn();
+  assert.equal(writes.length, 0, 'reset waits for an auto-save that was already in flight');
+  resolvePendingAutoSave();
+  await resetWriteStarted;
+  assert.equal(writes.length, 1, 'a duplicate reset cannot start another write');
+
+  resolveWrite();
+  await resetPromise;
+  assert.equal(harness.sandbox.resetInProgress, false);
+  assert.equal(harness.sandbox.saveBtn.disabled, false);
+  assert.equal(harness.sandbox.resetAllBtn.disabled, false);
+  assert.deepEqual(busyStates, [true, false]);
+  assert.ok(Object.values(dirty).every(value => value === false));
+  assert.deepEqual(toasts.at(-1), ['Reset to defaults', 'ok']);
+
+  let readCalls = 0;
+  const saveWhileReset = functionFrom(optionsSource, 'save', {
+    saveInProgress: false,
+    resetInProgress: true,
+    chrome: { storage: { sync: { get() { readCalls++; } } } }
+  });
+  await saveWhileReset.fn();
+  assert.equal(readCalls, 0, 'Save is ignored while Reset defaults is active');
+});
+
+test('options reset invalidates a delayed initial settings snapshot', async () => {
+  const defaults = {
+    enabled: true, grayscale: true, saveData: true, proxyBase: '',
+    quality: 60, maxWidth: 768, excludeDomains: ''
+  };
+  const settingsRevision = Object.create(null);
+  let resolveInitialRead;
+  const initialRead = new Promise(resolve => { resolveInitialRead = resolve; });
+  const elements = {
+    enabledEl: { checked: false }, grayscaleEl: { checked: false }, saveDataEl: { checked: false },
+    proxyBaseEl: { value: 'old proxy', classList: { remove() {} } },
+    excludeEl: { value: 'old.example' }
+  };
+  const initialLoad = functionFrom(optionsSource, 'load', {
+    DEFAULTS: defaults,
+    settingsRevision,
+    statsRevision: 0,
+    chrome: { storage: {
+      sync: { get: () => initialRead },
+      local: { get: async () => ({ stats: null }) }
+    } },
+    ...elements,
+    dirty: { proxyBase: false, excludeDomains: false, quality: false, width: false },
+    savedQuality: defaults.quality,
+    savedWidth: defaults.maxWidth,
+    setQualityUI() {}, setWidthUI() {}, renderStats() {}, showToast() {}
+  });
+  const startup = initialLoad.fn();
+  const resetHarness = functionFrom(optionsSource, 'resetAll', {
+    DEFAULTS: defaults,
+    dirty: { proxyBase: true, excludeDomains: true, quality: true, width: true },
+    settingsRevision,
+    markSettingsRevision(key) { settingsRevision[key] = (settingsRevision[key] || 0) + 1; },
+    autoSaveRevision: { enabled: 0, grayscale: 0, saveData: 0 },
+    saveInProgress: false, resetInProgress: false,
+    pendingAutoSaveWrites: Promise.resolve(),
+    saveBtn: { disabled: false }, resetAllBtn: { disabled: false },
+    setSettingsControlsDisabled() {},
+    chrome: { storage: { sync: { set: async () => {} } } },
+    load: async () => {
+      elements.enabledEl.checked = true;
+      elements.grayscaleEl.checked = true;
+      elements.saveDataEl.checked = true;
+      elements.proxyBaseEl.value = '';
+      elements.excludeEl.value = '';
+      return true;
+    },
+    reloadCurrentPage: async () => {}, showToast() {}
+  });
+
+  const reset = resetHarness.fn();
+  assert.ok(Object.keys(defaults).every(key => settingsRevision[key] > 0),
+    'reset invalidates all startup settings revisions synchronously');
+  await reset;
+  resolveInitialRead({ ...defaults, enabled: false, proxyBase: 'https://stale.example', excludeDomains: 'stale.example' });
+  await startup;
+  assert.equal(elements.enabledEl.checked, true, 'the delayed initial read cannot overwrite reset enabled state');
+  assert.equal(elements.proxyBaseEl.value, '', 'the delayed initial read cannot restore an old proxy');
+  assert.equal(elements.excludeEl.value, '', 'the delayed initial read cannot restore old exclusions');
+});
+
+test('options reset reports a failed storage write without clearing edits', async () => {
+  const toasts = [];
+  const dirty = { proxyBase: true, excludeDomains: true, quality: true, width: false };
+  const busyStates = [];
+  let refreshedAfterFailure = false;
+  const settingsRevision = Object.create(null);
+  const harness = functionFrom(optionsSource, 'resetAll', {
+    DEFAULTS: { enabled: true },
+    dirty,
+    settingsRevision,
+    markSettingsRevision(key) { settingsRevision[key] = (settingsRevision[key] || 0) + 1; },
+    autoSaveRevision: { enabled: 0, grayscale: 0, saveData: 0 },
+    saveInProgress: false,
+    resetInProgress: false,
+    pendingAutoSaveWrites: Promise.resolve(),
+    saveBtn: { disabled: false },
+    resetAllBtn: { disabled: false },
+    setSettingsControlsDisabled(value) { busyStates.push(value); },
+    chrome: { storage: { sync: { set: async () => { throw new Error('storage unavailable'); } } } },
+    load: async () => { refreshedAfterFailure = true; return true; },
+    reloadCurrentPage: async () => {},
+    showToast(...args) { toasts.push(args); }
+  });
+
+  await harness.fn();
+  assert.deepEqual(dirty, { proxyBase: true, excludeDomains: true, quality: true, width: false });
+  assert.deepEqual(busyStates, [true, false]);
+  assert.equal(harness.sandbox.resetInProgress, false);
+  assert.equal(harness.sandbox.saveBtn.disabled, false);
+  assert.equal(refreshedAfterFailure, true);
+  assert.deepEqual(toasts.at(-1), ['Could not reset settings', 'err']);
+});
+
+test('options initial settings read failure is reported without blocking stats reads', async () => {
+  const toasts = [];
+  let statsRead = false;
+  const harness = functionFrom(optionsSource, 'load', {
+    DEFAULTS: { enabled: true },
+    settingsRevision: Object.create(null),
+    statsRevision: 0,
+    chrome: { storage: {
+      sync: { get: async () => { throw new Error('sync unavailable'); } },
+      local: { get: async () => { statsRead = true; return { stats: null }; } }
+    } },
+    showToast(...args) { toasts.push(args); }
+  });
+
+  assert.equal(await harness.fn(), false);
+  assert.equal(statsRead, true, 'local stats retrieval is settled independently');
+  assert.deepEqual(toasts.at(-1), ['Could not load saved settings', 'err']);
+});
+
+test('popup site card ignores stale asynchronous tab lookups', async () => {
+  const tabReads = [];
+  const harness = functionFrom(popupSource, 'loadSiteUI', {
+    URL,
+    siteUiRevision: 0,
+    currentTabId: null,
+    currentHost: '',
+    currentIsWeb: false,
+    popupStorageWriteInProgress: false,
+    chrome: { tabs: { query: () => new Promise(resolve => { tabReads.push(resolve); }) } },
+    siteNameEl: { textContent: '' },
+    excludeBtn: { disabled: false, textContent: '' },
+    sitePillEl: { style: { display: '' }, className: '', textContent: '' },
+    parseDomains(text) {
+      return String(text || '').split(/[,\s]+/).map(x => x.toLowerCase()).filter(Boolean);
+    },
+    findExcludedDomain(host, domains) {
+      return domains.find(domain => host === domain || host.endsWith(`.${domain}`)) || '';
+    }
+  });
+  const stale = harness.fn({ excludeDomains: '' });
+  const latest = harness.fn({ excludeDomains: 'example.com' });
+  tabReads[1]([{ id: 2, url: 'https://example.com/path' }]);
+  await latest;
+  assert.equal(harness.sandbox.excludeBtn.textContent, '✕ Remove exclusion');
+  tabReads[0]([{ id: 1, url: 'https://old.example/path' }]);
+  await stale;
+  assert.equal(harness.sandbox.currentTabId, 2);
+  assert.equal(harness.sandbox.currentHost, 'example.com');
+  assert.equal(harness.sandbox.excludeBtn.textContent, '✕ Remove exclusion',
+    'the older tab query cannot replace the current site state');
+  const empty = harness.fn({ excludeDomains: '' });
+  tabReads[2]([]);
+  await empty;
+  assert.equal(harness.sandbox.currentTabId, null,
+    'an empty active-tab result clears the previous tab context');
+  assert.equal(harness.sandbox.currentIsWeb, false);
+});
+
+test('popup site card clears stale UI when the active-tab query fails or returns an invalid URL', async () => {
+  const pending = [];
+  const makeHarness = () => functionFrom(popupSource, 'loadSiteUI', {
+    URL,
+    siteUiRevision: 0,
+    currentTabId: 7,
+    currentHost: 'old.example',
+    currentIsWeb: true,
+    chrome: { tabs: { query: () => new Promise((resolve, reject) => pending.push({ resolve, reject })) } },
+    siteNameEl: { textContent: 'old.example' },
+    excludeBtn: { disabled: false, textContent: 'Remove exclusion' },
+    sitePillEl: { style: { display: '' }, className: 'site-pill excluded', textContent: 'Excluded' },
+    parseDomains(text) {
+      return String(text || '').split(/[\s,]+/).map(x => x.toLowerCase()).filter(Boolean);
+    },
+    findExcludedDomain(host, domains) {
+      return domains.find(domain => host === domain || host.endsWith(`.${domain}`)) || '';
+    }
+  });
+
+  const failedHarness = makeHarness();
+  const failed = failedHarness.fn({ excludeDomains: 'old.example' });
+  assert.equal(failedHarness.sandbox.excludeBtn.disabled, true,
+    'actions are disabled while a new tab lookup is pending');
+  pending[0].reject(new Error('tabs API unavailable'));
+  await failed;
+  assert.equal(failedHarness.sandbox.currentTabId, null);
+  assert.equal(failedHarness.sandbox.currentHost, '');
+  assert.equal(failedHarness.sandbox.currentIsWeb, false);
+  assert.equal(failedHarness.sandbox.siteNameEl.textContent, 'Tab unavailable');
+  assert.equal(failedHarness.sandbox.sitePillEl.style.display, 'none');
+  assert.equal(failedHarness.sandbox.sitePillEl.textContent, '');
+  assert.equal(failedHarness.sandbox.excludeBtn.textContent, 'Not available');
+  assert.equal(failedHarness.sandbox.excludeBtn.disabled, true);
+
+  const invalidHarness = makeHarness();
+  const invalid = invalidHarness.fn({ excludeDomains: 'old.example' });
+  pending[1].resolve([{ id: 8, url: 'not a valid absolute URL' }]);
+  await invalid;
+  assert.equal(invalidHarness.sandbox.siteNameEl.textContent, 'Unknown');
+  assert.equal(invalidHarness.sandbox.sitePillEl.style.display, 'none');
+  assert.equal(invalidHarness.sandbox.excludeBtn.disabled, true);
+});
+
+test('popup exclusion toggle aborts when the active site changes during its storage read', async () => {
+  let resolveRead;
+  const writes = [];
+  const settingsRevision = {};
+  const state = { excludeDomains: '' };
+  let refreshed = 0;
+  let nudges = 0;
+  const harness = functionFrom(popupSource, 'toggleSiteExclusion', {
+    currentIsWeb: true,
+    currentHost: 'old.example',
+    siteUiRevision: 4,
+    settingsRevision,
+    state,
+    popupStorageWriteInProgress: false,
+    setPopupStorageBusy() {},
+    DEFAULTS: { excludeDomains: '' },
+    chrome: { storage: { sync: {
+      get: () => new Promise(resolve => { resolveRead = resolve; }),
+      set: async value => { writes.push(value); }
+    } } },
+    markSettingsRevision(key) { settingsRevision[key] = (settingsRevision[key] || 0) + 1; },
+    parseDomains(text) { return String(text || '').split(/[\s,]+/).filter(Boolean); },
+    findExcludedDomain(host, domains) { return domains.find(domain => host === domain) || ''; },
+    removeDomainToken(text, domain) { return text.split(/[\s,]+/).filter(token => token && token !== domain).join('\n'); },
+    loadSiteUI() { refreshed++; },
+    showNudge() { nudges++; }
+  });
+
+  const toggle = harness.fn();
+  harness.sandbox.siteUiRevision = 5;
+  harness.sandbox.currentHost = 'new.example';
+  resolveRead({ excludeDomains: '' });
+  await toggle;
+  assert.deepEqual(writes, [], 'the stale click must not exclude the newly active site');
+  assert.equal(harness.sandbox.state.excludeDomains, '');
+  assert.equal(refreshed, 0);
+  assert.equal(nudges, 0);
+});
+
+test('popup settings reads and writes report storage errors without retaining failed optimistic state', async () => {
+  const defaults = { enabled: true, grayscale: true, saveData: true, proxyBase: '', quality: 60, maxWidth: 768, excludeDomains: '' };
+  const readErrors = [];
+  const readLoad = functionFrom(popupSource, 'load', {
+    DEFAULTS: defaults,
+    state: { ...defaults },
+    settingsRevision: Object.create(null),
+    chrome: { storage: { sync: { get: async () => { throw new Error('sync read failed'); } } } },
+    applyUI() {},
+    showStorageError(message) { readErrors.push(message); },
+    loadSiteUI() {}
+  });
+  assert.equal(await readLoad.fn(), false);
+  assert.deepEqual(readErrors, ['Could not load settings']);
+
+  const writeErrors = [];
+  const state = { ...defaults, enabled: false };
+  const settingsRevision = Object.create(null);
+  const failedWrite = functionFrom(popupSource, 'savePopupSetting', {
+    state,
+    settingsRevision,
+    popupStorageWriteInProgress: false,
+    setPopupStorageBusy() {},
+    markSettingsRevision(key) { settingsRevision[key] = (settingsRevision[key] || 0) + 1; },
+    chrome: { storage: { sync: { set: async () => { throw new Error('sync write failed'); } } } },
+    applyUI() {},
+    showStorageError(message) { writeErrors.push(message); }
+  });
+  assert.equal(await failedWrite.fn('enabled', true), false);
+  assert.equal(state.enabled, false, 'failed optimistic write restores the previous value');
+  assert.deepEqual(writeErrors, ['Could not save settings']);
+});
+
+test('popup serializes setting writes and blocks other storage controls while saving', async () => {
+  const writes = [];
+  let resolveWrite;
+  const busyStates = [];
+  let harness;
+  harness = functionFrom(popupSource, 'savePopupSetting', {
+    state: { enabled: false, grayscale: false },
+    settingsRevision: Object.create(null),
+    popupStorageWriteInProgress: false,
+    setPopupStorageBusy(value) {
+      busyStates.push(value);
+      harness.sandbox.popupStorageWriteInProgress = value;
+    },
+    markSettingsRevision(key) {
+      harness.sandbox.settingsRevision[key] = (harness.sandbox.settingsRevision[key] || 0) + 1;
+    },
+    chrome: { storage: { sync: { set(value) {
+      writes.push(value);
+      return new Promise(resolve => { resolveWrite = resolve; });
+    } } } },
+    applyUI() {}, showStorageError() {}
+  });
+  const first = harness.fn('enabled', true);
+  assert.equal(harness.sandbox.popupStorageWriteInProgress, true);
+  const second = await harness.fn('grayscale', true);
+  assert.equal(second, false, 'a second settings change is ignored while the first write is pending');
+  assert.equal(writes.length, 1, 'only one storage write is issued at a time');
+  resolveWrite();
+  assert.equal(await first, true);
+  assert.equal(harness.sandbox.popupStorageWriteInProgress, false);
+  assert.deepEqual(busyStates, [true, false]);
+});
+
+test('popup exclusion writes are blocked while another setting save is in flight', async () => {
+  let reads = 0;
+  const harness = functionFrom(popupSource, 'toggleSiteExclusion', {
+    currentIsWeb: true, currentHost: 'example.com', popupStorageWriteInProgress: true,
+    chrome: { storage: { sync: { get() { reads++; } } } },
+    setPopupStorageBusy() {}
+  });
+  await harness.fn();
+  assert.equal(reads, 0);
+});
+
+test('popup failed write does not roll back a newer cross-page settings event', async () => {
+  let rejectWrite;
+  const state = { enabled: false };
+  const settingsRevision = Object.create(null);
+  const writeErrors = [];
+  const harness = functionFrom(popupSource, 'savePopupSetting', {
+    state,
+    settingsRevision,
+    popupStorageWriteInProgress: false,
+    setPopupStorageBusy() {},
+    markSettingsRevision(key) { settingsRevision[key] = (settingsRevision[key] || 0) + 1; },
+    chrome: { storage: { sync: { set: () => new Promise((_resolve, reject) => { rejectWrite = reject; }) } } },
+    applyUI() {},
+    showStorageError(message) { writeErrors.push(message); }
+  });
+  const save = harness.fn('enabled', true);
+  harness.sandbox.markSettingsRevision('enabled');
+  state.enabled = true; // newer cross-page value arrived while this write was pending
+  rejectWrite(new Error('write failed'));
+  assert.equal(await save, false);
+  assert.equal(state.enabled, true, 'the newer observed value wins over the failed optimistic write');
+  assert.deepEqual(writeErrors, ['Could not save settings']);
+});
+
+test('popup exclusion read and write failures are reported', async () => {
+  const run = async ({ get, set }) => {
+    const errors = [];
+    const settingsRevision = {};
+    const host = functionFrom(popupSource, 'toggleSiteExclusion', {
+      currentIsWeb: true,
+      currentHost: 'example.com',
+      siteUiRevision: 1,
+      settingsRevision,
+      state: { excludeDomains: '' },
+      popupStorageWriteInProgress: false,
+      setPopupStorageBusy() {},
+      DEFAULTS: { excludeDomains: '' },
+      chrome: { storage: { sync: { get, set } } },
+      markSettingsRevision(key) { settingsRevision[key] = (settingsRevision[key] || 0) + 1; },
+      parseDomains(text) { return String(text || '').split(/[\s,]+/).filter(Boolean); },
+      findExcludedDomain(host, domains) { return domains.find(domain => host === domain) || ''; },
+      removeDomainToken(text, domain) { return text.split(/[\s,]+/).filter(token => token && token !== domain).join('\n'); },
+      loadSiteUI() {},
+      showNudge() {},
+      showStorageError(message) { errors.push(message); }
+    });
+    await host.fn();
+    return errors;
+  };
+  assert.deepEqual(await run({ get: async () => { throw new Error('read failed'); }, set: async () => {} }),
+    ['Could not load site exclusions']);
+  assert.deepEqual(await run({ get: async () => ({ excludeDomains: '' }), set: async () => { throw new Error('write failed'); } }),
+    ['Could not save site exclusion']);
+});
+
 test('service worker does not treat failed sync reads as missing settings', () => {
   const storageError = new Error('sync storage unavailable');
   let retries = 0;
@@ -110,6 +1283,12 @@ test('service worker does not treat failed sync reads as missing settings', () =
   };
   const mirror = functionFrom(serviceWorker, 'mirrorToLocal', {
     chrome: mirrorChrome,
+    mirrorReadRevision: 0,
+    mirrorRevision: 0,
+    mirrorWriteInFlight: false,
+    pendingMirrorWrite: null,
+    proxyObserverReady: false,
+    restoreProxyObserverFromLocalMirror() {},
     scheduleSettingsReadRetry() { retries++; }
   });
   mirror.fn();
@@ -142,6 +1321,103 @@ test('service worker does not treat failed sync reads as missing settings', () =
   initialize.fn();
   assert.equal(writes, 0, 'failed reads must never overwrite existing user settings with defaults');
   assert.equal(retries, 3);
+});
+
+test('service worker ignores stale sync snapshots and serializes local settings mirror writes', () => {
+  const defaults = {
+    enabled: true, saveData: true, proxyBase: '', quality: 60,
+    grayscale: true, maxWidth: 768, excludeDomains: ''
+  };
+  const syncReads = [];
+  const localReads = [];
+  const localWrites = [];
+  const localWriteCallbacks = [];
+  let localMirror = null;
+  const chrome = {
+    runtime: { lastError: null },
+    storage: {
+      sync: { get(_query, callback) { syncReads.push(callback); } },
+      local: {
+        get(_query, callback) { localReads.push(callback); },
+        set(value, callback) {
+          localWrites.push(value.bhOpts);
+          localMirror = value.bhOpts;
+          localWriteCallbacks.push(callback);
+        }
+      }
+    }
+  };
+  const sandbox = {
+    DEFAULTS: defaults, chrome, mirrorReadRevision: 0, mirrorRevision: 0, proxyObserverRevision: 0,
+    mirrorWriteInFlight: false, pendingMirrorWrite: null, proxyObserverReady: false,
+    configuredProxyOrigin: '', earlyStatsEvents: [],
+    sameOpts: (a, b) => !!a && !!b && Object.keys(defaults).every(key => a[key] === b[key]),
+    setProxyOrigin(base) { sandbox.configuredProxyOrigin = base; },
+    updateWebRequestListener() {}, handleProxyCompleted() {},
+    scheduleSettingsReadRetry() {}
+  };
+  const mirror = functionFrom(serviceWorker, 'mirrorToLocal', sandbox);
+  const oldOpts = { ...defaults, proxyBase: 'https://old.example/convert' };
+  const newOpts = { ...defaults, proxyBase: 'https://new.example/convert' };
+
+  mirror.fn();
+  syncReads[0](oldOpts);
+  localReads.shift()({ bhOpts: null });
+  assert.equal(localWrites.length, 1, 'the first snapshot starts one local write');
+
+  mirror.fn();
+  syncReads[1](newOpts);
+  assert.equal(localReads.length, 0,
+    'a newer snapshot waits while an older local write is in flight');
+  localWriteCallbacks.shift()();
+  assert.equal(localReads.length, 1,
+    'the queued newest snapshot reads the mirror after the older write completes');
+  localReads.shift()({ bhOpts: oldOpts });
+  assert.equal(localWrites.length, 2);
+  assert.equal(localWrites[1].proxyBase, newOpts.proxyBase);
+  localWriteCallbacks.shift()();
+  assert.equal(localMirror.proxyBase, newOpts.proxyBase,
+    'the last confirmed local mirror is always the newest sync snapshot');
+
+  mirror.fn();
+  mirror.fn();
+  const beforeStaleCallback = localReads.length;
+  syncReads[2]({ ...defaults, proxyBase: 'https://obsolete.example/convert' });
+  assert.equal(localReads.length, beforeStaleCallback,
+    'an obsolete sync callback cannot start a local mirror read');
+  const latestOpts = { ...defaults, proxyBase: 'https://latest.example/convert' };
+  syncReads[3](latestOpts);
+  assert.equal(localReads.length, beforeStaleCallback + 1,
+    'the newest sync callback is the only one allowed to publish');
+  localReads.shift()({ bhOpts: newOpts });
+  localWriteCallbacks.shift()();
+  assert.equal(localMirror.proxyBase, latestOpts.proxyBase,
+    'the latest snapshot finishes the serialized mirror queue');
+});
+
+test('service worker icon updates ignore stale sync callbacks', () => {
+  const reads = [];
+  const icons = [];
+  const sandbox = {
+    DEFAULTS: { enabled: true },
+    ICONS_ON: { 16: 'on.png' },
+    ICONS_OFF: { 16: 'off.png' },
+    iconRevision: 0,
+    chrome: {
+      runtime: { lastError: null },
+      storage: { sync: { get(_query, callback) { reads.push(callback); } } },
+      action: { setIcon(value) { icons.push(value.path); } }
+    },
+    scheduleSettingsReadRetry() {}
+  };
+  const update = functionFrom(serviceWorker, 'updateIcon', sandbox);
+  update.fn();
+  update.fn();
+  reads[0]({ enabled: false });
+  assert.equal(icons.length, 0, 'an old disabled snapshot is discarded');
+  reads[1]({ enabled: true });
+  assert.equal(icons.length, 1);
+  assert.deepEqual(JSON.parse(JSON.stringify(icons[0])), { 16: 'on.png' });
 });
 
 test('proxy observers register synchronously and recover their filter from the local settings mirror', () => {
@@ -183,6 +1459,8 @@ test('proxy observers register synchronously and recover their filter from the l
   vm.createContext(mirrorSandbox);
   vm.runInContext(`
     let configuredProxyOrigin = '';
+    let proxyObserverRevision = 0;
+    let proxyObserverReady = false;
     let restoringProxyObserver = false;
     const earlyStatsEvents = [${JSON.stringify(event)}];
     const handled = [];
@@ -194,7 +1472,7 @@ test('proxy observers register synchronously and recover their filter from the l
     function scheduleSettingsReadRetry() { retries++; }
     ${extractFunction(serviceWorker, 'restoreProxyObserverFromLocalMirror')}
     restoreProxyObserverFromLocalMirror();
-    this.result = () => ({ configuredProxyOrigin, selectedOrigin, remaining: earlyStatsEvents.length, handled, retries, restoringProxyObserver });
+    this.result = () => ({ configuredProxyOrigin, selectedOrigin, remaining: earlyStatsEvents.length, handled, retries, proxyObserverRevision, proxyObserverReady, restoringProxyObserver });
   `, mirrorSandbox);
   const result = mirrorSandbox.result();
   assert.equal(result.configuredProxyOrigin, 'https://proxy.example');
@@ -202,6 +1480,8 @@ test('proxy observers register synchronously and recover their filter from the l
   assert.equal(result.remaining, 0, 'queued startup events are replayed after the origin is restored');
   assert.deepEqual(Array.from(result.handled), [event.url]);
   assert.equal(result.retries, 0);
+  assert.equal(result.proxyObserverRevision, 1);
+  assert.equal(result.proxyObserverReady, true);
   assert.equal(result.restoringProxyObserver, false);
 
   const failedRead = new Error('local settings mirror unavailable');
@@ -215,6 +1495,8 @@ test('proxy observers register synchronously and recover their filter from the l
   vm.createContext(failureSandbox);
   vm.runInContext(`
     let configuredProxyOrigin = '';
+    let proxyObserverRevision = 0;
+    let proxyObserverReady = false;
     let restoringProxyObserver = false;
     const earlyStatsEvents = [];
     let selectedOrigin = '*';
@@ -225,12 +1507,141 @@ test('proxy observers register synchronously and recover their filter from the l
     function scheduleSettingsReadRetry() { retries++; }
     ${extractFunction(serviceWorker, 'restoreProxyObserverFromLocalMirror')}
     restoreProxyObserverFromLocalMirror();
-    this.result = () => ({ selectedOrigin, retries, restoringProxyObserver });
+    this.result = () => ({ selectedOrigin, retries, proxyObserverRevision, proxyObserverReady, restoringProxyObserver });
   `, failureSandbox);
   const failed = failureSandbox.result();
   assert.equal(failed.selectedOrigin, '*', 'a failed local read must leave the synchronous startup observer active');
   assert.equal(failed.retries, 1);
+  assert.equal(failed.proxyObserverRevision, 1);
   assert.equal(failed.restoringProxyObserver, false);
+});
+
+test('a successful sync snapshot invalidates an older local proxy-observer restore', () => {
+  const defaults = {
+    enabled: true, saveData: true, proxyBase: '', quality: 60,
+    grayscale: true, maxWidth: 768, excludeDomains: ''
+  };
+  const syncReads = [];
+  const localReads = [];
+  const selectedOrigins = [];
+  const sandbox = {
+    URL, DEFAULTS: defaults, mirrorReadRevision: 0, mirrorRevision: 0, mirrorWriteInFlight: false,
+    pendingMirrorWrite: null, proxyObserverRevision: 0, proxyObserverReady: false,
+    earlyStatsEvents: [], selectedOrigins, restoringProxyObserver: false,
+    chrome: {
+      runtime: { lastError: null },
+      storage: {
+        sync: { get(_query, callback) { syncReads.push(callback); } },
+        local: {
+          get(_query, callback) { localReads.push(callback); },
+          set(_value, callback) { callback?.(); }
+        }
+      }
+    },
+    sameOpts: (a, b) => !!a && !!b && Object.keys(defaults).every(key => a[key] === b[key]),
+    handleProxyCompleted() {},
+    scheduleSettingsReadRetry() {}
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(`
+    let configuredProxyOrigin = '';
+    function setProxyOrigin(base) { configuredProxyOrigin = base ? new URL(base).origin : ''; }
+    function updateWebRequestListener(origin) { selectedOrigins.push(origin); }
+    ${extractFunction(serviceWorker, 'restoreProxyObserverFromLocalMirror')}
+    ${extractFunction(serviceWorker, 'mirrorToLocal')}
+    this.restore = restoreProxyObserverFromLocalMirror;
+    this.mirror = mirrorToLocal;
+    this.origin = () => configuredProxyOrigin;
+  `, sandbox);
+
+  const oldOpts = { ...defaults, proxyBase: 'https://old-proxy.example/convert' };
+  const newOpts = { ...defaults, proxyBase: 'https://new-proxy.example/convert' };
+  sandbox.restore();
+  sandbox.restore();
+  assert.equal(localReads.length, 1, 'overlapping recovery requests share one local-mirror read');
+
+  sandbox.mirror();
+  syncReads[0](newOpts);
+  assert.equal(sandbox.origin(), 'https://new-proxy.example', 'the successful sync snapshot becomes current');
+  assert.equal(sandbox.proxyObserverReady, true, 'a trusted sync snapshot becomes the observer recovery baseline');
+  assert.equal(localReads.length, 2, 'the mirror writer separately checks whether the local copy needs updating');
+  localReads[1]({ bhOpts: newOpts });
+  localReads[0]({ bhOpts: oldOpts });
+
+  assert.equal(sandbox.origin(), 'https://new-proxy.example',
+    'a late local restore cannot roll the observer back to the older proxy');
+  assert.deepEqual(Array.from(sandbox.selectedOrigins), ['https://new-proxy.example']);
+});
+
+test('a failed newer sync read cannot roll the proxy observer back or cancel a confirmed mirror write', () => {
+  const defaults = {
+    enabled: true, saveData: true, proxyBase: '', quality: 60,
+    grayscale: true, maxWidth: 768, excludeDomains: ''
+  };
+  const syncReads = [];
+  const localReads = [];
+  const localWrites = [];
+  const selectedOrigins = [];
+  let configuredProxyOrigin = '';
+  const storageError = new Error('temporary sync read failure');
+  const sandbox = {
+    URL, DEFAULTS: defaults,
+    mirrorReadRevision: 0, mirrorRevision: 0,
+    mirrorWriteInFlight: false, pendingMirrorWrite: null,
+    proxyObserverRevision: 0, proxyObserverReady: false,
+    restoringProxyObserver: false, earlyStatsEvents: [], selectedOrigins,
+    chrome: {
+      runtime: { lastError: null },
+      storage: {
+        sync: { get(_query, callback) { syncReads.push(callback); } },
+        local: {
+          get(_query, callback) { localReads.push(callback); },
+          set(value, callback) { localWrites.push(value.bhOpts); callback?.(); }
+        }
+      }
+    },
+    sameOpts: (a, b) => !!a && !!b && Object.keys(defaults).every(key => a[key] === b[key]),
+    scheduleSettingsReadRetry() {},
+    handleProxyCompleted() {}
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(`
+    function setProxyOrigin(base) { configuredProxyOrigin = base ? new URL(base).origin : ''; }
+    function updateWebRequestListener(origin) { selectedOrigins.push(origin); }
+    ${extractFunction(serviceWorker, 'restoreProxyObserverFromLocalMirror')}
+    ${extractFunction(serviceWorker, 'mirrorToLocal')}
+    this.mirror = mirrorToLocal;
+    this.restore = restoreProxyObserverFromLocalMirror;
+    this.origin = () => configuredProxyOrigin;
+  `, sandbox);
+
+  const latest = { ...defaults, proxyBase: 'https://latest-proxy.example/convert' };
+  const staleLocal = { ...defaults, proxyBase: 'https://old-proxy.example/convert' };
+  sandbox.mirror();
+  syncReads[0](latest);
+  assert.equal(sandbox.origin(), 'https://latest-proxy.example');
+  assert.equal(sandbox.mirrorRevision, 1);
+  assert.equal(localReads.length, 1, 'the confirmed snapshot has begun its mirror read');
+
+  // A later storage-change notification triggers a fresh sync read that fails.
+  // It must neither use an old local mirror to reset the observer nor invalidate
+  // the already-confirmed snapshot whose local mirror write is still pending.
+  sandbox.mirror();
+  sandbox.chrome.runtime.lastError = storageError;
+  syncReads[1](undefined);
+  assert.equal(sandbox.mirrorRevision, 1,
+    'failed newer reads do not supersede the latest successful snapshot revision');
+  assert.equal(sandbox.proxyObserverReady, true);
+  assert.equal(localReads.length, 1,
+    'a ready observer does not launch a stale local-mirror recovery read');
+  assert.equal(sandbox.origin(), 'https://latest-proxy.example');
+
+  sandbox.chrome.runtime.lastError = null;
+  localReads[0]({ bhOpts: staleLocal });
+  assert.equal(localWrites.length, 1,
+    'the successful snapshot still completes its queued mirror write');
+  assert.equal(localWrites[0].proxyBase, latest.proxyBase);
+  assert.deepEqual(Array.from(selectedOrigins), ['https://latest-proxy.example']);
 });
 
 test('extension and browser HTML pages use unique DOM ids and resolve static UI selectors', () => {
@@ -266,7 +1677,7 @@ test('extension and browser HTML pages use unique DOM ids and resolve static UI 
 });
 
 function extractFunction(source, name) {
-  const marker = new RegExp(`function\\s+${name}\\s*\\(`);
+  const marker = new RegExp(`(?:async\\s+)?function\\s+${name}\\s*\\(`);
   const match = marker.exec(source);
   assert.ok(match, `function ${name} must exist in source`);
   const open = source.indexOf('{', match.index);
@@ -1052,6 +2463,44 @@ test('incoming quality and width changes update reset baselines without clobberi
   assert.deepEqual(applied, [45, 720], 'clean controls apply the newest stored values');
 });
 
+test('service worker retries session-bypass initialization after a transient rules read failure', async () => {
+  let reads = 0;
+  const existingRule = {
+    id: 100010,
+    condition: { urlFilter: '|https://cdn.example/existing.png|', tabIds: [7] }
+  };
+  const harness = functionFrom(serviceWorker, 'bypassReady', {
+    BYPASS_BASE_ID: 100000,
+    bypassInitialized: false,
+    bypassInitPromise: null,
+    bypassRules: new Map(),
+    bypassRegexRules: new Set(),
+    bypassNextId: 100000,
+    bypassUrlFromRule(rule) { return String(rule.condition.urlFilter).replace(/^\||\|$/g, ''); },
+    chrome: { declarativeNetRequest: { getSessionRules: async () => {
+      reads++;
+      if (reads === 1) throw new Error('temporary DNR failure');
+      return [existingRule];
+    } } }
+  });
+
+  const queue = functionFrom(serviceWorker, 'queueBypassOperation', {
+    bypassChain: Promise.resolve(),
+    bypassReady: harness.fn
+  });
+  let installed = 0;
+  assert.equal(await queue.fn(() => { installed++; }, 'not-ready'), 'not-ready',
+    'a failed rules read prevents a DNR update with unverified IDs');
+  assert.equal(installed, 0);
+  assert.equal(harness.sandbox.bypassInitPromise, null, 'the failed promise is not cached');
+  assert.equal(await queue.fn(() => { installed++; return 'installed'; }, 'not-ready'), 'installed',
+    'the next queued operation retries initialization and proceeds');
+  assert.equal(installed, 1);
+  assert.equal(reads, 2);
+  assert.equal(harness.sandbox.bypassRules.get('7 https://cdn.example/existing.png'), 100010);
+  assert.equal(harness.sandbox.bypassNextId, 100011, 'the next ID starts above recovered session rules');
+});
+
 test('service worker builds exact bypass matches for URLs containing DNR filter metacharacters', () => {
   const helper = extractFunction(serviceWorker, 'bypassCondition');
   const decode = extractFunction(serviceWorker, 'bypassUrlFromRule');
@@ -1072,7 +2521,7 @@ test('service worker builds exact bypass matches for URLs containing DNR filter 
 
 
 test('fallback retry is not consumed when the DNR bypass update fails', async () => {
-  const sources = ['bypassCondition', 'bypassUrlFromRule', 'originalFromProxyUrl', 'addBypass', 'scheduleFallback', 'markFallbackSeen', 'flushFallbacks']
+  const sources = ['bypassCondition', 'bypassUrlFromRule', 'originalFromProxyUrl', 'queueBypassOperation', 'addBypass', 'scheduleFallback', 'markFallbackSeen', 'flushFallbacks']
     .map(name => extractFunction(serviceWorker, name));
   const messages = [];
   const installedUpdates = [];
@@ -1110,22 +2559,23 @@ test('fallback retry is not consumed when the DNR bypass update fails', async ()
     let bypassRules = new Map();
     let bypassRegexRules = new Set();
     let bypassNextId = BYPASS_BASE_ID;
-    let bypassChain = null;
+    let bypassChain = Promise.resolve();
     let configuredProxyOrigin = "https://proxy.example";
     const CONFLICT_PATTERN = "&(?:quality|l|bw|jpeg|max_width)=";
     const PROXY_PARAMETER_RE = new RegExp(CONFLICT_PATTERN);
-    function bypassReady() { return Promise.resolve(); }
+    function bypassReady() { return Promise.resolve(true); }
     ${sources[0]}
     ${sources[1]}
     ${sources[2]}
     ${sources[3]}
+    ${sources[4]}
     let fallbackSeen = new Set();
     let fallbackPending = new Set();
     let fallbackBatch = new Map();
     let fallbackTimer = null;
-    ${sources[4]}
     ${sources[5]}
     ${sources[6]}
+    ${sources[7]}
     this.api = {
       fail(details) { scheduleFallback(details); },
       flush() {
@@ -2419,7 +3869,7 @@ test('a src assigned after a rewritten srcset restores the original candidates, 
 });
 
 test('bypass eviction only starts when the live bypass table is actually full', async () => {
-  const sources = ['bypassCondition', 'bypassUrlFromRule', 'addBypass'].map(name => extractFunction(serviceWorker, name));
+  const sources = ['bypassCondition', 'bypassUrlFromRule', 'queueBypassOperation', 'addBypass'].map(name => extractFunction(serviceWorker, name));
   const removed = [];
   const sandbox = {
     Promise, Number, JSON, Error, Set, Map, RegExp, URL, decodeURIComponent,
@@ -2439,8 +3889,8 @@ test('bypass eviction only starts when the live bypass table is actually full', 
     let bypassRules = new Map();
     let bypassRegexRules = new Set();
     let bypassNextId = BYPASS_BASE_ID;
-    let bypassChain = null;
-    const bypassReady = () => Promise.resolve();
+    let bypassChain = Promise.resolve();
+    const bypassReady = () => Promise.resolve(true);
     ${sources.join('\n')}
     this.add = addBypass;
     this.size = () => bypassRules.size;
