@@ -285,10 +285,12 @@ icon in an older state.
 | `<canvas>` | Images drawn from proxied `<img>` are proxied; the proxy sends `Access-Control-Allow-Origin: *`, so `crossorigin="anonymous"` images stay untainted | |
 
 Every browser test checks the actual URL Chrome requested (logged by a local
-mock origin and mock proxy). The mock log also records the final HTTP status and
-response `Content-Type`, so statistics assertions distinguish completed strict
-image responses from requests that the browser cancels while replacing an image
-candidate. When `BHP2_DIR` points to a bandwidth-hero-proxy2 checkout, the mock
+mock origin and mock proxy). Statistics assertions do not rely on the mock
+server's own view of a response: they use Chrome's network events, captured over
+the DevTools protocol. A proxy response counts only when Chrome reports it
+finished with a 2xx status and a strict image `Content-Type`, so a request that
+Chrome cancels while replacing an image candidate is not counted, even though
+the mock server had already written its bytes. When `BHP2_DIR` points to a bandwidth-hero-proxy2 checkout, the mock
 proxy uses that project's `getImageUrl()` implementation; otherwise it uses the
 equivalent parser bundled in `tests/browser/server.cjs`. Assertions cover image
 loading, fallback behaviour and duplicate proxy requests.
