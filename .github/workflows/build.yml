@@ -36,6 +36,7 @@ jobs:
         with:
           repository: anT0ny54/bhp2
           path: bhp2
+          fetch-depth: 1   # only the working tree is read, never history
 
       - name: Install test browser
         run: |
@@ -52,6 +53,8 @@ jobs:
     name: Build extension
     needs: test
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
 
     steps:
       - name: Checkout
@@ -87,17 +90,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Read manifest version
-        id: version
-        shell: bash
-        run: echo "version=$(python3 -c 'import json; print(json.load(open("manifest.json"))["version"])')" >> "$GITHUB_OUTPUT"
-
       # Reuse the zip the build job already produced (the build is
       # reproducible) instead of building a second time.
       - name: Download build artifact
         uses: actions/download-artifact@v4
         with:
-          name: bandwidth-guardian-${{ steps.version.outputs.version }}
+          name: bandwidth-guardian-${{ needs.build.outputs.version }}
           path: dist
 
       - name: Publish manifest version release
@@ -105,7 +103,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          VERSION="$(python3 -c 'import json; print(json.load(open("manifest.json"))["version"])')"
+          VERSION="${{ needs.build.outputs.version }}"
           ZIP="dist/bandwidth-guardian-${VERSION}.zip"
 
           if gh release view "v${VERSION}" >/dev/null 2>&1; then
