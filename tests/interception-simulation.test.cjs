@@ -1392,7 +1392,7 @@ test('service worker ignores stale sync snapshots and serializes local settings 
     updateWebRequestListener() {}, handleProxyCompleted() {},
     scheduleSettingsReadRetry() {}
   };
-  const mirror = functionFrom(serviceWorker, 'mirrorToLocal', sandbox);
+  const mirror = functionFrom(serviceWorker, ['applyProxyObserverOrigin', 'mirrorToLocal'], sandbox);
   const oldOpts = { ...defaults, proxyBase: 'https://old.example/convert' };
   const newOpts = { ...defaults, proxyBase: 'https://new.example/convert' };
 
@@ -1506,6 +1506,7 @@ test('proxy observers register synchronously and recover their filter from the l
     function updateWebRequestListener(origin) { selectedOrigin = origin; }
     function handleProxyCompleted(item) { handled.push(item.url); }
     function scheduleSettingsReadRetry() { retries++; }
+    ${extractFunction(serviceWorker, 'applyProxyObserverOrigin')}
     ${extractFunction(serviceWorker, 'restoreProxyObserverFromLocalMirror')}
     restoreProxyObserverFromLocalMirror();
     this.result = () => ({ configuredProxyOrigin, selectedOrigin, remaining: earlyStatsEvents.length, handled, retries, proxyObserverRevision, proxyObserverReady, restoringProxyObserver });
@@ -1541,6 +1542,7 @@ test('proxy observers register synchronously and recover their filter from the l
     function updateWebRequestListener(origin) { selectedOrigin = origin; }
     function handleProxyCompleted() {}
     function scheduleSettingsReadRetry() { retries++; }
+    ${extractFunction(serviceWorker, 'applyProxyObserverOrigin')}
     ${extractFunction(serviceWorker, 'restoreProxyObserverFromLocalMirror')}
     restoreProxyObserverFromLocalMirror();
     this.result = () => ({ selectedOrigin, retries, proxyObserverRevision, proxyObserverReady, restoringProxyObserver });
@@ -1550,6 +1552,16 @@ test('proxy observers register synchronously and recover their filter from the l
   assert.equal(failed.retries, 1);
   assert.equal(failed.proxyObserverRevision, 1);
   assert.equal(failed.restoringProxyObserver, false);
+});
+
+test('proxy observer origin is applied through one helper on both the sync and local-mirror paths', () => {
+  // One definition plus the two recovery call sites; the raw steps live only in the helper.
+  assert.equal(serviceWorker.split('applyProxyObserverOrigin(').length - 1, 3,
+    'the helper is defined once and called from the sync and local-mirror paths');
+  assert.equal(serviceWorker.split('updateWebRequestListener(configuredProxyOrigin)').length - 1, 1,
+    'only the shared helper re-targets the webRequest observer');
+  assert.equal(serviceWorker.split('setProxyOrigin(opts.proxyBase)').length - 1, 0,
+    'callers never set the origin directly');
 });
 
 test('a successful sync snapshot invalidates an older local proxy-observer restore', () => {
@@ -1583,6 +1595,7 @@ test('a successful sync snapshot invalidates an older local proxy-observer resto
     let configuredProxyOrigin = '';
     function setProxyOrigin(base) { configuredProxyOrigin = base ? new URL(base).origin : ''; }
     function updateWebRequestListener(origin) { selectedOrigins.push(origin); }
+    ${extractFunction(serviceWorker, 'applyProxyObserverOrigin')}
     ${extractFunction(serviceWorker, 'restoreProxyObserverFromLocalMirror')}
     ${extractFunction(serviceWorker, 'mirrorToLocal')}
     this.restore = restoreProxyObserverFromLocalMirror;
@@ -1644,6 +1657,7 @@ test('a failed newer sync read cannot roll the proxy observer back or cancel a c
   vm.runInContext(`
     function setProxyOrigin(base) { configuredProxyOrigin = base ? new URL(base).origin : ''; }
     function updateWebRequestListener(origin) { selectedOrigins.push(origin); }
+    ${extractFunction(serviceWorker, 'applyProxyObserverOrigin')}
     ${extractFunction(serviceWorker, 'restoreProxyObserverFromLocalMirror')}
     ${extractFunction(serviceWorker, 'mirrorToLocal')}
     this.mirror = mirrorToLocal;
@@ -1794,10 +1808,14 @@ function extractFunction(source, name) {
   assert.fail(`function ${name} has unbalanced braces`);
 }
 
+// `name` may be a list: the listed functions share one sandbox, and the last
+// one is the exported function (earlier ones are helpers it calls).
 function functionFrom(source, name, globals = {}) {
+  const names = Array.isArray(name) ? name : [name];
   const sandbox = { ...globals };
   vm.createContext(sandbox);
-  vm.runInContext(`${extractFunction(source, name)}\nthis.__exported = ${name};`, sandbox);
+  const exported = names[names.length - 1];
+  vm.runInContext(`${names.map(n => extractFunction(source, n)).join('\n')}\nthis.__exported = ${exported};`, sandbox);
   return { fn: sandbox.__exported, sandbox };
 }
 
@@ -2149,6 +2167,62 @@ test('parser-created responsive preload without href holds conflicting imagesrcs
   assert.equal(candidates[0][1], '800w');
   assert.equal(candidates[1][0], 'https://cdn.example/preload/full.jpg');
   assert.equal(candidates[1][1], '1600w');
+});
+
+test('MAIN-world inline-style interception handles conflict URLs and preserves DNR-owned URLs', () => {
+  const sandbox = {
+    URL,
+    destroyed: false,
+    active: true,
+    redirectLive: true,
+    CSS_URL_RE: constRegex(prehook, 'CSS_URL_RE'),
+    CONFLICT_RE: constRegex(prehook, 'CONFLICT_RE'),
+    document: { baseURI: 'https://page.example/articles/' },
+    isLocalFragmentReference: value => String(value || '').trim().startsWith('#'),
+    safeURL(value, base) { try { return new URL(value, base); } catch { return null; } },
+    domHandles(value) { return !sandbox.redirectLive || sandbox.CONFLICT_RE.test(value); },
+    skipAbsolute(value) {
+      try {
+        const url = new URL(value);
+        return url.origin === 'https://proxy.example' || url.hostname === 'private.test';
+      } catch { return true; }
+    },
+    buildProxyUrl(value) { return 'https://proxy.example/convert?url=' + encodeURIComponent(value); },
+    setAttr: { call(el, name, value) { if (name === 'style') { el._style = String(value); el.writes++; } } }
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(`${extractFunction(prehook, 'processInlineStyle')}\nthis.rewrite = processInlineStyle;`, sandbox);
+
+  const makeElement = style => ({
+    nodeType: 1, baseURI: 'https://page.example/articles/', _style: style, writes: 0,
+    getAttribute(name) { return name === 'style' ? this._style : null; }
+  });
+  const conflict = 'https://cdn.example/image.png?w=40&QUALITY=80';
+  const ordinary = 'https://cdn.example/ordinary.png';
+  const el = makeElement(`background:url("${conflict}");border-image:url(${ordinary});mask:url(#mask);`);
+  sandbox.rewrite(el);
+  assert.equal(el.writes, 1);
+  assert.ok(el._style.includes(encodeURIComponent(conflict)), 'case-insensitive conflict URL is proxied');
+  assert.ok(el._style.includes(ordinary), 'ordinary image URL remains with the DNR redirect');
+  assert.ok(el._style.includes('url(#mask)'), 'same-document fragment remains local');
+
+  sandbox.redirectLive = false;
+  const fallback = makeElement(`background:url(${ordinary});border:url(https://private.test/image.png);`);
+  sandbox.rewrite(fallback);
+  assert.equal(fallback.writes, 1);
+  assert.ok(fallback._style.includes(encodeURIComponent(ordinary)), 'DOM fallback proxies ordinary public URLs');
+  assert.ok(fallback._style.includes('https://private.test/image.png'), 'private hosts remain direct');
+});
+
+test('MAIN-world style observer covers attribute changes and already-populated shadow roots', () => {
+  assert.match(prehook, /attributeFilter: \["style"\]/,
+    'style attribute changes are observed');
+  assert.match(prehook, /preloadObserver\.observe\(root, DOM_OBSERVER_OPTIONS\)/,
+    'open and closed attached roots share the style-aware observer');
+  assert.match(prehook, /observeNestedShadowRoots\(n\)/,
+    'inserted hosts register open declarative shadow roots');
+  assert.match(prehook, /scanKnownShadowInlineStyles\(\);/,
+    'settings arrival scans inline styles already present in known roots');
 });
 
 test('content script rewrites URL references across inline CSS declarations', () => {
@@ -2509,6 +2583,12 @@ test('service worker never broadens CSP removal when response-header matching is
   assert.equal(fallbackRules.some(rule => rule.id === 2), false, 'unsupported header matching must preserve CSP');
   assert.ok(fallbackRules.some(rule => rule.id === 10), 'image redirect remains installed without CSP matching');
   const normalRules = sandbox.__buildRules(opts, false, false);
+  const regexRules = normalRules.filter(rule => typeof rule.condition.regexFilter === 'string');
+  assert.ok(regexRules.length > 0, 'the network rules include regex-based matches');
+  for (const rule of regexRules) {
+    assert.equal(rule.condition.isUrlFilterCaseSensitive, false,
+      `regex rule ${rule.id} explicitly keeps case-insensitive URL matching`);
+  }
   const csp = normalRules.find(rule => rule.id === 2);
   assert.deepEqual(JSON.parse(JSON.stringify(csp.condition.responseHeaders)), [
     { header: 'content-security-policy', values: ['*img-src*', '*default-src*'] }
