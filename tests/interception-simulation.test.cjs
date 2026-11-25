@@ -1785,6 +1785,12 @@ test('popup shows a site that cannot be excluded as not available, never as excl
 
 // Reads a top-level `const NAME = /.../flags;` regex literal from a source file,
 // so sandboxes use exactly the pattern the shipped code declares.
+function stringConst(source, name) {
+  const m = new RegExp(`const ${name} = "([^"]*)";`).exec(source);
+  assert.ok(m, `${name} must be declared`);
+  return m[1];
+}
+
 function constRegex(source, name) {
   const m = new RegExp(`const ${name} = (\\/.*\\/)([a-z]*);`).exec(source);
   assert.ok(m, `${name} must be declared`);
@@ -2173,8 +2179,12 @@ test('MAIN-world inline-style interception handles conflict URLs and preserves D
   const sandbox = {
     URL,
     destroyed: false,
+    ready: true,
     active: true,
     redirectLive: true,
+    HELD_URL_PREFIX: stringConst(prehook, 'HELD_URL_PREFIX'),
+    HELD_URL_RE: constRegex(prehook, 'HELD_URL_RE'),
+    queuePending() {},
     CSS_URL_RE: constRegex(prehook, 'CSS_URL_RE'),
     CONFLICT_RE: constRegex(prehook, 'CONFLICT_RE'),
     document: { baseURI: 'https://page.example/articles/' },
@@ -2191,7 +2201,8 @@ test('MAIN-world inline-style interception handles conflict URLs and preserves D
     setAttr: { call(el, name, value) { if (name === 'style') { el._style = String(value); el.writes++; } } }
   };
   vm.createContext(sandbox);
-  vm.runInContext(`${extractFunction(prehook, 'processInlineStyle')}\nthis.rewrite = processInlineStyle;`, sandbox);
+  vm.runInContext(['holdConflictStyle', 'restoreHeldStyle', 'processInlineStyle']
+    .map(name => extractFunction(prehook, name)).join('\n') + '\nthis.rewrite = processInlineStyle;', sandbox);
 
   const makeElement = style => ({
     nodeType: 1, baseURI: 'https://page.example/articles/', _style: style, writes: 0,
@@ -2212,6 +2223,49 @@ test('MAIN-world inline-style interception handles conflict URLs and preserves D
   assert.equal(fallback.writes, 1);
   assert.ok(fallback._style.includes(encodeURIComponent(ordinary)), 'DOM fallback proxies ordinary public URLs');
   assert.ok(fallback._style.includes('https://private.test/image.png'), 'private hosts remain direct');
+});
+
+test('inline-style conflict URLs are held before settings arrive and proxied exactly once when they do', () => {
+  const h = createDomHarness();
+  const original = 'https://cdn.example/held-style.png?w=40&quality=80';
+  const el = new h.Element('div');
+  el._attrs.set('style', `width:40px;background-image:url(${original})`);
+  h.notifyAdded(el);
+  const held = el.getAttribute('style');
+  assert.equal(held.includes(original), false, 'the original conflict URL is not in the DOM before settings');
+  assert.ok(held.includes('width:40px'), 'other declarations are untouched while held');
+
+  h.publishSettings();
+  const style = el.getAttribute('style');
+  const match = /url\("([^"]+)"\)/.exec(style);
+  assert.ok(match, 'a url() remains after settings');
+  assertProxied(match[1], original);
+  assert.equal(style.includes(original), false, 'the direct URL is never written back');
+  assert.ok(style.includes('width:40px'));
+});
+
+test('a held inline style is restored to its original URL when compression is disabled', () => {
+  const h = createDomHarness();
+  const original = 'https://cdn.example/disabled-style.png?w=40&quality=80';
+  const el = new h.Element('div');
+  el._attrs.set('style', `background-image:url(${original})`);
+  h.notifyAdded(el);
+  assert.equal(el.getAttribute('style').includes(original), false);
+
+  h.publishSettings({ enabled: false });
+  assert.equal(el.getAttribute('style'), `background-image:url("${original}")`,
+    'disabled compression leaves the page\'s own URL in place');
+});
+
+test('a held style rewritten by the page keeps its new declarations once settings arrive', () => {
+  const h = createDomHarness();
+  const original = 'https://cdn.example/rewritten.png?w=40&quality=80';
+  const el = new h.Element('div');
+  el._attrs.set('style', `background-image:url(${original})`);
+  h.notifyAdded(el);
+  el.setAttribute('style', 'color:red');   // page replaces its style while held
+  h.publishSettings();
+  assert.equal(el.getAttribute('style'), 'color:red', 'a page-written style without conflict URLs is left as written');
 });
 
 test('MAIN-world style observer covers attribute changes and already-populated shadow roots', () => {
@@ -2775,6 +2829,29 @@ test('service worker retries session-bypass initialization after a transient rul
   assert.equal(reads, 2);
   assert.equal(harness.sandbox.bypassRules.get('7 https://cdn.example/existing.png'), 100010);
   assert.equal(harness.sandbox.bypassNextId, 100011, 'the next ID starts above recovered session rules');
+});
+
+test('session-bypass initialization retries after a synchronous API throw instead of caching the failure', async () => {
+  let reads = 0;
+  const harness = functionFrom(serviceWorker, 'bypassReady', {
+    BYPASS_BASE_ID: 100000,
+    bypassInitialized: false,
+    bypassInitPromise: null,
+    bypassRules: new Map(),
+    bypassRegexRules: new Set(),
+    bypassNextId: 100000,
+    bypassUrlFromRule() { return ''; },
+    chrome: { declarativeNetRequest: { getSessionRules() {
+      reads++;
+      if (reads === 1) throw new TypeError('synchronous API failure');
+      return [];
+    } } }
+  });
+  assert.equal(await harness.fn(), false, 'a synchronous failure reports not ready');
+  assert.equal(harness.sandbox.bypassInitPromise, null, 'the failed promise is not cached');
+  assert.equal(await harness.fn(), true, 'the next call retries and succeeds');
+  assert.equal(harness.sandbox.bypassInitialized, true);
+  assert.equal(reads, 2);
 });
 
 test('service worker builds exact bypass matches for URLs containing DNR filter metacharacters', () => {
