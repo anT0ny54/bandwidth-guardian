@@ -92,14 +92,20 @@
     const r = safeURL(u);
     return r && /^https?:$/.test(r.protocol) ? r.href : null;
   };
+  function isLocalFragmentReference(value) { return String(value || "").trim().startsWith("#"); }
   const isHttp = u => /^https?:\/\//i.test(u);
   // Same tokenizer as service-worker.js / content.js / popup.js: split on commas
   // and ANY whitespace (a narrower class here let a pasted non-breaking space
   // glue two domains together, so this layer disagreed with the network rules).
+  // Only plain hostnames take part in exclusion (see EXCLUDE_HOST_RE in
+  // service-worker.js). Invalid entries are dropped here too, so this layer and
+  // the network rules never disagree about a site.
+  // KEEP IN SYNC with EXCLUDE_HOST_RE in service-worker.js / content.js / popup.js.
+  const EXCLUDE_HOST_RE = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$/;
   const toDomainSet = text => new Set(
     String(text || "").split(/[,\s]+/)
       .map(s => s.toLowerCase().replace(/^https?:\/\//, "").split("/")[0].replace(/\.$/, ""))
-      .filter(Boolean)
+      .filter(s => EXCLUDE_HOST_RE.test(s))
   );
 
   const SKIP_URL_RE = /favicon|\.(?:ico|svg)(?:[?#]|$)/i;
@@ -438,7 +444,9 @@
   const SETTINGS_WATCHDOG_MS = 5000;
   const settingsWatchdogTimer = setTimeout(() => {
     if (!destroyed && !ready) {
-      applyOpts({ enabled: false, proxyBase: "", quality: 60, grayscale: true, maxWidth: 768, excludeDomains: "" });
+      // Only `enabled` and `proxyBase` matter while proxying is off; the rest of the
+      // settings are never read, so no copy of the shared defaults is kept here.
+      applyOpts({ enabled: false, proxyBase: "" });
       flushPending();
     }
   }, SETTINGS_WATCHDOG_MS);
@@ -495,6 +503,7 @@
     const cands = parseSrcset(ss);
     let touched = false;
     const parts = cands.map(({ url, desc }) => {
+      if (isLocalFragmentReference(url)) return url + (desc ? " " + desc : "");
       const absolute = resolveHttp(url);
       // Non-conflict candidates stay untouched: the network redirect proxies
       // them, and rewriting them here as well would proxy them twice.
@@ -509,6 +518,7 @@
 
   function decideSrc(original) {
     if (!original || !String(original).trim()) return original; // clearing src
+    if (isLocalFragmentReference(original)) return original;
     const absolute = resolveHttp(original);
     if (!absolute) return original;
     if (isConfiguredProxyUrl(absolute)) return original; // don't double-wrap
@@ -920,6 +930,7 @@
     const out = [];
     String(text || "").replace(CSS_URL_RE, (_f, q, quoted, bare) => {
       const raw = String(q ? quoted : bare || "").trim();
+      if (isLocalFragmentReference(raw)) return _f;
       const r = raw ? safeURL(raw, base || document.baseURI) : null;
       const abs = r && /^https?:$/.test(r.protocol) ? stripHash(r.href) : null;
       if (abs) out.push(abs);

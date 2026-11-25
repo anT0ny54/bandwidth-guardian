@@ -63,6 +63,11 @@ const SKIP_PATTERN = "favicon|\\.(?:ico|svg)(?:[?#]|$)";
 // KEEP IN SYNC with CONFLICT_RE in prehook.js / content.js and with
 // PROXY_PARAMETER in bandwidth-hero-proxy2 functions/index.js.
 const CONFLICT_PATTERN = "&(?:quality|l|bw|jpeg|max_width)=";
+// A plain hostname (labels of letters, digits and inner hyphens). Every layer
+// that reads excludeDomains uses this same rule, so the network rules, the DOM
+// layers and the popup agree on which entries are honored.
+// KEEP IN SYNC with EXCLUDE_HOST_RE in prehook.js / content.js / popup.js.
+const EXCLUDE_HOST_RE = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$/;
 // Hosts a public proxy cannot (and must not) reach: bandwidth-hero-proxy2
 // rejects them with 403, so redirecting them would only add a failed round
 // trip and leak intranet URLs. localhost, *.localhost, *.local, single-label
@@ -1141,6 +1146,10 @@ const BREAKER_ALARM       = "bh-breaker-resume";
 const BREAKER_READ_RETRY_ALARM = "bh-breaker-read-retry";
 const RUNTIME_PUBLISH_RETRY_ALARM = "bh-runtime-publish-retry";
 let breakerFailures = [];
+// A failed session-storage write must still keep this worker's rules suspended
+// until the cooldown expires; the persisted value remains authoritative when
+// available, while this volatile floor covers the failed-write window.
+let breakerFallbackUntil = 0;
 let breakerReadRetryDelay = 1000;
 
 function scheduleBreakerReadRetry() {
@@ -1152,7 +1161,8 @@ function scheduleBreakerReadRetry() {
   } catch {}
 }
 
-function noteProxyResponse() { breakerFailures = []; }
+// Runs for every proxied response: only allocate when a failure is recorded.
+function noteProxyResponse() { if (breakerFailures.length) breakerFailures = []; }
 function noteGlobalProxyFailure() {
   const now = Date.now();
   breakerFailures = breakerFailures.filter(t => now - t < BREAKER_WINDOW_MS);
@@ -1160,24 +1170,64 @@ function noteGlobalProxyFailure() {
   if (breakerFailures.length < BREAKER_THRESHOLD) return;
   breakerFailures = [];
   const until = now + BREAKER_COOLDOWN_MS;
-  const done = () => refreshRules();
-  try { chrome.storage.session.set({ bhSuspendedUntil: until }, done); } catch { done(); }
-  try { chrome.alarms?.create(BREAKER_ALARM, { when: until + 50 }); } catch {}
+  // Establish the in-memory floor before yielding to storage. This closes the
+  // window where another rule refresh could run before the async write settles.
+  breakerFallbackUntil = Math.max(breakerFallbackUntil, until);
+  // Arm the resume alarm before the async write: storage can fail or invoke its
+  // callback synchronously in tests, but the cooldown must always be bounded.
+  scheduleBreakerResume(until + 50);
+  const persist = () => {
+    try {
+      chrome.storage.session.set({ bhSuspendedUntil: until }, () => {
+        if (chrome.runtime?.lastError) {
+          // Do not let a stale/empty storage read re-enable redirects after a
+          // failed write. readSuspended() and the resume alarm honor this floor.
+          breakerFallbackUntil = Math.max(breakerFallbackUntil, until);
+        } else if (breakerFallbackUntil <= until) {
+          // A successful write at this deadline supersedes an older fallback,
+          // but cannot clear a newer suspension opened while this write waited.
+          breakerFallbackUntil = 0;
+        }
+        refreshRules();
+      });
+    } catch {
+      breakerFallbackUntil = Math.max(breakerFallbackUntil, until);
+      refreshRules();
+    }
+  };
+  persist();
 }
 function scheduleBreakerResume(when) {
-  try { chrome.alarms?.create(BREAKER_ALARM, { when }); } catch {}
+  try {
+    const created = chrome.alarms?.create(BREAKER_ALARM, { when });
+    if (created && typeof created.catch === "function") created.catch(() => {});
+  } catch {}
 }
 function resumeBreakerIfExpired() {
   const retry = () => scheduleBreakerResume(Date.now() + 1000);
   try {
     chrome.storage.session.get({ bhSuspendedUntil: 0 }, data => {
       if (chrome.runtime?.lastError) { retry(); return; }
-      const until = Number(data?.bhSuspendedUntil) || 0;
-      if (!until) return; // Another alarm or lifecycle event already cleared it.
+      const storedUntil = Number(data?.bhSuspendedUntil) || 0;
+      const until = Math.max(storedUntil, breakerFallbackUntil);
+      if (!until) {
+        // A worker restart can discard the in-memory fallback after a failed
+        // session write. The expiry alarm still proves the cooldown elapsed;
+        // rebuild from current settings instead of leaving redirects disabled.
+        refreshRules();
+        return;
+      }
       if (until > Date.now()) {
         // An older alarm can fire after an in-flight request extends the
         // suspension. Keep the newer deadline and replace the stale alarm.
         scheduleBreakerResume(until + 50);
+        return;
+      }
+      if (breakerFallbackUntil && breakerFallbackUntil <= Date.now()) breakerFallbackUntil = 0;
+      if (!storedUntil) {
+        // The session write failed: there is no stored key to remove, but the
+        // in-memory fail-safe has now expired and the normal rules can return.
+        refreshRules();
         return;
       }
       try {
@@ -1216,7 +1266,10 @@ function readSuspended(cb) {
         const cleared = chrome.alarms?.clear(BREAKER_READ_RETRY_ALARM);
         if (cleared && typeof cleared.catch === "function") cleared.catch(() => {});
       } catch {}
-      cb(Number(d?.bhSuspendedUntil) > Date.now());
+      const now = Date.now();
+      const fallbackUntil = breakerFallbackUntil;
+      if (fallbackUntil && fallbackUntil <= now) breakerFallbackUntil = 0;
+      cb(Math.max(Number(d?.bhSuspendedUntil) || 0, fallbackUntil) > now);
     });
   } catch { unavailable(); }
 }
@@ -1226,7 +1279,7 @@ function parseExcluded(text) {
   // DNR rejects the whole update on an invalid domain — pass only valid hosts.
   var excluded = String(text || "").split(/[,\s]+/)
     .map(function(s) { return s.toLowerCase().replace(/^https?:\/\//, "").split("/")[0].replace(/\.$/, ""); })
-    .filter(function(s) { return /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$/.test(s); });
+    .filter(function(s) { return EXCLUDE_HOST_RE.test(s); });
   return Array.from(new Set(excluded));
 }
 
@@ -1274,7 +1327,10 @@ function buildRules(opts, noHeaderMatch, suspended) {
       resourceTypes: ["main_frame", "sub_frame"],
       responseHeaders: [{ header: "content-security-policy", values: ["*img-src*", "*default-src*"] }]
     };
-    if (excludedDomains.length) cspCondition.excludedRequestDomains = excludedDomains;
+    if (excludedDomains.length) {
+      cspCondition.excludedRequestDomains = excludedDomains;
+      cspCondition.excludedInitiatorDomains = excludedDomains;
+    }
     addRules.push({
       id: RULE_ID_CSP,
       priority: PRIORITY_HEADERS,

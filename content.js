@@ -83,16 +83,15 @@
   // Known lazy-loader attributes. These are signals only: their values are
   // never changed or proxied directly. The loader's eventual src/srcset write
   // is intercepted by prehook, after any template tokens have been resolved.
-  const DEFERRED_SOURCE_ATTRS = [
-    "data-src", "data-srcset", "data-lazy-src", "data-lazy-srcset",
-    "data-original", "data-original-src", "data-original-set",
-    "data-image-src", "data-image-srcset", "data-bg", "data-bgset"
-  ];
   const DEFERRED_URL_ATTRS = {
     src: ["data-src", "data-lazy-src", "data-original", "data-original-src", "data-image-src"],
     srcset: ["data-srcset", "data-lazy-srcset", "data-original-set", "data-image-srcset"]
   };
+  // Every URL-bearing lazy attribute, plus the CSS background-only signals.
+  const DEFERRED_SOURCE_ATTRS = [...DEFERRED_URL_ATTRS.src, ...DEFERRED_URL_ATTRS.srcset, "data-bg", "data-bgset"];
   const TEMPLATE_SOURCE_RE = /(?:\$\{[^}]*\}|\{\{?[^}]*\}\}?|%7b[^%]*%7d|__[^_\s]+__)/i;
+  // CSS url(...) references in inline style text (global: used only with replace()).
+  const CSS_URL_RE = /url\(\s*(?:(['"])(.*?)\1|([^)]*?))\s*\)/gi;
 
   let opts = null;
   // Revisions prevent an asynchronous startup snapshot from overwriting a
@@ -103,7 +102,7 @@
   let active = false; // enabled && proxyBase set && !pageExcluded (O1)
   let proxyConfig = null;
   let proxyOrigin = "";  // C2: origin-based identity, matching the worker
-  let proxyHost = "";    // hostname only, for srcset substring checks
+  let proxyHost = "";    // normalized host (including port), for srcset checks
   let destroyed = false;
   const proxyUrlCache = new Map();
   const PROXY_CACHE_LIMIT = 512;
@@ -136,12 +135,19 @@
     const r = safeURL(u);
     return r && /^https?:$/.test(r.protocol) ? r.href : null;
   };
+  // CSS/SVG fragment references (url(#mask), url(#gradient)) name an element
+  // in the current document, not a network image. Preserve them in fallback mode.
+  function isLocalFragmentReference(value) { return String(value || "").trim().startsWith("#"); }
 
+  // Only plain hostnames take part in exclusion. KEEP IN SYNC with EXCLUDE_HOST_RE
+  // in service-worker.js / prehook.js / popup.js, so the DOM layer and the
+  // network rules agree on every entry.
+  const EXCLUDE_HOST_RE = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$/;
   function domainSet(text) {
     return new Set(
       String(text || "").split(/[,\s]+/)
         .map(s => s.toLowerCase().replace(/^https?:\/\//, "").split("/")[0].replace(/\.$/, ""))
-        .filter(Boolean)
+        .filter(s => EXCLUDE_HOST_RE.test(s))
     );
   }
 
@@ -293,6 +299,7 @@
     if (cached && (cached.input === ss || cached.output === ss)) return cached.output;
     let touched = false;
     const parts = parseSrcset(ss).map(({ url, desc }) => {
+      if (isLocalFragmentReference(url)) return url + (desc ? " " + desc : "");
       const absolute = resolveHttp(url);
       if (!absolute || shouldSkip(absolute)) return url + (desc ? " " + desc : "");
       touched = true;
@@ -461,7 +468,7 @@
 
     if (el.tagName === "IMG" && !hasDeferredLazySource(el, "src")) {
       const src = el.getAttribute("src");
-      const absoluteSrc = src ? resolveHttp(src) : null;
+      const absoluteSrc = src && !isLocalFragmentReference(src) ? resolveHttp(src) : null;
       if (absoluteSrc && !shouldSkip(absoluteSrc) && nativeImgSrcSetter) {
         armProxyFallback(el, absoluteSrc, "");
         nativeImgSrcSetter.call(el, buildProxyUrl(absoluteSrc));
@@ -491,10 +498,10 @@
     const style = el.getAttribute("style");
     if (!style || !/\burl\(/i.test(style)) return;
 
-    const urlRe = /url\(\s*(?:(['"])(.*?)\1|([^)]*?))\s*\)/gi;
     let touched = false;
-    const output = style.replace(urlRe, (full, quote, quoted, bare) => {
+    const output = style.replace(CSS_URL_RE, (full, quote, quoted, bare) => {
       const raw = String(quote ? quoted : bare || "").trim();
+      if (isLocalFragmentReference(raw)) return full;
       const absolute = raw ? resolveHttp(raw) : null;
       if (!absolute || shouldSkip(absolute)) return full;
       touched = true;

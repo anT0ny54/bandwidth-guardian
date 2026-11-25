@@ -137,7 +137,14 @@ their module scripts.
   pages load images directly; an alarm then resumes proxying automatically. If
   the suspension state cannot be read from session storage, that rule refresh
   also keeps redirects off and schedules a separate, backoff-limited refresh
-  until the state can be read safely.
+  until the state can be read safely. If writing the suspension fails, the
+  worker establishes a fail-safe deadline in memory before attempting the
+  storage write, so concurrent rule refreshes cannot treat an empty storage
+  value as an expired breaker. If the write fails, the resume alarm rebuilds
+  rules when the cooldown expires, including after a service-worker restart.
+  Alarm setup handles both synchronous API errors and rejected Promise results;
+  every rule refresh also checks the persisted and in-memory deadlines, so a
+  delayed alarm cannot reopen proxying before the cooldown expires.
   Only recognized Chromium transport, DNS and proxy-path errors count
   (for example `ERR_CONNECTION_REFUSED`, `ERR_CONNECTION_TIMED_OUT`,
   `ERR_PROXY_CONNECTION_FAILED`, `ERR_SOCKS_CONNECTION_FAILED` and
@@ -157,8 +164,10 @@ their module scripts.
 `service-worker.js` also injects `Save-Data: on` and strips CSP only while the
 proxy is valid, enabled, and not temporarily suspended by the circuit breaker
 (only on documents whose CSP references `img-src`/`default-src`). Excluded
-domains always keep their own CSP, and CSP remains intact while the breaker is
-open. **Security impact:** when a response matches, Chromium's DNR `remove`
+domains are excluded both as resource hosts and as request initiators, so an
+excluded page also preserves CSP on embedded subframes hosted elsewhere. CSP
+remains intact while the breaker is open. **Security impact:** when a response
+matches, Chromium's DNR `remove`
 operation removes **all `Content-Security-Policy` response-header entries** for
 that response—not just the matching `img-src`/`default-src` policy or directive.
 Other CSP headers and unrelated protections such as `script-src` and
@@ -178,7 +187,7 @@ can then block the proxy on that browser configuration.
 | `quality` | `60` | 1–100 |
 | `grayscale` | `true` | Server-side grayscale (`bw=1`) |
 | `maxWidth` | `768` | `0` = no limit |
-| `excludeDomains` | `""` | Comma/space/newline separated (any whitespace); subdomains match; entries other than plain host names (ports, wildcards) are ignored |
+| `excludeDomains` | `""` | Comma/space/newline separated (any whitespace); subdomains match; only plain hostnames count (letters, digits and inner hyphens per label). Entries with ports, wildcards, underscores or other characters are ignored by every layer, and the popup shows such a site as not available rather than excluded |
 
 Settings changed on one surface (popup vs. options page) stay in sync on the
 other. Popup and options-page startup reads are revision-guarded: a delayed
@@ -211,7 +220,10 @@ page reloads persisted switch values while preserving dirty text and preset edit
 A failed reset reports the error without clearing unsaved edits.
 Popup settings and site-exclusion reads/writes also report storage errors.
 These write actions share a short lock that disables writable popup controls,
-preventing rapid changes from issuing overlapping storage writes. Failed
+preventing rapid changes from issuing overlapping storage writes. When the lock
+is released, the site-exclusion action is re-enabled only for a valid web
+hostname; an invalid hostname stays unavailable even after an unrelated setting
+write completes. Failed
 optimistic settings changes are rolled back only when no newer cross-page setting
 has arrived, and unrelated sync keys are ignored. If a boolean setting key is
 removed from sync storage, the settings page restores its shared default rather
@@ -276,7 +288,7 @@ icon in an older state.
 | `srcset`, `sizes`, `<picture>`, `<source>` | Network redirect applies to whichever candidate Chrome selects; DOM layer rewrites every candidate and keeps descriptors | viewport growth, media switching |
 | `<link rel="preload" as="image">`, `imagesrcset` | Network redirect; preload and `<img>` share one proxied request | attribute changes, de-duplication |
 | Lazy loading (`loading=lazy`, `data-src`, `data-srcset`, framework loaders) | The URL is redirected when the loader actually activates it | nothing requested early |
-| Inline, same-origin, cross-origin and `@import` stylesheet backgrounds, multiple backgrounds, `image-set()`, `@media` | Network redirect (no CSSOM access needed, so cross-origin sheets are covered) | each case |
+| Inline, same-origin, cross-origin and `@import` stylesheet backgrounds, multiple backgrounds, `image-set()`, `@media` | Network redirect (no CSSOM access needed, so cross-origin sheets are covered); DOM fallback rewrites remote inline-style URLs but preserves same-document fragment references such as `url(#mask)` | each case |
 | CSS pseudo-elements `::before`/`::after` | Network redirect | computed-style + request check |
 | Open, closed and declarative shadow roots | Network redirect; `attachShadow` is wrapped so the DOM layer also observes roots | all three |
 | SVG `<image href>` / `xlink:href` | Redirected; `<use>` sprite references and `.svg` files are left alone, fragments intact | fragments preserved |
@@ -330,7 +342,7 @@ when a sync key is removed), stale startup settings and stats snapshots across
 the content script, service worker, popup and options page, stale proxy-observer
 restores, popup tab lookup failures,
 invalid tab URLs, exclusion clicks racing with tab changes, popup storage errors,
-write-lock behavior and failed optimistic writes, options saves waiting for
+write-lock behavior (including invalid-host exclusion state) and failed optimistic writes, options saves waiting for
 successful startup reads, cross-page updates and edits during pending writes,
 reload decisions based on the final committed settings, Proxy Test/Reset
 exclusion, reset/autosave queue ordering, reset invalidation of stale startup
@@ -338,8 +350,8 @@ snapshots and recovery callbacks, transient session-bypass initialization
 failures, oversized bypass filters, DNR-failure retry bookkeeping, live-rule
 state recovery, runtime-publication alarm retries, global bypass capacity across
 tabs, reserved proxy query validation, safe custom-width validation,
-case-insensitive CSS fallback, unique IDs across all extension and browser HTML
-pages, and static popup/settings selectors that resolve against their markup.
+case-insensitive CSS fallback, same-document CSS/SVG fragment preservation in DOM fallback and retry scanning, unique IDs across all extension and browser HTML
+pages, static popup/settings selectors that resolve against their markup, and one exclusion hostname rule shared by the network rules, both DOM layers and the popup (a regression test runs the same input through each layer).
 The browser suite skips unless both `playwright-core` and a valid `CHROME_PATH`
 are available. The simulation suite also locks down the proxy-response boundary
 for missing `Content-Type` headers: unknown MIME types are not counted or
@@ -400,6 +412,12 @@ Releasing is handled by `.github/workflows/build.yml`. Every push to `main`
 builds the extension. If a release for the manifest version does not exist, the
 workflow creates it; if that release already exists, it replaces the release
 asset. Bump `manifest.json`'s version when publishing a distinct release.
+
+The build workflow token is read-only by default for the test and build jobs;
+only the release job receives `contents: write` to publish the ZIP. This keeps
+write access out of jobs that install and execute test-time dependencies. The
+separate Keep-Fork-Alive workflow grants `contents: write` only to its commit
+job, not at workflow scope.
 
 See [Fallback, loops and the circuit breaker](#fallback-loops-and-the-circuit-breaker)
 for the failure classification, two-in-10-seconds threshold and 40-second

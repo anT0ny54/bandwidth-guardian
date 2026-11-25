@@ -1,5 +1,10 @@
 const $ = id => document.getElementById(id);
 
+// Only plain hostnames can be excluded. KEEP IN SYNC with EXCLUDE_HOST_RE in
+// service-worker.js, prehook.js and content.js: the popup must not report a
+// site as excluded when the network layer would still compress it.
+const EXCLUDE_HOST_RE = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$/;
+
 const enabledEl   = $("enabled");
 const grayscaleEl = $("grayscale");
 const ctrlCard    = $("ctrlCard");
@@ -27,7 +32,7 @@ function setPopupStorageBusy(busy) {
   enabledEl.disabled = busy;
   grayscaleEl.disabled = busy;
   presetBtns.forEach(btn => { btn.disabled = busy; });
-  excludeBtn.disabled = busy || !currentIsWeb;
+  excludeBtn.disabled = busy || !currentIsWeb || !EXCLUDE_HOST_RE.test(currentHost);
 }
 
 function markSettingsRevision(key) {
@@ -44,7 +49,8 @@ function parseDomains(text) {
 }
 
 function findExcludedDomain(host, domains) {
-  return domains.find(domain => host === domain || host.endsWith(`.${domain}`)) || "";
+  return domains.find(domain => EXCLUDE_HOST_RE.test(domain) &&
+    (host === domain || host.endsWith(`.${domain}`))) || "";
 }
 
 function removeDomainToken(text, excludedDomain) {
@@ -236,6 +242,11 @@ async function loadSiteUI(d) {
 
   siteNameEl.textContent = currentHost;
   excludeBtn.disabled = popupStorageWriteInProgress;
+  if (!EXCLUDE_HOST_RE.test(currentHost)) {
+    // Not a plain hostname (e.g. underscores): exclusion cannot apply to it.
+    setUnavailable(currentHost);
+    return;
+  }
 
   const excluded = parseDomains(d.excludeDomains);
   if (findExcludedDomain(currentHost, excluded)) {
@@ -252,7 +263,8 @@ async function loadSiteUI(d) {
 // ── Exclude / re-include current site ─────────────────────────────────────────
 
 async function toggleSiteExclusion() {
-  if (!currentIsWeb || !currentHost || popupStorageWriteInProgress) return;
+  if (!currentIsWeb || !currentHost || popupStorageWriteInProgress ||
+      !EXCLUDE_HOST_RE.test(currentHost)) return;
   setPopupStorageBusy(true);
   try {
     const host = currentHost;
