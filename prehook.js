@@ -123,6 +123,10 @@
   const CONFLICT_RE = /&(?:quality|l|bw|jpeg|max_width)=/i;
   const CSS_URL_RE = /url\(\s*(?:(['"])(.*?)\1|([^)]*?))\s*\)/gi;
   const INLINE_STYLE_SELECTOR = "[style*='url(' i]";
+  // Inert stand-in for a conflict url() while settings are unknown. The original
+  // URL is encoded inside it, so restoring needs no per-element state.
+  const HELD_URL_PREFIX = "data:,bh-held:";
+  const HELD_URL_RE = /url\("data:,bh-held:([^"]*)"\)/g;
   // true when THIS layer (not the network redirect) must proxy the URL.
   const domHandles = absolute => !redirectLive || CONFLICT_RE.test(absolute);
   // Before settings arrive, only URLs that the DOM layer would have to proxy
@@ -341,6 +345,7 @@
     const toFlush = Array.from(pending);
     pending.clear();
     for (const el of toFlush) {
+      processInlineStyle(el); // restores a held style, then proxies or leaves it direct
       try {
         if (el instanceof HTMLLinkElement) { processPreloadLink(el); continue; }
         if (el instanceof HTMLImageElement && loadingDesc && loadingDesc.set) {
@@ -659,12 +664,41 @@
   // contract cannot safely carry them. Unlike the isolated-world observer,
   // this MAIN-world path can also watch attached shadow roots (including closed
   // roots), so inline style attributes there receive the same DOM treatment.
+  //
+  // Before settings arrive, a conflict url() must not be fetched: DNR does not
+  // cover it and the proxy decision is still unknown. Such a url() is swapped
+  // for HELD_URL_PREFIX and the element waits in `pending`. Other declarations
+  // are untouched, so a page that writes its style meanwhile keeps them.
+  function holdConflictStyle(el, style) {
+    const held = style.replace(CSS_URL_RE, (full, quote, quoted, bare) => {
+      const raw = String(quote ? quoted : bare || "").trim();
+      if (!raw || isLocalFragmentReference(raw)) return full;
+      const resolved = safeURL(raw, el.baseURI || document.baseURI);
+      if (!resolved || !/^https?:$/.test(resolved.protocol) || !CONFLICT_RE.test(resolved.href)) return full;
+      return `url("${HELD_URL_PREFIX}${encodeURIComponent(raw)}")`;
+    });
+    if (held === style) return;
+    setAttr.call(el, "style", held);
+    queuePending(el);
+  }
+
+  // Rebuild the original url() values from their placeholders (exact inverse).
+  function restoreHeldStyle(style) {
+    return style.replace(HELD_URL_RE, (full, encoded) => {
+      let raw;
+      try { raw = decodeURIComponent(encoded); } catch { return full; }
+      return `url("${raw.replace(/["\\]/g, "\\$&")}")`;
+    });
+  }
+
   function processInlineStyle(el) {
     try {
-      if (destroyed || !active || !el || el.nodeType !== 1) return;
+      if (destroyed || !el || el.nodeType !== 1) return;
       const style = el.getAttribute("style");
       if (!style || !/\burl\(/i.test(style)) return;
-      const output = style.replace(CSS_URL_RE, (full, quote, quoted, bare) => {
+      if (!ready) { holdConflictStyle(el, style); return; }
+      const current = style.includes(HELD_URL_PREFIX) ? restoreHeldStyle(style) : style;
+      const output = !active ? current : current.replace(CSS_URL_RE, (full, quote, quoted, bare) => {
         const raw = String(quote ? quoted : bare || "").trim();
         if (!raw || isLocalFragmentReference(raw)) return full;
         const resolved = safeURL(raw, el.baseURI || document.baseURI);

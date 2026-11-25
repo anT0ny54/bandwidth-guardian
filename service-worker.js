@@ -856,31 +856,31 @@ let bypassInitPromise = null;
 // operation instead of allocating IDs that may already exist in Chrome.
 function bypassReady() {
   if (bypassInitialized) return Promise.resolve(true);
-  if (bypassInitPromise) return bypassInitPromise;
-  let initialization;
-  initialization = (async () => {
-    try {
-      const rules = await chrome.declarativeNetRequest.getSessionRules();
-      for (const r of rules) {
-        if (r.id < BYPASS_BASE_ID) continue;
-        const url = bypassUrlFromRule(r);
-        if (!url) continue;
-        const tab = r.condition?.tabIds?.[0] ?? -1;
-        const key = tab + " " + url;
-        bypassRules.set(key, r.id);
-        if (r.condition?.regexFilter) bypassRegexRules.add(key);
-        bypassNextId = Math.max(bypassNextId, r.id + 1);
+  if (!bypassInitPromise) {
+    // Clear the cache with .finally(), which runs after the promise is stored.
+    // Clearing inside the async body would run before the assignment when the
+    // API throws synchronously, and a failed result would then be cached forever.
+    bypassInitPromise = (async () => {
+      try {
+        const rules = await chrome.declarativeNetRequest.getSessionRules();
+        for (const r of rules) {
+          if (r.id < BYPASS_BASE_ID) continue;
+          const url = bypassUrlFromRule(r);
+          if (!url) continue;
+          const tab = r.condition?.tabIds?.[0] ?? -1;
+          const key = tab + " " + url;
+          bypassRules.set(key, r.id);
+          if (r.condition?.regexFilter) bypassRegexRules.add(key);
+          bypassNextId = Math.max(bypassNextId, r.id + 1);
+        }
+        bypassInitialized = true;
+        return true;
+      } catch {
+        return false;
       }
-      bypassInitialized = true;
-      return true;
-    } catch {
-      return false;
-    } finally {
-      if (bypassInitPromise === initialization) bypassInitPromise = null;
-    }
-  })();
-  bypassInitPromise = initialization;
-  return initialization;
+    })().finally(() => { bypassInitPromise = null; });
+  }
+  return bypassInitPromise;
 }
 
 function queueBypassOperation(operation, notReadyValue) {

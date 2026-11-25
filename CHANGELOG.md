@@ -13,8 +13,19 @@ This file keeps only the latest release and modification log.
 - The settings page said that saving always reloads the page that opened it. The
   page is now reloaded only when a saved value differs from the stored one, and the
   hint says so.
+- Inline `style` URLs that contain a conflict parameter (`&quality=`, `&bw=`, …) could
+  be fetched directly when the page wrote them before compression settings reached the
+  MAIN-world script. They are now held until settings arrive, then proxied once. A
+  pending style keeps its other declarations, and disabling compression restores the
+  page's own URL. This made the real-browser shadow-root test fail in CI.
+- A failed session-bypass initialization was cached permanently when the
+  `declarativeNetRequest.getSessionRules()` call threw synchronously, so per-tab
+  bypass rules were never installed until the worker restarted. The failure is now
+  retried on the next operation.
 
 ### Changed
+- The release job reads the version from the build job's output instead of reading
+  `manifest.json` again. The bhp2 checkout fetches only its working tree.
 - The proxy-origin recovery steps that were duplicated between the synced-settings
   path and the local-mirror recovery path are now a single helper in the service
   worker. Behaviour is unchanged: both paths mark the observer ready, replay queued
@@ -30,6 +41,7 @@ This file keeps only the latest release and modification log.
 
 ### Removed
 - An unused `controls` class on the popup's controls card.
+- A duplicate `button, input` rule in the popup stylesheet, merged into one.
 - An unused `legacy` flag from the browser test's mock URL parser. The mock returns
   only the original URL, which is the only field any caller reads.
 

@@ -96,6 +96,13 @@ and the extension pages load it before their module scripts.
    coverage requires the DNR rules to install successfully. Private/intranet and
    excluded-host exemptions still apply in DOM fallback mode.
 
+   Until settings reach the MAIN-world script, a conflict URL inside an inline
+   `style` attribute is not left to load. Its `url()` is replaced by an inert
+   `data:` placeholder that encodes the original URL, and the element waits.
+   Once settings arrive the original is rebuilt and proxied once; if compression is
+   disabled, the page's own URL is restored and loads directly. Other declarations
+   are never changed while the element waits.
+
    `prehook.js` and `content.js` intentionally keep small URL-classification and
    parsing helpers in sync: Chrome runs them in separate MAIN and isolated
    JavaScript worlds, so they cannot import one shared runtime implementation.
@@ -368,7 +375,7 @@ snapshots and recovery callbacks, transient session-bypass initialization
 failures, oversized bypass filters, DNR-failure retry bookkeeping, live-rule
 state recovery, runtime-publication alarm retries, global bypass capacity across
 tabs, reserved proxy query validation, safe custom-width validation,
-case-insensitive CSS fallback, MAIN-world inline-style rewriting in observed shadow roots, same-document CSS/SVG fragment preservation in DOM fallback and retry scanning, unique IDs across all extension and browser HTML
+case-insensitive CSS fallback, MAIN-world inline-style rewriting in observed shadow roots, pre-settings holding and restoration of conflict-URL inline styles, synchronous-throw recovery of the session-bypass initialization, same-document CSS/SVG fragment preservation in DOM fallback and retry scanning, unique IDs across all extension and browser HTML
 pages, static popup/settings selectors that resolve against their markup, and one exclusion hostname rule shared by the network rules, both DOM layers and the popup (a regression test runs the same input through each layer).
 The browser suite skips unless both `playwright-core` and a valid `CHROME_PATH`
 are available. A skipped suite means no real-browser checks ran; it is not a passing
