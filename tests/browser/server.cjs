@@ -76,17 +76,17 @@ function loadGetImageUrl() {
   return { source: 'builtin', fn(event = {}) {
     const raw = String(event.rawQuery ?? '').replace(/^\?/, '');
     const match = /(?:^|&)url=/.exec(raw);
-    if (!match) return { url: '', legacy: false };
+    if (!match) return { url: '' };
     let value = raw.slice(match.index + match[0].length);
     if (/^https?:\/\//i.test(value)) {
       const end = value.search(PROXY_PARAMETER);
       if (end >= 0) value = value.slice(0, end);
-      return { url: value, legacy: value.includes('&') };
+      return { url: value };
     }
     const end = value.indexOf('&');
     if (end >= 0) value = value.slice(0, end);
-    try { return { url: decodeURIComponent(value.replace(/\+/g, ' ')), legacy: false }; }
-    catch { return { url: value, legacy: false }; }
+    try { return { url: decodeURIComponent(value.replace(/\+/g, ' ')) }; }
+    catch { return { url: value }; }
   } };
 }
 const getImageUrl = loadGetImageUrl();
@@ -106,6 +106,10 @@ function createServer({ pagesDir }) {
     // Requests are logged when they reach the server. Whether Chrome actually
     // completed a response is decided browser-side (see recordNetwork in the
     // browser test), not from this log.
+    // Upstream fetches made by the mock proxy itself carry x-from-proxy and are
+    // not browser requests. Flag the entry it belongs to, rather than whichever
+    // entry happened to be logged last.
+    entry.fromProxy = !!req.headers['x-from-proxy'];
     if (u.pathname !== '/favicon.ico') log.push(entry);
 
     try {
@@ -197,9 +201,7 @@ function createServer({ pagesDir }) {
     res.end(body);
   }
 
-  // Requests made by the mock proxy itself are not browser requests.
   const browserLog = () => log.filter(e => !e.fromProxy);
-  server.on('request', req => { if (req.headers['x-from-proxy']) { const last = log[log.length - 1]; if (last) last.fromProxy = true; } });
 
   return { server, log, browserLog, state, getImageUrlSource: getImageUrl.source };
 }

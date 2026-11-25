@@ -82,12 +82,17 @@ async function recordNetwork(page) {
   cdp.on('Network.loadingFinished', e => { rec(e.requestId).finished = true; });
   cdp.on('Network.loadingFailed', e => { rec(e.requestId).failed = e.errorText; });
 }
-// Completed proxy responses (as Chrome saw them) whose proxy URL names one of
-// the given original path prefixes. The raw form and the encoded form both match.
-function completedProxyResponses(page, prefixes) {
+// Proxy responses Chrome recorded (finished, failed or unfinished) whose proxy
+// URL names one of the given original path prefixes. The raw and encoded forms
+// both match.
+function proxyResponses(page, prefixes) {
   const hit = r => r.urls.some(u => u.startsWith(`http://proxy.test:${PORT}/`) &&
     prefixes.some(p => u.includes(p) || u.includes(encodeURIComponent(p))));
-  return netLog.filter(r => r.page === page && r.finished && !r.failed && hit(r));
+  return netLog.filter(r => r.page === page && hit(r));
+}
+// Only responses Chrome reports as finished and not failed or cancelled.
+function completedProxyResponses(page, prefixes) {
+  return proxyResponses(page, prefixes).filter(r => r.finished && !r.failed);
 }
 // Wait until an element has actually loaded the candidate we just selected.
 // currentSrc is the proxy URL for proxied candidates and the original otherwise.
@@ -284,10 +289,12 @@ test.describe('Bandwidth Guardian in Chrome', { skip: SKIP }, () => {
 
   test('open, closed and declarative shadow roots', async () => {
     const page = await open('shadow.html');
-    const expected = ['open.png', 'open-bg.png', 'closed.png', 'closed-bg.png', 'closed-late.png', 'dsd.png'];
+    const expected = ['open.png', 'open-bg.png', 'closed.png', 'closed-bg.png', 'closed-late.png', 'dsd.png',
+      'open-inline.png', 'closed-inline.png', 'closed-late-inline.png', 'dsd-inline.png'];
     await until(() => expected.every(u => proxied('/img/shadow/' + u).length), 6000);
     for (const u of expected) assert.equal(proxied('/img/shadow/' + u).length, 1, u);
     assert.deepEqual(direct('/img/shadow/').map(e => e.url), []);
+    assertNoDuplicates('/img/shadow/');
     const closed = await page.evaluate(() => window.__closedImgs());
     assert.ok(closed.every(([, c, w]) => c && w > 0), JSON.stringify(closed));
     await page.close();
@@ -410,15 +417,21 @@ test.describe('Bandwidth Guardian in Chrome', { skip: SKIP }, () => {
     // request and whether Chrome reports it as finished can disagree, so it is
     // treated as ambiguous: every other response must match exactly, and each
     // ambiguous response may add at most one count.
+    // The ambiguous request can also be reported by Chrome as failed (cancelled
+    // after its bytes arrived) or never finished, so ambiguity is evaluated over
+    // every proxy response Chrome recorded, not only the finished ones. The
+    // extension counts from webRequest completion, which can still fire for it.
     const strictImageTypes = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/tiff', 'image/jxl']);
     const isSuccess = r => r.status >= 200 && r.status < 300 && strictImageTypes.has(String(r.mime || '').toLowerCase());
-    const completed = completedProxyResponses(page, ['/img/fallback/', '/img/reused-node/']);
+    const prefixes = ['/img/fallback/', '/img/reused-node/'];
+    const recorded = proxyResponses(page, prefixes);
+    const completed = recorded.filter(r => r.finished && !r.failed);
     const isAmbiguous = r => r.urls.some(u => u.includes('/img/fallback/picture-fallback.png') || u.includes(encodeURIComponent('/img/fallback/picture-fallback.png')));
     const certain = completed.filter(r => !isAmbiguous(r) && isSuccess(r)).length;
-    const ambiguousPossible = completed.filter(r => isAmbiguous(r) && (isSuccess(r) || !r.status)).length;
+    const ambiguousPossible = recorded.filter(r => isAmbiguous(r) && (isSuccess(r) || !r.status)).length;
     const counted = await settledStats();
     const delta = counted - statsBefore;
-    const dump = JSON.stringify(completed.map(r => ({ url: r.urls.at(-1), status: r.status, mime: r.mime, finished: !!r.finished, failed: r.failed || null })));
+    const dump = JSON.stringify(recorded.map(r => ({ url: r.urls.at(-1), status: r.status, mime: r.mime, finished: !!r.finished, failed: r.failed || null })));
     assert.ok(delta >= certain && delta <= certain + ambiguousPossible,
       `extension counted ${delta}; browser-confirmed ${certain} (+ up to ${ambiguousPossible} ambiguous); browser-side: ${dump}`);
   });
