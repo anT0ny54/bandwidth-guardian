@@ -162,9 +162,7 @@
     return false;
   }
 
-  // Keep settings equality aligned with the service worker: compare exactly
-  // the keys defined by DEFAULTS so both execution worlds refresh together.
-  const sameOpts = (a, b) => !!a && !!b && Object.keys(DEFAULTS).every(k => a[k] === b[k]);
+  // sameOpts() comes from defaults.js, shared with the service worker.
 
   // Skip decision for a RESOLVED absolute http(s) URL (O4: parsed once here).
   function shouldSkip(absolute) {

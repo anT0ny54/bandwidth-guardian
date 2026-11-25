@@ -12,3 +12,9 @@ var DEFAULTS = Object.freeze({
   maxWidth:        768,   // 0 = no limit; MV3-specific addition
   excludeDomains:  "",
 });
+
+// True when two settings objects agree on every key in DEFAULTS. Used by the
+// worker and the isolated content script to skip redundant re-applies.
+function sameOpts(a, b) {
+  return !!a && !!b && Object.keys(DEFAULTS).every(k => a[k] === b[k]);
+}

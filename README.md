@@ -40,10 +40,10 @@ excluded domains and private-network hosts are never proxied.
 ## How it works
 
 Interception happens in two layers, so an image request is rewritten exactly
-once and before Chrome starts it. Shared settings defaults live in one frozen,
-classic `defaults.js`; the service worker imports it, the isolated content
-script receives it before `content.js`, and the extension pages load it before
-their module scripts.
+once and before Chrome starts it. Shared settings defaults and the
+settings-equality helper live in one frozen, classic `defaults.js`; the service
+worker imports it, the isolated content script receives it before `content.js`,
+and the extension pages load it before their module scripts.
 
 1. **Network layer (primary), `service-worker.js`.** A declarativeNetRequest
    `redirect` rule (`regexFilter ^https?://.+`, resource type `image`, plus
@@ -68,10 +68,12 @@ their module scripts.
      literals (including IPv4-mapped IPv6 and the full `fe80::/10` link-local
      range; a public proxy cannot reach them).
    - **Conflict URLs:** URLs containing `&quality=`, `&l=`, `&bw=`, `&jpeg=` or
-     `&max_width=` (matched case-insensitively, like DNR regex filters) would
+     `&max_width=` (matched case-insensitively by explicitly configured DNR
+     regex rules) would
      be truncated by the raw contract, so the network rule skips them and the
      DOM layer proxies them URL-encoded on supported DOM surfaces (`src`,
-     `srcset`, image preloads and inline `style` attributes). Conflict URLs
+     `srcset`, image preloads and inline `style` attributes, including observed
+     attached shadow roots and open declarative shadow roots). Conflict URLs
      originating only in stylesheet/CSSOM rules cannot be rewritten by these
      DOM hooks and remain direct; ordinary stylesheet and CSSOM URLs still use
      the network redirect.
@@ -79,9 +81,11 @@ their module scripts.
    Intercepts supported image `src`/`srcset` setters, preload-link `href`/`imagesrcset`
    attributes, and `url()` references in inline `style` attributes (including
    background, border-image, list-style, mask and cursor declarations). The
-   network layer, not these hooks, covers posters, SVG `<image>`, objects/embeds,
-   CSSOM rules and stylesheet requests. The
-   network rule handles ordinary requests; the DOM layer handles conflict URLs
+   MAIN-world observer also tracks style-attribute changes in attached open and
+   closed shadow roots and discovers open declarative roots inserted into the
+   document. The network layer covers posters, SVG `<image>`, objects/embeds,
+   CSSOM rules and stylesheet requests. It handles ordinary requests; the DOM
+   layer handles conflict URLs
    on supported surfaces and hands everything else
    to the network layer untouched (so nothing is wrapped twice). If Chrome
    rejects the network rule, the DOM layer provides best-effort fallback for
@@ -91,6 +95,12 @@ their module scripts.
    CSS images, SVG `<image>`, video posters, and `<object>`/`<embed>`). Full
    coverage requires the DNR rules to install successfully. Private/intranet and
    excluded-host exemptions still apply in DOM fallback mode.
+
+   `prehook.js` and `content.js` intentionally keep small URL-classification and
+   parsing helpers in sync: Chrome runs them in separate MAIN and isolated
+   JavaScript worlds, so they cannot import one shared runtime implementation.
+   The simulation suite checks their shared skip/conflict patterns and exercises
+   the srcset parser in both worlds.
 
 ### Fallback, loops and the circuit breaker
 
@@ -160,6 +170,8 @@ their module scripts.
   A successful response with no `Content-Type` is left unclassified: it is not
   counted and is not automatically retried just because its MIME type is
   unknown. An explicit non-image `Content-Type` triggers direct fallback.
+
+While compression is active, both interception layers also set `loading="lazy"` on images. An image with no `loading` attribute gets one, and a script-set `loading` value other than `eager` is stored as `lazy`, so offscreen images are requested only as they approach the viewport. An explicit `loading="eager"` is kept, and sites that use their own lazy-loader attributes (`data-src`, `data-srcset` and similar) keep them untouched until their loader promotes a URL. Disabling compression, or leaving the page excluded, restores the page's own `loading` behaviour for new images.
 
 `service-worker.js` also injects `Save-Data: on` and strips CSP only while the
 proxy is valid, enabled, and not temporarily suspended by the circuit breaker
@@ -290,7 +302,7 @@ icon in an older state.
 | Lazy loading (`loading=lazy`, `data-src`, `data-srcset`, framework loaders) | The URL is redirected when the loader actually activates it | nothing requested early |
 | Inline, same-origin, cross-origin and `@import` stylesheet backgrounds, multiple backgrounds, `image-set()`, `@media` | Network redirect (no CSSOM access needed, so cross-origin sheets are covered); DOM fallback rewrites remote inline-style URLs but preserves same-document fragment references such as `url(#mask)` | each case |
 | CSS pseudo-elements `::before`/`::after` | Network redirect | computed-style + request check |
-| Open, closed and declarative shadow roots | Network redirect; `attachShadow` is wrapped so the DOM layer also observes roots | all three |
+| Open, closed and declarative shadow roots | Network redirect; the MAIN-world DOM layer observes attached roots, discovers open declarative roots, and rewrites inline style-attribute URLs in those roots | all three, including conflict-query style attributes |
 | SVG `<image href>` / `xlink:href` | Redirected; `<use>` sprite references and `.svg` files are left alone, fragments intact | fragments preserved |
 | `<video poster>` | Redirected | poster renders |
 | `<object>`/`<embed>` image URLs | Redirected only when the URL has an image extension; documents in `<object>` untouched | object/embed media test |
@@ -299,10 +311,16 @@ icon in an older state.
 Every browser test checks the actual URL Chrome requested (logged by a local
 mock origin and mock proxy). Statistics assertions do not rely on the mock
 server's own view of a response: they use Chrome's network events, captured over
-the DevTools protocol. A proxy response counts only when Chrome reports it
-finished with a 2xx status and a strict image `Content-Type`, so a request that
-Chrome cancels while replacing an image candidate is not counted, even though
-the mock server had already written its bytes. When `BHP2_DIR` points to a bandwidth-hero-proxy2 checkout, the mock
+the DevTools protocol. The extension itself counts a proxy response from its
+`webRequest` completion event when the status is 2xx and the `Content-Type` is a
+strict image type. That event can fire for a request that Chrome later reports
+as cancelled, such as the `<picture>` fallback image that loses its source
+selection after its bytes arrive. The browser test therefore allows for that
+request: every recorded proxy response, including failed or unfinished ones, is
+considered when deciding whether the counted total is acceptable. The count must
+lie between the confirmed responses and the confirmed plus any ambiguous ones.
+
+When `BHP2_DIR` points to a bandwidth-hero-proxy2 checkout, the mock
 proxy uses that project's `getImageUrl()` implementation; otherwise it uses the
 equivalent parser bundled in `tests/browser/server.cjs`. Assertions cover image
 loading, fallback behaviour and duplicate proxy requests.
@@ -350,10 +368,12 @@ snapshots and recovery callbacks, transient session-bypass initialization
 failures, oversized bypass filters, DNR-failure retry bookkeeping, live-rule
 state recovery, runtime-publication alarm retries, global bypass capacity across
 tabs, reserved proxy query validation, safe custom-width validation,
-case-insensitive CSS fallback, same-document CSS/SVG fragment preservation in DOM fallback and retry scanning, unique IDs across all extension and browser HTML
+case-insensitive CSS fallback, MAIN-world inline-style rewriting in observed shadow roots, same-document CSS/SVG fragment preservation in DOM fallback and retry scanning, unique IDs across all extension and browser HTML
 pages, static popup/settings selectors that resolve against their markup, and one exclusion hostname rule shared by the network rules, both DOM layers and the popup (a regression test runs the same input through each layer).
 The browser suite skips unless both `playwright-core` and a valid `CHROME_PATH`
-are available. The simulation suite also locks down the proxy-response boundary
+are available. A skipped suite means no real-browser checks ran; it is not a passing
+browser result. CI installs both prerequisites before running the browser suite.
+The simulation suite also locks down the proxy-response boundary
 for missing `Content-Type` headers: unknown MIME types are not counted or
 retried solely because the header is absent.
 
@@ -368,8 +388,10 @@ retried solely because the header is absent.
 - Same-origin images become cross-origin through the proxy; a canvas drawing
   them without `crossorigin` becomes tainted for `getImageData()`/`toDataURL()`.
 - Conflict URLs (containing `&quality=` and similar) are proxied by the DOM
-  layer only when referenced through supported DOM attributes or inline CSS;
-  when referenced from stylesheets they load directly.
+  layer only when referenced through supported DOM attributes or inline `style`
+  attributes. Inline style attributes in observed open/closed attached shadow
+  roots and open declarative roots are included; URLs in stylesheet CSSOM rules
+  still load directly when they match a conflict parameter.
 - If declarativeNetRequest rules cannot be installed, fallback coverage is
   intentionally best-effort and does not include every network-only mechanism
   (see **How it works**); full interception requires a compatible Chromium build

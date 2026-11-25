@@ -121,6 +121,8 @@
   // URLs the raw-URL redirect cannot carry (KEEP IN SYNC with CONFLICT_PATTERN
   // in service-worker.js and PROXY_PARAMETER in bandwidth-hero-proxy2).
   const CONFLICT_RE = /&(?:quality|l|bw|jpeg|max_width)=/i;
+  const CSS_URL_RE = /url\(\s*(?:(['"])(.*?)\1|([^)]*?))\s*\)/gi;
+  const INLINE_STYLE_SELECTOR = "[style*='url(' i]";
   // true when THIS layer (not the network redirect) must proxy the URL.
   const domHandles = absolute => !redirectLive || CONFLICT_RE.test(absolute);
   // Before settings arrive, only URLs that the DOM layer would have to proxy
@@ -379,6 +381,7 @@
         }
       } catch {}
     }
+    scanKnownShadowInlineStyles();
   }
 
   // ── Settings channel ────────────────────────────────────────────────────────
@@ -652,6 +655,28 @@
     } catch {}
   }
 
+  // Conflict-query URLs are exempted from DNR because the proxy's raw URL
+  // contract cannot safely carry them. Unlike the isolated-world observer,
+  // this MAIN-world path can also watch attached shadow roots (including closed
+  // roots), so inline style attributes there receive the same DOM treatment.
+  function processInlineStyle(el) {
+    try {
+      if (destroyed || !active || !el || el.nodeType !== 1) return;
+      const style = el.getAttribute("style");
+      if (!style || !/\burl\(/i.test(style)) return;
+      const output = style.replace(CSS_URL_RE, (full, quote, quoted, bare) => {
+        const raw = String(quote ? quoted : bare || "").trim();
+        if (!raw || isLocalFragmentReference(raw)) return full;
+        const resolved = safeURL(raw, el.baseURI || document.baseURI);
+        if (!resolved || !/^https?:$/.test(resolved.protocol)) return full;
+        const absolute = resolved.href;
+        if (!domHandles(absolute) || skipAbsolute(absolute)) return full;
+        return `url("${buildProxyUrl(absolute)}")`;
+      });
+      if (output !== style) setAttr.call(el, "style", output);
+    } catch {}
+  }
+
   // ── Patch <img>.src ─────────────────────────────────────────────────────────
   Object.defineProperty(imgProto, "src", {
     configurable: true,
@@ -779,8 +804,14 @@
 
       // #21: fast path first — class/data-*/aria-*/id/etc. return immediately.
       if (n !== "src" && n !== "srcset" && n !== "loading" && n !== "imagesrcset" &&
-          n !== "href" && n !== "rel" && n !== "as" && n !== "type") {
+          n !== "href" && n !== "rel" && n !== "as" && n !== "type" && n !== "style") {
         return setAttr.call(this, name, value);
+      }
+
+      if (n === "style") {
+        setAttr.call(this, name, value);
+        processInlineStyle(this);
+        return;
       }
 
       if (this instanceof HTMLLinkElement) {
@@ -842,28 +873,86 @@
     return setAttr.call(this, name, value);
   };
 
-  // ── MutationObservers for parser-created media and preload links ──────────────
-  // C1/O5: childList catches parser-inserted links, images and sources — the
-  // parser bypasses JavaScript setters. Watch the attributes that can turn a
-  // link into an image preload or introduce responsive candidates: rel/as/type
-  // are not fully patchable, and imagesrcset can change without href.
+  // ── MutationObservers for parser-created media, preloads and inline CSS ──
+  // Parser-created elements bypass setters; style attributes can also change
+  // through setAttribute/CSSStyleDeclaration after insertion. Observe them in
+  // both the document and every attached shadow root.
   const linkObserverGuard = () => destroyed || (ready && !active);
+  const DOM_OBSERVER_OPTIONS = {
+    childList: true,
+    subtree: true,
+    attributes: true,
+    attributeFilter: ["style"]
+  };
+  const shadowRefs = [];
+  const observedShadowRoots = new WeakSet();
+
+  function processInlineStyles(root) {
+    if (!root || typeof root.querySelectorAll !== "function") return;
+    try { root.querySelectorAll(INLINE_STYLE_SELECTOR).forEach(processInlineStyle); } catch {}
+  }
+
+  function observeShadowRoot(root) {
+    if (!root || observedShadowRoots.has(root)) return;
+    try {
+      observedShadowRoots.add(root);
+      shadowRefs.push(new WeakRef(root));
+      preloadObserver.observe(root, DOM_OBSERVER_OPTIONS);
+      processInlineStyles(root);
+    } catch {}
+  }
+
+  // Declarative open shadow roots do not invoke attachShadow(). Discover them
+  // when their host enters an observed tree; imperative roots are registered
+  // synchronously by the attachShadow wrapper below.
+  function observeNestedShadowRoots(node) {
+    if (!node || node.nodeType !== 1) return;
+    try { if (node.shadowRoot) observeShadowRoot(node.shadowRoot); } catch {}
+    // Most observed additions are leaf images; skip a descendant scan unless
+    // the inserted element can actually contain nested shadow hosts.
+    if (!node.children || node.children.length === 0) return;
+    try {
+      node.querySelectorAll("*").forEach(host => {
+        try { if (host.shadowRoot) observeShadowRoot(host.shadowRoot); } catch {}
+      });
+    } catch {}
+  }
+
+  function scanKnownShadowInlineStyles() {
+    if (destroyed || !active) return;
+    for (let i = shadowRefs.length - 1; i >= 0; i--) {
+      const root = shadowRefs[i].deref();
+      if (!root) shadowRefs.splice(i, 1);
+      else processInlineStyles(root);
+    }
+  }
+
   preloadObserver = new MutationObserver(mutations => {
-    if (linkObserverGuard()) return;
+    if (destroyed) return;
     for (const m of mutations) {
+      if (m.type === "attributes") {
+        if (!(ready && !active) && m.attributeName === "style") processInlineStyle(m.target);
+        continue;
+      }
       if (m.type !== "childList") continue;
       m.addedNodes.forEach(n => {
         if (n.nodeType !== 1) return;
+        // Keep discovering roots even while proxying is disabled: they may
+        // become active later without another host insertion.
+        observeNestedShadowRoots(n);
+        if (ready && !active) return;
         processParserImage(n);
+        processInlineStyle(n);
         if (n instanceof HTMLLinkElement) processPreloadLink(n);
         if (n.querySelectorAll) {
           n.querySelectorAll("img,source").forEach(processParserImage);
           n.querySelectorAll('link[rel~="preload"]').forEach(processPreloadLink);
+          n.querySelectorAll(INLINE_STYLE_SELECTOR).forEach(processInlineStyle);
         }
       });
     }
   });
-  preloadObserver.observe(document, { childList: true, subtree: true });
+  preloadObserver.observe(document, DOM_OBSERVER_OPTIONS);
 
   linkAttrObserver = new MutationObserver(mutations => {
     if (linkObserverGuard()) return;
@@ -877,22 +966,14 @@
     attributeFilter: ["rel", "as", "type", "imagesrcset"]
   });
 
-  // ── Shadow roots ────────────────────────────────────────────────────────────
   // attachShadow() is wrapped (mode is never changed) so both open and closed
-  // roots are observed for DOM-layer media and can be reached by the fallback
-  // retry. Declarative shadow roots do not go through attachShadow; open ones
-  // are found via element.shadowRoot during retry, closed ones are unreachable.
-  const shadowRefs = [];
+  // roots get child/attribute observers. Declarative open roots are discovered
+  // from inserted hosts by observeNestedShadowRoots().
   const nativeAttachShadow = Element.prototype.attachShadow;
   if (typeof nativeAttachShadow === "function") {
     Element.prototype.attachShadow = function(init) {
       const root = nativeAttachShadow.call(this, init);
-      try {
-        if (!destroyed && root) {
-          shadowRefs.push(new WeakRef(root));
-          preloadObserver.observe(root, { childList: true, subtree: true });
-        }
-      } catch {}
+      try { if (!destroyed && root) observeShadowRoot(root); } catch {}
       return root;
     };
   }
@@ -903,7 +984,6 @@
   // goes straight to the origin and can never reach the proxy again. A failed
   // URL is retried at most once; its element may later receive a different URL.
   const RELOADED_ATTR = "data-bh-reloaded";
-  const CSS_URL_RE = /url\(\s*(?:(['"])(.*?)\1|([^)]*?))\s*\)/gi;
   const stripHash = u => { const r = safeURL(u); if (!r) return null; r.hash = ""; return r.href; };
 
   function collectRoots() {

@@ -5,53 +5,49 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.2.7]
+This file keeps only the latest release and modification log.
 
-### Security
-- GitHub Actions now grants repository write access only to the release job.
-  Test and build jobs inherit read-only permissions, reducing the impact of
-  test-time dependency execution.
-- The separate Keep-Fork-Alive workflow now scopes `contents: write` to its
-  commit job instead of granting it at workflow scope.
+## [0.2.8] - 2026-11-25
 
 ### Fixed
-- The popup's site-exclusion action could become enabled after an unrelated
-  settings write completed, even when the active hostname contained invalid
-  characters and could not be excluded. The storage lock now rechecks the
-  hostname before enabling that action.
-- Same-document CSS/SVG fragment references such as `url(#mask)` could be
-  mistaken for remote images when DOM fallback was active. Both interception
-  layers now preserve fragment-only references in `src`, `srcset`, inline CSS
-  and CSS retry scanning while continuing to proxy real remote images.
-- Exclusion lists were interpreted differently by the network rules, the DOM
-  layers and the popup. Entries that are not plain hostnames (for example names
-  with underscores) were dropped by the network rules but still honored by the
-  content script and prehook, so the same site could be excluded for some
-  requests and not others, and the popup reported it as "Excluded" while images
-  were still compressed. All layers now use one hostname rule. The popup shows a
-  site that cannot be excluded as "Not available".
-- If `storage.session.set()` failed while opening the circuit breaker, a later
-  rule refresh could treat the empty storage value as an expired breaker and
-  restore proxy redirects immediately. The worker now establishes a fail-safe
-  in-memory deadline before the async write; the resume alarm rebuilds rules
-  after the cooldown, including if the service worker restarts first.
-- CSP response rules excluded a configured host only when it was the requested
-  resource. A page on an excluded host could still have CSP removed from an
-  embedded subframe on another host. CSP rules now honor exclusions for both
-  request and initiator domains.
+- The settings page said that saving always reloads the page that opened it. The
+  page is now reloaded only when a saved value differs from the stored one, and the
+  hint says so.
 
 ### Changed
-- The settings page and README state that only plain hostnames are used.
+- The proxy-origin recovery steps that were duplicated between the synced-settings
+  path and the local-mirror recovery path are now a single helper in the service
+  worker. Behaviour is unchanged: both paths mark the observer ready, replay queued
+  stats events, clear them when no proxy is configured, and re-target the webRequest
+  filter.
+- The README documents that, while compression is active, images without a
+  `loading` attribute are given `loading="lazy"`. An explicit `eager` is kept, and
+  sites with their own lazy-loader attributes are left alone.
+- The package version is 0.2.8. The release workflow replaces the asset of an
+  existing release that has the same manifest version, so changes of this size need
+  a new version. Shipping them as 0.2.7 would have overwritten the published 0.2.7
+  package.
+
+### Removed
+- An unused `controls` class on the popup's controls card.
+- An unused `legacy` flag from the browser test's mock URL parser. The mock returns
+  only the original URL, which is the only field any caller reads.
 
 ### Maintenance
-- Circuit-breaker resume-alarm scheduling now handles rejected Promise results
-  from Chrome's alarms API as well as synchronous errors, matching the other
-  worker retry helpers. Added a focused regression test.
-- Removed duplicated default values from the prehook's settings watchdog and
-  duplicated lazy-attribute lists in the content script; both are now derived
-  from a single definition.
-- The CSS `url()` matcher is a constant instead of being rebuilt per style
-  element, and the proxy-response path no longer allocates on every image.
-- Added regression coverage for local CSS/SVG fragments, failed breaker
-  storage writes, and excluded initiators in CSP rules; the hostname rule is
-  also verified across the network rules, DOM layer and popup.
+- The README distinguishes a skipped real-browser suite from a passing browser
+  validation and states that both Playwright Core and a Chrome/Chromium executable
+  are required. CI installs these prerequisites before the browser tests.
+- DNR regex conditions now explicitly set `isUrlFilterCaseSensitive: false`,
+  matching the documented case-insensitive behavior for skip, conflict, private-host
+  and redirect filters. A regression test checks every generated regex rule.
+- The README clarifies that conflict-query matching is explicitly configured as
+  case-insensitive in the network rules.
+- A regression test checks that the proxy origin is applied through the shared
+  helper and that no caller sets it directly.
+- The simulation test helper `functionFrom()` accepts several function names, so a
+  test can load a helper together with the function that calls it.
+- The MAIN-world DOM layer now rewrites conflict-query URLs in inline `style`
+  attributes inside observed open and closed attached shadow roots. It also watches
+  later style-attribute changes, discovers inserted open declarative roots, and
+  scans known roots when settings become active. Stylesheet CSSOM rules remain
+  outside this attribute-level fallback.

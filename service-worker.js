@@ -37,8 +37,6 @@ importScripts("defaults.js");
 const IMAGE_CONTENT_TYPES = new Set(["image/jpeg", "image/png", "image/webp", "image/gif", "image/tiff", "image/jxl"]);
 const ZERO_STATS = { filesProcessed: 0, bytesProcessed: 0, bytesSaved: 0 };
 
-const sameOpts = (a, b) => !!a && !!b && Object.keys(DEFAULTS).every(k => a[k] === b[k]);
-
 // Rule 1 is the retired, unencoded-regex redirect; it stays in removeRuleIds so
 // very old installs lose it (O9). Rule 2 strips CSP; Rule 3 adds Save-Data.
 const RULE_ID_CSP             = 2;
@@ -104,6 +102,26 @@ function setProxyOrigin(base) {
   configuredProxyOrigin = usable ? new URL(usable).origin : "";
 }
 
+// Makes a settings snapshot's proxy base the observer origin: marks the observer
+// ready, replays stats events that arrived before the origin was known (B9),
+// clears them when there is no origin, and re-targets the webRequest filter.
+// Both the synced-settings path and the local-mirror recovery path use this, so
+// they configure the observer identically.
+function applyProxyObserverOrigin(proxyBase) {
+  proxyObserverReady = true;
+  setProxyOrigin(proxyBase);
+  // Without an origin the queued events can never match (they are only replayed
+  // once an origin exists); clearing them keeps a proxy-less install from
+  // holding stale entries for the worker's whole lifetime.
+  if (!configuredProxyOrigin) {
+    earlyStatsEvents.length = 0;
+  } else if (earlyStatsEvents.length) {
+    const queued = earlyStatsEvents.splice(0);
+    queued.forEach(handleProxyCompleted);
+  }
+  updateWebRequestListener(configuredProxyOrigin);
+}
+
 function refreshRules() {
   if (refreshing) { pendingRefresh = true; return; }
   refreshing = true;
@@ -155,20 +173,9 @@ function mirrorToLocal() {
     const revision = ++mirrorRevision;
     // Once a trusted settings snapshot has configured the observer, a later
     // transient sync read failure must not restore an older local mirror over it.
-    proxyObserverReady = true;
     // A successful sync snapshot supersedes any older local-mirror recovery read.
     proxyObserverRevision++;
-    setProxyOrigin(opts.proxyBase);
-    // Without an origin the queued early events can never match (they are only
-    // replayed once an origin exists); drop them so the queue cannot hold
-    // stale entries for the worker's whole lifetime on a proxy-less install.
-    if (!configuredProxyOrigin && earlyStatsEvents.length) earlyStatsEvents.length = 0;
-    // B9: stats events that arrived before the origin was known are queued.
-    if (configuredProxyOrigin && earlyStatsEvents.length) {
-      const queued = earlyStatsEvents.splice(0);
-      queued.forEach(handleProxyCompleted);
-    }
-    updateWebRequestListener(configuredProxyOrigin);
+    applyProxyObserverOrigin(opts.proxyBase);
     // Only write when different: every write makes every open tab rebuild
     // its caches via storage.onChanged. Queue one latest snapshot while a write
     // is in flight, so callback ordering cannot leave an older mirror last.
@@ -781,14 +788,7 @@ function restoreProxyObserverFromLocalMirror() {
       const opts = data?.bhOpts;
       if (!opts || typeof opts !== "object" || Array.isArray(opts)) { finish(); return; }
       try {
-        proxyObserverReady = true;
-        setProxyOrigin(opts.proxyBase);
-        if (!configuredProxyOrigin && earlyStatsEvents.length) earlyStatsEvents.length = 0;
-        if (configuredProxyOrigin && earlyStatsEvents.length) {
-          const queued = earlyStatsEvents.splice(0);
-          queued.forEach(handleProxyCompleted);
-        }
-        updateWebRequestListener(configuredProxyOrigin);
+        applyProxyObserverOrigin(opts.proxyBase);
       } catch {
         if (revision === proxyObserverRevision) scheduleSettingsReadRetry();
       } finally {
@@ -1343,7 +1343,12 @@ function buildRules(opts, noHeaderMatch, suspended) {
     var proxyOrigin = new URL(base).origin;
     var substitution = redirectSubstitution(opts, base);
     var redirectCondition = function(regexFilter, resourceTypes) {
-      var c = { regexFilter: regexFilter, resourceTypes: resourceTypes, requestMethods: ["get"] };
+      var c = {
+        regexFilter: regexFilter,
+        isUrlFilterCaseSensitive: false,
+        resourceTypes: resourceTypes,
+        requestMethods: ["get"]
+      };
       if (excludedDomains.length) {
         c.excludedRequestDomains = excludedDomains;   // excluded image hosts
         c.excludedInitiatorDomains = excludedDomains; // excluded pages / frames
@@ -1365,20 +1370,20 @@ function buildRules(opts, noHeaderMatch, suspended) {
       id: RULE_ID_ALLOW_PROXY, priority: PRIORITY_PROXY, action: { type: "allow" },
       condition: { urlFilter: "|" + proxyOrigin + "/", resourceTypes: PROXY_REQUEST_TYPES }
     });
-    // These regex filters are case-insensitive by design; DNR's
-    // isUrlFilterCaseSensitive option applies only to urlFilter conditions.
+    // Keep regex filters case-insensitive explicitly. DNR applies this option
+    // to both regexFilter and urlFilter; exact per-URL bypasses opt into true.
     addRules.push({
       id: RULE_ID_ALLOW_SKIP, priority: PRIORITY_EXEMPT, action: { type: "allow" },
-      condition: { regexFilter: SKIP_PATTERN, resourceTypes: PROXY_REQUEST_TYPES }
+      condition: { regexFilter: SKIP_PATTERN, isUrlFilterCaseSensitive: false, resourceTypes: PROXY_REQUEST_TYPES }
     });
     addRules.push({
       id: RULE_ID_ALLOW_CONFLICT, priority: PRIORITY_EXEMPT, action: { type: "allow" },
-      condition: { regexFilter: CONFLICT_PATTERN, resourceTypes: PROXY_REQUEST_TYPES }
+      condition: { regexFilter: CONFLICT_PATTERN, isUrlFilterCaseSensitive: false, resourceTypes: PROXY_REQUEST_TYPES }
     });
     PRIVATE_HOST_PATTERNS.forEach(function(p, i) {
       addRules.push({
         id: RULE_ID_ALLOW_PRIVATE + i, priority: PRIORITY_EXEMPT, action: { type: "allow" },
-        condition: { regexFilter: p, resourceTypes: PROXY_REQUEST_TYPES }
+        condition: { regexFilter: p, isUrlFilterCaseSensitive: false, resourceTypes: PROXY_REQUEST_TYPES }
       });
     });
   }
