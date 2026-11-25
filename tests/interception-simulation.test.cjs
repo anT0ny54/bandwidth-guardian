@@ -1016,6 +1016,38 @@ test('options initial settings read failure is reported without blocking stats r
   assert.deepEqual(toasts.at(-1), ['Could not load saved settings', 'err']);
 });
 
+test('popup storage lock keeps exclusion disabled for invalid hostnames', () => {
+  const controls = { enabled: { disabled: false }, grayscale: { disabled: false } };
+  const presetBtns = [{ disabled: false }, { disabled: false }];
+  const excludeBtn = { disabled: true };
+  const harness = functionFrom(popupSource, 'setPopupStorageBusy', {
+    enabledEl: controls.enabled,
+    grayscaleEl: controls.grayscale,
+    presetBtns,
+    excludeBtn,
+    currentIsWeb: true,
+    currentHost: 'invalid_host.example',
+    EXCLUDE_HOST_RE: constRegex(popupSource, 'EXCLUDE_HOST_RE'),
+    popupStorageWriteInProgress: false
+  });
+
+  harness.fn(true);
+  assert.equal(excludeBtn.disabled, true, 'all writable controls are disabled during a write');
+  harness.fn(false);
+  assert.equal(excludeBtn.disabled, true,
+    'finishing an unrelated setting write must not enable exclusion for an invalid hostname');
+  assert.equal(controls.enabled.disabled, false);
+  assert.equal(controls.grayscale.disabled, false);
+  assert.deepEqual(presetBtns.map(button => button.disabled), [false, false]);
+
+  harness.sandbox.currentHost = 'valid.example';
+  harness.fn(false);
+  assert.equal(excludeBtn.disabled, false, 'a valid web hostname remains actionable');
+  harness.sandbox.currentIsWeb = false;
+  harness.fn(false);
+  assert.equal(excludeBtn.disabled, true, 'non-web tabs remain unavailable');
+});
+
 test('popup site card ignores stale asynchronous tab lookups', async () => {
   const tabReads = [];
   const harness = functionFrom(popupSource, 'loadSiteUI', {
@@ -1025,6 +1057,7 @@ test('popup site card ignores stale asynchronous tab lookups', async () => {
     currentHost: '',
     currentIsWeb: false,
     popupStorageWriteInProgress: false,
+    EXCLUDE_HOST_RE: constRegex(popupSource, 'EXCLUDE_HOST_RE'),
     chrome: { tabs: { query: () => new Promise(resolve => { tabReads.push(resolve); }) } },
     siteNameEl: { textContent: '' },
     excludeBtn: { disabled: false, textContent: '' },
@@ -1063,6 +1096,7 @@ test('popup site card clears stale UI when the active-tab query fails or returns
     currentTabId: 7,
     currentHost: 'old.example',
     currentIsWeb: true,
+    EXCLUDE_HOST_RE: constRegex(popupSource, 'EXCLUDE_HOST_RE'),
     chrome: { tabs: { query: () => new Promise((resolve, reject) => pending.push({ resolve, reject })) } },
     siteNameEl: { textContent: 'old.example' },
     excludeBtn: { disabled: false, textContent: 'Remove exclusion' },
@@ -1107,6 +1141,7 @@ test('popup exclusion toggle aborts when the active site changes during its stor
   let refreshed = 0;
   let nudges = 0;
   const harness = functionFrom(popupSource, 'toggleSiteExclusion', {
+    EXCLUDE_HOST_RE: constRegex(popupSource, 'EXCLUDE_HOST_RE'),
     currentIsWeb: true,
     currentHost: 'old.example',
     siteUiRevision: 4,
@@ -1244,6 +1279,7 @@ test('popup exclusion read and write failures are reported', async () => {
     const errors = [];
     const settingsRevision = {};
     const host = functionFrom(popupSource, 'toggleSiteExclusion', {
+      EXCLUDE_HOST_RE: constRegex(popupSource, 'EXCLUDE_HOST_RE'),
       currentIsWeb: true,
       currentHost: 'example.com',
       siteUiRevision: 1,
@@ -1676,6 +1712,71 @@ test('extension and browser HTML pages use unique DOM ids and resolve static UI 
   }
 });
 
+test('exclusion hostname rule is identical in every layer; network rules, DOM layer and popup agree', () => {
+  const reference = constRegex(serviceWorker, 'EXCLUDE_HOST_RE').source;
+  for (const [file, src] of [['prehook.js', prehook], ['content.js', content], ['popup.js', popupSource]]) {
+    assert.equal(constRegex(src, 'EXCLUDE_HOST_RE').source, reference, `${file}: EXCLUDE_HOST_RE differs from service-worker.js`);
+  }
+
+  const swParse = functionFrom(serviceWorker, 'parseExcluded', { EXCLUDE_HOST_RE: constRegex(serviceWorker, 'EXCLUDE_HOST_RE') });
+  const domSet = functionFrom(content, 'domainSet', { EXCLUDE_HOST_RE: constRegex(content, 'EXCLUDE_HOST_RE') });
+  const popupFind = functionFrom(popupSource, 'findExcludedDomain', { EXCLUDE_HOST_RE: constRegex(popupSource, 'EXCLUDE_HOST_RE') });
+  const popupParse = functionFrom(popupSource, 'parseDomains');
+
+  // Underscores, ports, wildcards and malformed labels are not plain hostnames.
+  const input = 'good.example, foo_bar.example\u00a0sub.good.example,\tBAD..x,https://port.example:8443/path, *.wild.example';
+  const honored = JSON.parse(JSON.stringify(swParse.fn(input))).sort();
+  assert.deepEqual(honored, ['good.example', 'sub.good.example']);
+
+  assert.deepEqual(JSON.parse(JSON.stringify([...domSet.fn(input)])).sort(), honored,
+    'the content-script layer keeps exactly the entries the network rules keep');
+
+  const candidates = ['good.example', 'sub.good.example', 'foo_bar.example', 'x.foo_bar.example', 'other.example', 'port.example'];
+  const h = createDomHarness();
+  h.publishSettings({ redirect: false, excludeDomains: input });
+  for (const host of candidates) {
+    const expected = honored.some(d => host === d || host.endsWith(`.${d}`));
+    assert.equal(popupFind.fn(host, popupParse.fn(input)) !== '', expected,
+      `popup must report ${host} as excluded only when the network rule honors it`);
+    const url = `https://${host}/x.png`;
+    const img = new h.HTMLImageElement();
+    img.src = url;
+    assert.equal(img.getAttribute('src') === url, expected,
+      `DOM layer must agree with the network rule for ${host}`);
+  }
+});
+
+test('popup shows a site that cannot be excluded as not available, never as excluded', async () => {
+  const harness = functionFrom(popupSource, 'loadSiteUI', {
+    URL,
+    EXCLUDE_HOST_RE: constRegex(popupSource, 'EXCLUDE_HOST_RE'),
+    siteUiRevision: 0,
+    currentTabId: null,
+    currentHost: '',
+    currentIsWeb: false,
+    popupStorageWriteInProgress: false,
+    chrome: { tabs: { query: async () => [{ id: 3, url: 'https://foo_bar.example/page' }] } },
+    siteNameEl: { textContent: '' },
+    excludeBtn: { disabled: false, textContent: '' },
+    sitePillEl: { style: { display: '' }, className: '', textContent: '' },
+    parseDomains(text) { return String(text || '').split(/[,\s]+/).map(x => x.toLowerCase()).filter(Boolean); },
+    findExcludedDomain(host, domains) { return domains.find(d => host === d) || ''; }
+  });
+  await harness.fn({ excludeDomains: 'foo_bar.example' });
+  assert.equal(harness.sandbox.excludeBtn.disabled, true);
+  assert.equal(harness.sandbox.excludeBtn.textContent, 'Not available');
+  assert.equal(harness.sandbox.sitePillEl.style.display, 'none',
+    'no "Excluded" pill for a site the network layer cannot exclude');
+});
+
+// Reads a top-level `const NAME = /.../flags;` regex literal from a source file,
+// so sandboxes use exactly the pattern the shipped code declares.
+function constRegex(source, name) {
+  const m = new RegExp(`const ${name} = (\\/.*\\/)([a-z]*);`).exec(source);
+  assert.ok(m, `${name} must be declared`);
+  return new RegExp(m[1].slice(1, -1), m[2]);
+}
+
 function extractFunction(source, name) {
   const marker = new RegExp(`(?:async\\s+)?function\\s+${name}\\s*\\(`);
   const match = marker.exec(source);
@@ -2051,8 +2152,9 @@ test('parser-created responsive preload without href holds conflicting imagesrcs
 });
 
 test('content script rewrites URL references across inline CSS declarations', () => {
-  const rewriteSource = extractFunction(content, 'rewriteInlineStyles');
+  const rewriteSource = [extractFunction(content, 'isLocalFragmentReference'), extractFunction(content, 'rewriteInlineStyles')].join('\n');
   const sandbox = {
+    CSS_URL_RE: constRegex(content, 'CSS_URL_RE'),
     doneStyle: new WeakSet(), active: true, failedEls: { has: () => false },
     shouldSkip(url) { try { return !/^https?:$/.test(new URL(url).protocol) || new URL(url).origin === 'https://proxy.example'; } catch { return true; } },
     resolveHttp(url) { try { const u = new URL(url, 'https://page.example/'); return /^https?:$/.test(u.protocol) ? u.href : null; } catch { return null; } },
@@ -2071,6 +2173,94 @@ test('content script rewrites URL references across inline CSS declarations', ()
   for (const original of ['https://cdn.example/a.jpg?x=1&y=2', 'https://cdn.example/b.webp', 'https://cdn.example/c.png']) {
     assert.ok(el._style.includes(encodeURIComponent(original)), `rewritten style retains ${original}`);
   }
+});
+
+test('same-document fragment references stay local in DOM fallback and CSS retry scanning', () => {
+  const fragment = '#paint-server';
+  const external = 'https://cdn.example/background.png';
+  const proxy = original => `https://proxy.example/convert?url=${encodeURIComponent(original)}`;
+
+  // Isolated-world inline styles must leave SVG masks/gradients intact while
+  // still proxying actual remote image URLs when DNR is unavailable.
+  const contentStyleSandbox = {
+    CSS_URL_RE: constRegex(content, 'CSS_URL_RE'),
+    doneStyle: new WeakSet(), active: true, failedEls: { has: () => false },
+    shouldSkip(url) { return new URL(url).origin === 'https://proxy.example'; },
+    resolveHttp(url) { try { const u = new URL(url, 'https://page.example/'); return /^https?:$/.test(u.protocol) ? u.href : null; } catch { return null; } },
+    buildProxyUrl: proxy
+  };
+  vm.createContext(contentStyleSandbox);
+  vm.runInContext(`${extractFunction(content, 'isLocalFragmentReference')}\n${extractFunction(content, 'rewriteInlineStyles')}\nthis.rewrite = rewriteInlineStyles;`, contentStyleSandbox);
+  const styleEl = {
+    _style: `mask: url(${fragment}); background-image: url("${external}")`,
+    getAttribute(name) { return name === 'style' ? this._style : null; },
+    setAttribute(name, value) { if (name === 'style') this._style = String(value); }
+  };
+  contentStyleSandbox.rewrite(styleEl);
+  assert.ok(styleEl._style.includes(`url(${fragment})`), 'fragment-only CSS reference remains unchanged');
+  assert.ok(styleEl._style.includes(encodeURIComponent(external)), 'remote CSS image is still proxied');
+
+  // Parser-created images use a separate path from srcset rewriting; their
+  // fragment-only src must also remain on the native direct path.
+  const contentImageSandbox = {
+    doneImg: new WeakSet(), failedEls: { has: () => false }, active: true,
+    hasCustomLazySource: () => false, hasDeferredLazySource: () => false,
+    resolveHttp(url) { try { return new URL(url, 'https://page.example/').href; } catch { return null; } },
+    shouldSkip: () => false,
+    nativeImgSrcSetter: { call(el, value) { el.setAttribute('src', value); } },
+    armProxyFallback() {}, buildProxyUrl: proxy,
+    rewriteSrcsetValue: value => value
+  };
+  vm.createContext(contentImageSandbox);
+  vm.runInContext(`${extractFunction(content, 'isLocalFragmentReference')}\n${extractFunction(content, 'rewriteImg')}\nthis.rewrite = rewriteImg;`, contentImageSandbox);
+  const imageEl = {
+    tagName: 'IMG', attrs: new Map([['src', fragment]]),
+    getAttribute(name) { return this.attrs.has(name) ? this.attrs.get(name) : null; },
+    hasAttribute(name) { return this.attrs.has(name); },
+    setAttribute(name, value) { this.attrs.set(name, String(value)); }
+  };
+  contentImageSandbox.rewrite(imageEl);
+  assert.equal(imageEl.getAttribute('src'), fragment, 'isolated-world parser handling preserves fragment-only src');
+
+  // Both srcset interceptors must preserve fragment candidates independently.
+  const contentSrcsetSandbox = {
+    WeakMap, srcsetCache: new WeakMap(),
+    shouldSkip(url) { return new URL(url).origin === 'https://proxy.example'; },
+    resolveHttp(url) { try { return new URL(url, 'https://page.example/').href; } catch { return null; } },
+    buildProxyUrl: proxy
+  };
+  vm.createContext(contentSrcsetSandbox);
+  vm.runInContext(`${extractFunction(content, 'isLocalFragmentReference')}\n${extractFunction(content, 'parseSrcset')}\n${extractFunction(content, 'rewriteSrcsetValue')}\nthis.rewrite = rewriteSrcsetValue;`, contentSrcsetSandbox);
+  const contentSrcset = contentSrcsetSandbox.rewrite(`${fragment} 1x, ${external} 2x`, {});
+  assert.ok(contentSrcset.startsWith(`${fragment} 1x, `));
+  assert.ok(contentSrcset.includes(encodeURIComponent(external)));
+
+  const prehookSandbox = {
+    URL, ready: true, opts: {}, active: true,
+    resolveHttp(url) { try { return new URL(url, 'https://page.example/').href; } catch { return null; } },
+    isConfiguredProxyUrl: () => false,
+    domHandles: () => true,
+    skipAbsolute: () => false,
+    buildProxyUrl: proxy,
+    srcsetCache: new WeakMap(),
+    document: { baseURI: 'https://page.example/' },
+    CSS_URL_RE: /url\(\s*(?:(['\"])(.*?)\1|([^)]*?))\s*\)/gi,
+    safeURL(value, base) { try { return new URL(value, base); } catch { return null; } },
+    stripHash(value) { const u = new URL(value); u.hash = ''; return u.href; }
+  };
+  vm.createContext(prehookSandbox);
+  vm.runInContext([
+    extractFunction(prehook, 'isLocalFragmentReference'),
+    extractFunction(prehook, 'parseSrcset'),
+    extractFunction(prehook, 'decideSrc'),
+    extractFunction(prehook, 'rewriteSrcset'),
+    extractFunction(prehook, 'cssUrls')
+  ].join('\n') + '\nthis.decide = decideSrc; this.rewrite = rewriteSrcset; this.css = cssUrls;', prehookSandbox);
+  assert.equal(prehookSandbox.decide(fragment), fragment, 'MAIN-world src setter preserves fragment-only references');
+  const prehookSrcset = prehookSandbox.rewrite(`${fragment} 1x, ${external} 2x`, {});
+  assert.ok(prehookSrcset.startsWith(`${fragment} 1x, `));
+  assert.ok(prehookSrcset.includes(encodeURIComponent(external)));
+  assert.deepEqual(JSON.parse(JSON.stringify(prehookSandbox.css(`mask: url(${fragment}); background: url(${external})`, 'https://page.example/'))), [external]);
 });
 
 test('fallback load cleanup remains armed after an image element is reused', () => {
@@ -2326,6 +2516,12 @@ test('service worker never broadens CSP removal when response-header matching is
   const suspendedRules = sandbox.__buildRules(opts, false, true);
   assert.equal(suspendedRules.some(rule => rule.id === 2), false, 'suspension must preserve page CSP');
   assert.equal(suspendedRules.some(rule => rule.id === 10), false, 'suspension disables redirects');
+
+  const excludedRules = sandbox.__buildRules({ ...opts, excludeDomains: 'excluded.example' }, false, false);
+  const excludedCsp = excludedRules.find(rule => rule.id === 2);
+  assert.deepEqual(JSON.parse(JSON.stringify(excludedCsp.condition.excludedRequestDomains)), ['excluded.example']);
+  assert.deepEqual(JSON.parse(JSON.stringify(excludedCsp.condition.excludedInitiatorDomains)), ['excluded.example'],
+    'a page on an excluded host must also keep CSP when it embeds a different host');
 });
 
 test('CSS fallback retries uppercase URL() references in stylesheet rules', () => {
@@ -2337,7 +2533,7 @@ test('CSS fallback retries uppercase URL() references in stylesheet rules', () =
     safeURL, stripHash
   };
   vm.createContext(sandbox);
-  const helpers = [extractFunction(prehook, 'cssUrls'), extractFunction(prehook, 'retryRules')].join('\n');
+  const helpers = [extractFunction(prehook, 'isLocalFragmentReference'), extractFunction(prehook, 'cssUrls'), extractFunction(prehook, 'retryRules')].join('\n');
   vm.runInContext(`${helpers}\nthis.retry = retryRules;`, sandbox);
 
   const original = 'https://cdn.example/failed-background.png';
@@ -3608,7 +3804,7 @@ test('an HTTP error response resets earlier connection failures without opening 
     refreshRules() { refreshes++; }
   };
   vm.createContext(sandbox);
-  vm.runInContext(`const SETTINGS_READ_RETRY_ALARM = 'bh-settings-read-retry';\n${constants}\nlet breakerFailures = [];\n${extractFunction(serviceWorker, 'noteProxyResponse')}\n${extractFunction(serviceWorker, 'noteGlobalProxyFailure')}\n${extractFunction(serviceWorker, 'handleProxyCompleted')}\nthis.api = { fail: noteGlobalProxyFailure, completed: handleProxyCompleted };`, sandbox);
+  vm.runInContext(`const SETTINGS_READ_RETRY_ALARM = 'bh-settings-read-retry';\n${constants}\nlet breakerFailures = [];\nlet breakerFallbackUntil = 0;\n${extractFunction(serviceWorker, 'noteProxyResponse')}\n${extractFunction(serviceWorker, 'scheduleBreakerResume')}\n${extractFunction(serviceWorker, 'noteGlobalProxyFailure')}\n${extractFunction(serviceWorker, 'handleProxyCompleted')}\nthis.api = { fail: noteGlobalProxyFailure, completed: handleProxyCompleted };`, sandbox);
 
   sandbox.api.fail();
   now += 1_000;
@@ -3729,7 +3925,7 @@ test('service worker opens the breaker after two failures inside 10 seconds and 
     refreshRules() { refreshes++; }
   };
   vm.createContext(sandbox);
-  vm.runInContext(`const SETTINGS_READ_RETRY_ALARM = 'bh-settings-read-retry';\n${constants}\nlet breakerFailures = [];\n${extractFunction(serviceWorker, 'noteProxyResponse')}\n${extractFunction(serviceWorker, 'noteGlobalProxyFailure')}\n${extractFunction(serviceWorker, 'scheduleBreakerResume')}\n${extractFunction(serviceWorker, 'resumeBreakerIfExpired')}\n${alarmListener}\nthis.api = { fail: noteGlobalProxyFailure, response: noteProxyResponse };`, sandbox);
+  vm.runInContext(`const SETTINGS_READ_RETRY_ALARM = 'bh-settings-read-retry';\n${constants}\nlet breakerFailures = [];\nlet breakerFallbackUntil = 0;\n${extractFunction(serviceWorker, 'noteProxyResponse')}\n${extractFunction(serviceWorker, 'noteGlobalProxyFailure')}\n${extractFunction(serviceWorker, 'scheduleBreakerResume')}\n${extractFunction(serviceWorker, 'resumeBreakerIfExpired')}\n${alarmListener}\nthis.api = { fail: noteGlobalProxyFailure, response: noteProxyResponse };`, sandbox);
 
   sandbox.api.fail();
   assert.equal(Object.keys(stored).length, 0, 'one failure does not open the breaker');
@@ -3815,7 +4011,7 @@ test('an unreadable breaker state disables proxying and retries rule refresh wit
     refreshRules() { refreshes++; }
   };
   vm.createContext(sandbox);
-  vm.runInContext(`const SETTINGS_READ_RETRY_ALARM = 'bh-settings-read-retry';\n${constants}\nlet breakerFailures = [];\nlet breakerReadRetryDelay = 1000;\n${retryFunction}\n${readFunction}\n${listener}\nthis.read = readSuspended;`, sandbox);
+  vm.runInContext(`const SETTINGS_READ_RETRY_ALARM = 'bh-settings-read-retry';\n${constants}\nlet breakerFailures = [];\nlet breakerFallbackUntil = 0;\nlet breakerReadRetryDelay = 1000;\n${retryFunction}\n${readFunction}\n${listener}\nthis.read = readSuspended;`, sandbox);
 
   let suspended = false;
   sandbox.read(value => { suspended = value; });
@@ -3847,6 +4043,110 @@ test('an unreadable breaker state disables proxying and retries rule refresh wit
   sandbox.read(value => { suspended = value; });
   assert.equal(suspended, true);
   assert.deepEqual(alarms.at(-1), { name: 'bh-breaker-read-retry', when: now + 1000 });
+});
+
+test('a failed session-storage breaker write still suspends redirects until the cooldown expires', () => {
+  const constantsStart = serviceWorker.indexOf('const BREAKER_THRESHOLD');
+  const constantsEnd = serviceWorker.indexOf('let breakerFailures', constantsStart);
+  assert.ok(constantsStart >= 0 && constantsEnd > constantsStart, 'breaker constants exist');
+  const constants = serviceWorker.slice(constantsStart, constantsEnd);
+  const retryFunction = extractFunction(serviceWorker, 'scheduleBreakerReadRetry');
+  const readFunction = extractFunction(serviceWorker, 'readSuspended');
+  const alarmStart = serviceWorker.indexOf('chrome.alarms?.onAlarm?.addListener');
+  const alarmEnd = serviceWorker.indexOf('\n\nfunction readSuspended', alarmStart);
+  assert.ok(alarmStart >= 0 && alarmEnd > alarmStart, 'breaker alarm listener exists');
+  const alarmListener = serviceWorker.slice(alarmStart, alarmEnd);
+
+  let now = 90_000;
+  const alarms = [];
+  const stored = {};
+  const states = [];
+  const removed = [];
+  const pendingSetCallbacks = [];
+  let onAlarm = null;
+  const chrome = {
+    runtime: { lastError: null },
+    storage: { session: {
+      set(_value, callback) { pendingSetCallbacks.push(callback); },
+      get(_defaults, callback) { callback({ bhSuspendedUntil: stored.bhSuspendedUntil || 0 }); },
+      remove(key, callback) { delete stored[key]; removed.push(key); callback(); }
+    } },
+    alarms: {
+      create(name, info) { alarms.push({ name, ...info }); },
+      clear() {},
+      onAlarm: { addListener(callback) { onAlarm = callback; } }
+    }
+  };
+  const sandbox = {
+    Date: { now: () => now }, chrome,
+    refreshRules() { sandbox.read(value => states.push(value)); }
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(`
+    const SETTINGS_READ_RETRY_ALARM = 'bh-settings-read-retry';
+    ${constants}
+    let breakerFailures = [];
+    let breakerFallbackUntil = 0;
+    let breakerReadRetryDelay = 1000;
+    ${retryFunction}
+    ${readFunction}
+    ${extractFunction(serviceWorker, 'scheduleBreakerResume')}
+    ${extractFunction(serviceWorker, 'noteGlobalProxyFailure')}
+    ${extractFunction(serviceWorker, 'resumeBreakerIfExpired')}
+    ${alarmListener}
+    this.fail = noteGlobalProxyFailure;
+    this.read = readSuspended;
+    this.snapshot = () => breakerFallbackUntil;
+  `, sandbox);
+
+  sandbox.fail();
+  now += 1000;
+  sandbox.fail();
+  const deadline = now + 40_000;
+  assert.equal(sandbox.snapshot(), deadline, 'the in-memory suspension floor is established before the async write settles');
+  assert.equal(stored.bhSuspendedUntil, undefined, 'the simulated storage write has not persisted');
+  assert.equal(pendingSetCallbacks.length, 1, 'the session write remains pending');
+  let suspendedDuringWrite = false;
+  sandbox.read(value => { suspendedDuringWrite = value; });
+  assert.equal(suspendedDuringWrite, true, 'a concurrent rule refresh cannot re-enable redirects while storage is pending');
+  chrome.runtime.lastError = { message: 'session storage write failed' };
+  pendingSetCallbacks.shift()();
+  chrome.runtime.lastError = null;
+  assert.deepEqual(states, [true], 'the failed-write callback refresh keeps redirects disabled');
+  assert.deepEqual(alarms.filter(a => a.name === 'bh-breaker-resume'), [
+    { name: 'bh-breaker-resume', when: deadline + 50 }
+  ]);
+
+  now = deadline + 50;
+  onAlarm({ name: 'bh-breaker-resume' });
+  assert.equal(sandbox.snapshot(), 0, 'the volatile fail-safe clears after its cooldown');
+  assert.deepEqual(states, [true, false], 'normal redirects may return only after the cooldown expires');
+  assert.deepEqual(removed, [], 'no storage key is removed when the failed write created none');
+
+  // If the worker was restarted before this alarm fired, its in-memory floor
+  // is gone. The alarm must still refresh the rules instead of leaving them
+  // permanently suspended because session storage has no key.
+  onAlarm({ name: 'bh-breaker-resume' });
+  assert.deepEqual(states, [true, false, false], 'a no-state expiry alarm still rebuilds current rules after worker restart');
+});
+
+test('breaker resume scheduling consumes rejected Promise results from the alarms API', () => {
+  let handled = false;
+  let created = null;
+  const harness = functionFrom(serviceWorker, 'scheduleBreakerResume', {
+    BREAKER_ALARM: 'bh-breaker-resume',
+    chrome: { alarms: { create(name, info) {
+      created = { name, ...info };
+      return { catch(onRejected) {
+        handled = true;
+        onRejected(new Error('alarm creation rejected'));
+      } };
+    } } }
+  });
+
+  harness.fn(123456);
+  assert.deepEqual(created, { name: 'bh-breaker-resume', when: 123456 });
+  assert.equal(handled, true, 'a Promise-based alarm failure is handled instead of becoming unhandled');
 });
 
 test('a src assigned after a rewritten srcset restores the original candidates, not proxy URLs', () => {
@@ -3960,4 +4260,28 @@ test('retry re-requests the original URL when an img attribute still holds a pro
     'unrelated URLs are untouched');
   assert.equal(sandbox.directSet(`${proxy} 1x, https://cdn.example/other.png 2x`, 'https://page.example/', map),
     `${original} 1x, https://cdn.example/other.png 2x`, 'only proxy candidates are restored and descriptors kept');
+});
+
+test('CI repository write permission is limited to the release job', () => {
+  const workflow = fs.readFileSync(path.join(ROOT, '.github/workflows/build.yml'), 'utf8');
+  assert.match(workflow, /^permissions:\s*\n\s+contents:\s*read\s*$/m,
+    'workflow defaults to read-only repository access');
+  assert.doesNotMatch(workflow, /^permissions:\s*\n\s+contents:\s*write\s*$/m,
+    'write access must not be granted at workflow scope');
+  const releaseJob = workflow.match(/^  release:\s*\n([\s\S]*)$/m)?.[1] || '';
+  assert.match(releaseJob, /^    permissions:\s*\n\s+contents:\s*write\s*$/m,
+    'only the publishing job receives permission to upload a release');
+  const testAndBuildJobs = workflow.match(/^  test:[\s\S]*?^  release:/m)?.[0] || '';
+  assert.doesNotMatch(testAndBuildJobs, /contents:\s*write/,
+    'test/build jobs cannot mutate repository contents');
+});
+
+
+test('Keep-Fork-Alive repository write permission is limited to its commit job', () => {
+  const workflow = fs.readFileSync(path.join(ROOT, '.github/workflows/Keep-Alive.yml'), 'utf8');
+  assert.doesNotMatch(workflow, /^permissions:\s*\n\s+contents:\s*write\s*$/m,
+    'write access must not be granted at workflow scope');
+  const keepAliveJob = workflow.match(/^  keep-alive:\s*\n([\s\S]*)$/m)?.[1] || '';
+  assert.match(keepAliveJob, /^    permissions:\s*\n\s+contents:\s*write\s*$/m,
+    'the commit job alone receives permission to push the keep-alive update');
 });
